@@ -876,7 +876,7 @@ pub fn tune_tile_ir(
         let compile_result = std::panic::catch_unwind(move || -> Result<(Vec<u8>, u32, u32), String> {
             let kernel_ir = super::tile_ir::lower_gemm(&spec_clone);
             let base_lds = kernel_ir.lds_size();
-            let (elf, final_lds) = kernel_ir.compile_with_info(super::ir::Target::GFX1100)?;
+            let (elf, final_lds) = kernel_ir.compile_with_info(super::ir::Target::detect())?;
             Ok((elf, base_lds, final_lds))
         });
         let (elf, base_lds, final_lds) = match compile_result {

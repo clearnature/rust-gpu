@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn test_log_softmax_compiles() {
         let kb = build_log_softmax();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("log_softmax compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("log_softmax compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ log_softmax: {} bytes ELF", ck.elf.len());
     }
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn test_nll_loss_compiles() {
         let kb = build_nll_loss();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("nll_loss compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("nll_loss compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ nll_loss: {} bytes ELF", ck.elf.len());
     }
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn test_ce_bwd_compiles() {
         let kb = build_ce_loss_backward();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("ce_bwd compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("ce_bwd compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ ce_bwd: {} bytes ELF", ck.elf.len());
     }
@@ -274,7 +274,7 @@ mod tests {
 
         // Kernel 1: log_softmax
         let kb1 = build_log_softmax();
-        let ck1 = kb1.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile log_sm");
+        let ck1 = kb1.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile log_sm");
         let k1 = GpuKernel::load(&rt.device, &ck1.elf, &KernelLoadConfig {
             workgroup_size: ck1.workgroup_size, lds_size: ck1.lds_size,
         }).expect("load log_sm");
@@ -292,7 +292,7 @@ mod tests {
 
         // Kernel 2: nll_loss
         let kb2 = build_nll_loss();
-        let ck2 = kb2.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile nll");
+        let ck2 = kb2.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile nll");
         let k2 = GpuKernel::load(&rt.device, &ck2.elf, &KernelLoadConfig {
             workgroup_size: ck2.workgroup_size, lds_size: ck2.lds_size,
         }).expect("load nll");
@@ -347,7 +347,7 @@ mod tests {
         let out_buf = rt.alloc_f32(n).unwrap();
 
         let kb = build_log_softmax();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile");
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile");
         eprintln!("log_softmax compiled: elf={} bytes, wg={:?}, lds={}",
             ck.elf.len(), ck.workgroup_size, ck.lds_size);
 
@@ -437,7 +437,7 @@ mod tests {
         let loss_buf = rt.alloc_f32(rows as usize).unwrap();
 
         let kb = build_nll_loss();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile nll");
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile nll");
         eprintln!("nll_loss: elf={} wg={:?} lds={}", ck.elf.len(), ck.workgroup_size, ck.lds_size);
         let kernel = GpuKernel::load(&rt.device, &ck.elf, &KernelLoadConfig {
             workgroup_size: ck.workgroup_size, lds_size: ck.lds_size,

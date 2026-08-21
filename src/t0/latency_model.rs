@@ -220,6 +220,7 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
         Op::Branch(_) | Op::BranchScc0(_) | Op::BranchScc1(_) | Op::BranchVccz(_) |
         Op::Label(_) |
         Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
+        Op::WaitKmcnt(_) |
         Op::Barrier | Op::SBarrier | Op::Endpgm |
         Op::CaptureTgid { .. } | Op::ComputeGlobalIdX { .. } => ctrl(),
 
@@ -402,6 +403,7 @@ mod tests {
         let op = Op::Wmma {
             dst: VReg(0), a: VReg(8), b: VReg(16), c: VReg(24),
             format: WmmaFormat::BF16_F32,
+            ab_width: 8,
         };
         let info = op_latency(&op);
         assert_eq!(info.pipeline, Pipeline::WMMA);

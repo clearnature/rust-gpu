@@ -176,7 +176,7 @@ impl GemmTuner {
 
         // 1. Generate and compile kernel
         let kernel_ir = super::gemm_gen::generate(cfg);
-        let elf = kernel_ir.compile(super::ir::Target::GFX1100)?;
+        let elf = kernel_ir.compile(super::ir::Target::detect())?;
         let lds_size = kernel_ir.lds_size();
 
         let gpu_kernel = GpuKernel::load(
@@ -258,7 +258,7 @@ impl GemmTuner {
         let spec_clone = spec.clone();
         let compile_result = std::panic::catch_unwind(move || {
             let kernel_ir = super::tile_ir::lower_gemm(&spec_clone);
-            let elf = kernel_ir.compile(super::ir::Target::GFX1100);
+            let elf = kernel_ir.compile(super::ir::Target::detect());
             let lds_size = kernel_ir.lds_size();
             (elf, lds_size)
         });

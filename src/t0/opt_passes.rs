@@ -432,6 +432,7 @@ fn rename_op_vregs(op: &Op, offset: u32, rename_set: &HashSet<u32>) -> Op {
         Op::WaitVmcnt(n) => Op::WaitVmcnt(*n),
         Op::WaitLgkmcnt(n) => Op::WaitLgkmcnt(*n),
         Op::WaitVscnt(n) => Op::WaitVscnt(*n),
+        Op::WaitKmcnt(n) => Op::WaitKmcnt(*n),
         // Comparisons
         Op::VCmpLtU32 { src0, src1 } =>
             Op::VCmpLtU32 { src0: rename_op(src0), src1: rename_op(src1) },

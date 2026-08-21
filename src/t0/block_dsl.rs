@@ -20,7 +20,7 @@
 //! let c = a.add(&mut kb, b);
 //! kb.store(out_ptr, offsets, c, mask);
 //!
-//! let compiled = kb.compile(Target::GFX1100)?;
+//! let compiled = kb.compile(Target::detect())?;
 //! ```
 
 #[allow(unused_imports)]
@@ -1005,7 +1005,7 @@ impl BlockKernel {
     /// let y_stride = kb.arg_u32("y_split_stride");
     ///
     /// kb.tile_gemm(x, w, y, k, n, TileGemmConfig::auto(m, k_val, n_val));
-    /// let compiled = kb.compile(Target::GFX1100)?;
+    /// let compiled = kb.compile(Target::detect())?;
     /// ```
     pub fn tile_gemm(
         &mut self,
@@ -1095,7 +1095,7 @@ mod tests {
         let c = a.add(&mut kb, b);
         kb.store(out, offsets, c, mask);
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         eprintln!("compiled: {:?}", compiled);
         assert!(!compiled.elf.is_empty());
         assert!(compiled.name == "vector_add");
@@ -1117,7 +1117,7 @@ mod tests {
         let exp_vals = shifted.exp2(&mut kb);
         kb.store(out, offsets, exp_vals, mask);
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         assert!(!compiled.elf.is_empty());
     }
 }
@@ -1185,7 +1185,7 @@ mod gpu_tests {
         let c = a.add(&mut kb, b);
         kb.store(out, offsets, c, mask);
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
 
         // Allocate GPU buffers
         let x_buf = rt.alloc_f32(n).unwrap();
@@ -1265,7 +1265,7 @@ mod gpu_tests {
 
         kb.store(out, offsets, result, mask);
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         assert!(compiled.lds_size > 0, "LDS size should be > 0");
         eprintln!("  lds_double: lds_size = {}", compiled.lds_size);
 
@@ -1336,7 +1336,7 @@ mod gpu_tests {
         let result = kb.lds_load(lds, tid);
         kb.store(out, tid, result, mask);
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         eprintln!("  lds_accum: elf={} lds={}", compiled.elf.len(), compiled.lds_size);
 
         let out_buf = rt.alloc_f32(block_size as usize).unwrap();
@@ -1516,7 +1516,7 @@ mod gpu_tests {
         let c_off = gm.mul(&mut kb, n_arg).add(&mut kb, gn);
         kb.store(c_ptr, c_off, result, mask_m);
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         eprintln!("  gemm_tn: elf={} bytes, lds={}, ka={}",
             compiled.elf.len(), compiled.lds_size, compiled.kernarg_size);
 
@@ -1632,7 +1632,7 @@ mod gpu_tests {
             kb.store(out, off, val, mask);
         }
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         eprintln!("  wmma_test: elf={} bytes, ka={}", compiled.elf.len(), compiled.kernarg_size);
 
         // Allocate 16×16 f32 output
@@ -1700,7 +1700,7 @@ mod gpu_tests {
         let _yss = kb.arg_u32("y_split_stride");
         kb.tile_gemm(_x, _w, _y, _k, _n, config.clone());
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         let compiled_elf_len = compiled.elf.len();
         let compiled_elf_bytes = compiled.elf.clone();
         eprintln!("[tile_gemm] compiled: elf={} bytes, wg={}, lds={}, ka={}",
@@ -1809,7 +1809,7 @@ mod gpu_tests {
 
             // Recompile fresh kernel directly from gemm_gen
             let t0k_raw = gemm_gen::generate(&gemm_cfg);
-            let elf_raw = t0k_raw.compile(Target::GFX1100).unwrap();
+            let elf_raw = t0k_raw.compile(Target::detect()).unwrap();
             eprintln!("[tile_gemm] raw ELF: {} bytes (tile_gemm ELF: {} bytes, same={})",
                 elf_raw.len(), compiled_elf_len,
                 elf_raw == compiled_elf_bytes);
@@ -1904,7 +1904,7 @@ mod gpu_tests {
         kb.store(y, offsets, doubled, mask);
         kb.end_if();
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         eprintln!("  gpu_if_only: elf={} bytes, ka={}", compiled.elf.len(), compiled.kernarg_size);
 
         let x_buf = rt.alloc_f32(n).unwrap();
@@ -1974,7 +1974,7 @@ mod gpu_tests {
         kb.store(y, offsets, shifted, mask);
         kb.end_if();
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         eprintln!("  gpu_if_else: elf={} bytes, ka={}", compiled.elf.len(), compiled.kernarg_size);
 
         let x_buf = rt.alloc_f32(n).unwrap();
@@ -2031,7 +2031,7 @@ mod tests_new {
         let back = kb.lds_load(lds, offsets);
         kb.store(out, offsets, back, mask);
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         assert!(compiled.lds_size >= 128, "LDS size should be >= 128");
         eprintln!("  test_lds_basic: lds_size={}, elf={} bytes", compiled.lds_size, compiled.elf.len());
     }
@@ -2056,7 +2056,7 @@ mod tests_new {
         let c = kb.const_f32(42.0);
         kb.store(out, offsets, c, mask);
 
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         assert!(!compiled.elf.is_empty());
         eprintln!("  test_for_range_basic: elf={} bytes", compiled.elf.len());
     }
@@ -2083,7 +2083,7 @@ mod tests_new {
         kb.end_if();
 
         // compile() now goes through SSA path (ExecMaskPush/Pop)
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         assert!(!compiled.elf.is_empty(), "ELF should not be empty");
         eprintln!("  [PASS] test_if_only_compile: elf={} bytes (SSA path)", compiled.elf.len());
     }
@@ -2112,7 +2112,7 @@ mod tests_new {
         kb.end_if();
 
         // compile() now goes through SSA path (ExecMaskPush/Flip/Pop)
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         assert!(!compiled.elf.is_empty(), "ELF should not be empty");
         eprintln!("  [PASS] test_if_else_compile: elf={} bytes (SSA path)", compiled.elf.len());
     }

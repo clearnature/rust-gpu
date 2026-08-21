@@ -12,7 +12,7 @@
 //!
 //! let spec = TileGemm::tile_128x64_k16();
 //! let kernel = lower_gemm(&spec);
-//! let elf = kernel.compile(Target::GFX1100).unwrap();
+//! let elf = kernel.compile(Target::detect()).unwrap();
 //! ```
 
 use super::compile::T0Kernel;
@@ -1118,22 +1118,23 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     // NOTE: Row-major (1 frag_a) was tested — achieved 192 VGPRs / 4 waves/SIMD
     // but performance DROPPED 13% (81→71 TF) due to worse frag_b reuse.
     // Column-major (n_row_blocks frag_a) is the optimal tradeoff at 200 VGPRs.
+    let wmma_ab_size = k.wmma_ab_frag_size(); // GFX1200: 4, GFX1100: 8
     let frag_a_count = if spec.acc_swap { 1 } else { n_row_blocks };
     let frag_a: Vec<VReg> = (0..frag_a_count)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
+        .map(|_| k.alloc_vreg_array(wmma_ab_size, Alignment::Align8))
         .collect();
     // Streaming mode (n_col_tiles > 4) only needs 1 ping-pong pair = 16 VGPRs.
     // Bulk-load mode needs all n_col_tiles fragments = n_col_tiles * 8 VGPRs.
     // Fix: don't allocate 8 × 8 = 64 VGPRs when only 2 × 8 = 16 are needed!
     let use_streaming = n_col_tiles > 4;
     let frag_b: Vec<VReg> = if use_streaming {
-        vec![k.alloc_vreg_array(8, Alignment::Align8)]  // only ping buffer
+        vec![k.alloc_vreg_array(wmma_ab_size, Alignment::Align8)]  // only ping buffer
     } else {
-        (0..n_col_tiles).map(|_| k.alloc_vreg_array(8, Alignment::Align8)).collect()
+        (0..n_col_tiles).map(|_| k.alloc_vreg_array(wmma_ab_size, Alignment::Align8)).collect()
     };
     // Pong buffer for streaming (or dummy for bulk-load)
     let frag_b_shared = if use_streaming {
-        k.alloc_vreg_array(8, Alignment::Align8)
+        k.alloc_vreg_array(wmma_ab_size, Alignment::Align8)
     } else {
         VReg(0) // unused in bulk-load mode
     };
@@ -1876,6 +1877,11 @@ fn emit_lds_read_and_wmma(
     // Use column-streaming for large tiles (>4 cols) to reduce VGPR pressure.
     // Small tiles (≤4 cols) use bulk-load for better LDS-WMMA overlap.
     let use_streaming = n_col_tiles > 4;
+    // GFX1200: A/B fragments are 4 VGPRs (1× ds_load_b128)
+    // GFX1100: A/B fragments are 8 VGPRs (2× ds_load_b128)
+    let load_ab_hi = k.wmma_ab_frag_size() > 4;
+    // Number of ds_load_b128 calls per A/B fragment (2 for 8-VGPR, 1 for 4-VGPR)
+    let loads_per_frag: u8 = if load_ab_hi { 2 } else { 1 };
 
     // Interleaved store tracking
     let total_wmma = (n_row_blocks * n_col_tiles * k_sub as usize) as u32;
@@ -1962,7 +1968,9 @@ fn emit_lds_read_and_wmma(
         if !frag_a_preloaded && !row_major {
             for r in 0..frag_a.len() {
                 k.ds_load_b128(frag_a[r], cur_x_reads_0[r], ds_off);
-                k.ds_load_b128(VReg(frag_a[r].0 + 4), cur_x_reads_16[r], ds_off);
+                if load_ab_hi {
+                    k.ds_load_b128(VReg(frag_a[r].0 + 4), cur_x_reads_16[r], ds_off);
+                }
             }
         }
 
@@ -1983,22 +1991,29 @@ fn emit_lds_read_and_wmma(
                 for r in 0..n_row_blocks {
                     // Load frag_a for this row block
                     k.ds_load_b128(frag_a[0], cur_x_reads_0[r], ds_off);
-                    k.ds_load_b128(VReg(frag_a[0].0 + 4), cur_x_reads_16[r], ds_off);
+                    if load_ab_hi {
+                        k.ds_load_b128(VReg(frag_a[0].0 + 4), cur_x_reads_16[r], ds_off);
+                    }
 
                     // Prefetch first TWO B columns
                     {
-                        let base_0: u16 = lds_x as u16;
-                        k.ds_load_b128(fb_ping, cur_wt_0, base_0 + ds_off);
-                        k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, base_0 + ds_off);
+                        let off0 = (lds_x as u16).wrapping_add(ds_off);
+                        k.ds_load_b128(fb_ping, cur_wt_0, off0);
+                        if load_ab_hi {
+                            k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, off0);
+                        }
                     }
                     if n_col_tiles > 1 {
-                        let base_1: u16 = (lds_x + 16 * wt_row_stride) as u16;
-                        k.ds_load_b128(fb_pong, cur_wt_0, base_1 + ds_off);
-                        k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, base_1 + ds_off);
+                        let off1 = ((lds_x + 16 * wt_row_stride) as u16)
+                            .wrapping_add(ds_off);
+                        k.ds_load_b128(fb_pong, cur_wt_0, off1);
+                        if load_ab_hi {
+                            k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, off1);
+                        }
                     }
 
-                    // Wait: 2 frag_a + 2 frag_b_col1 in flight, need frag_a + col0 ready
-                    let initial_wait = if n_col_tiles > 1 { 2u8 } else { 0u8 };
+                    // Wait: loads_per_frag frag_a + loads_per_frag frag_b_col1 in flight
+                    let initial_wait = if n_col_tiles > 1 { loads_per_frag } else { 0u8 };
                     k.wait_lgkmcnt(initial_wait);
 
                     for c in 0..n_col_tiles {
@@ -2018,14 +2033,17 @@ fn emit_lds_read_and_wmma(
 
                         // Prefetch column c+2
                         if c + 2 < n_col_tiles {
-                            let next2_base: u16 = (lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16;
-                            k.ds_load_b128(cur_fb, cur_wt_0, next2_base + ds_off);
-                            k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, next2_base + ds_off);
+                            let off_c2 = ((lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16)
+                                .wrapping_add(ds_off);
+                            k.ds_load_b128(cur_fb, cur_wt_0, off_c2);
+                            if load_ab_hi {
+                                k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, off_c2);
+                            }
                         }
 
                         // Wait for next column's B data
                         if c + 1 < n_col_tiles {
-                            let remaining = if c + 2 < n_col_tiles { 2u8 } else { 0u8 };
+                            let remaining = if c + 2 < n_col_tiles { loads_per_frag } else { 0u8 };
                             k.wait_lgkmcnt(remaining);
                         }
                     }
@@ -2037,20 +2055,29 @@ fn emit_lds_read_and_wmma(
 
                 // Prefetch first TWO B columns
                 {
-                    let base_0: u16 = lds_x as u16;
-                    k.ds_load_b128(fb_ping, cur_wt_0, base_0 + ds_off);
-                    k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, base_0 + ds_off);
+                    let off0 = (lds_x as u16).wrapping_add(ds_off);
+                    k.ds_load_b128(fb_ping, cur_wt_0, off0);
+                    if load_ab_hi {
+                        k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, off0);
+                    }
                 }
                 if n_col_tiles > 1 {
-                    let base_1: u16 = (lds_x + 16 * wt_row_stride) as u16;
-                    k.ds_load_b128(fb_pong, cur_wt_0, base_1 + ds_off);
-                    k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, base_1 + ds_off);
+                    let off1 = ((lds_x + 16 * wt_row_stride) as u16)
+                        .wrapping_add(ds_off);
+                    k.ds_load_b128(fb_pong, cur_wt_0, off1);
+                    if load_ab_hi {
+                        k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, off1);
+                    }
                 }
 
                 // When frag_a was preloaded, it has a head start — account for
-                // those 4 loads still in the lgkmcnt pipeline.
-                let preloaded_inflight = if frag_a_preloaded { (2 * n_row_blocks) as u8 } else { 0u8 };
-                let initial_wait = if n_col_tiles > 1 { 2u8 + preloaded_inflight } else { preloaded_inflight };
+                // those loads still in the lgkmcnt pipeline.
+                let preloaded_inflight = if frag_a_preloaded {
+                    (loads_per_frag as usize * n_row_blocks) as u8
+                } else { 0u8 };
+                let initial_wait = if n_col_tiles > 1 {
+                    loads_per_frag + preloaded_inflight
+                } else { preloaded_inflight };
                 k.wait_lgkmcnt(initial_wait);
 
                 for c in 0..n_col_tiles {
@@ -2085,7 +2112,9 @@ fn emit_lds_read_and_wmma(
                                 // Note: these regs are used by next ksub's cur_x_reads
                                 // but since prefetch uses frag_a[r] as dest, they're temporary
                                 k.ds_load_b128(frag_a[r2], nxr_0, buf_off);
-                                k.ds_load_b128(VReg(frag_a[r2].0 + 4), nxr_16, buf_off);
+                                if load_ab_hi {
+                                    k.ds_load_b128(VReg(frag_a[r2].0 + 4), nxr_16, buf_off);
+                                }
                             }
                         }
 
@@ -2101,14 +2130,17 @@ fn emit_lds_read_and_wmma(
 
                     // ── Prefetch column c+2 into the buffer we just consumed ──
                     if c + 2 < n_col_tiles {
-                        let next2_base: u16 = (lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16;
-                        k.ds_load_b128(cur_fb, cur_wt_0, next2_base + ds_off);
-                        k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, next2_base + ds_off);
+                        let off_c2 = ((lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16)
+                            .wrapping_add(ds_off);
+                        k.ds_load_b128(cur_fb, cur_wt_0, off_c2);
+                        if load_ab_hi {
+                            k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, off_c2);
+                        }
                     }
 
                     // Wait for next column's B data
                     if c + 1 < n_col_tiles {
-                        let mut remaining = if c + 2 < n_col_tiles { 2u8 } else { 0u8 };
+                        let mut remaining = if c + 2 < n_col_tiles { loads_per_frag } else { 0u8 };
                         if c == n_col_tiles - 2 && ksub + 1 < k_sub {
                             // frag_a prefetches not yet issued, remaining stays same
                         }
@@ -2138,15 +2170,18 @@ fn emit_lds_read_and_wmma(
             //   complete before ds_stores (issued later), so the graduated
             //   wait correctly drains reads before stores.
             for c in 0..n_col_tiles {
-                let base_off: u16 = (lds_x + (c as u32) * 16 * wt_row_stride) as u16;
-                k.ds_load_b128(frag_b[c], cur_wt_0, base_off + ds_off);
-                k.ds_load_b128(VReg(frag_b[c].0 + 4), cur_wt_16, base_off + ds_off);
+                let off = ((lds_x + (c as u32) * 16 * wt_row_stride) as u16)
+                    .wrapping_add(ds_off);
+                k.ds_load_b128(frag_b[c], cur_wt_0, off);
+                if load_ab_hi {
+                    k.ds_load_b128(VReg(frag_b[c].0 + 4), cur_wt_16, off);
+                }
             }
 
-            let total_loads = (2 * n_row_blocks + 2 * n_col_tiles) as u8;
+            let total_loads = (loads_per_frag as usize * (n_row_blocks + n_col_tiles)) as u8;
             let mut pending_stores: u8 = 0;
             for c in 0..n_col_tiles {
-                let loads_needed = (2 * n_row_blocks + 2 * c + 2) as u8;
+                let loads_needed = (loads_per_frag as usize * (n_row_blocks + c + 1)) as u8;
                 // Account for ds_stores already in lgkmcnt pipeline
                 let remaining = total_loads.saturating_sub(loads_needed) + pending_stores;
                 k.wait_lgkmcnt(remaining);
@@ -2694,6 +2729,8 @@ fn emit_lds_read_and_wmma_swap(
     swap_temp: VReg,       // 8-VGPR temp for acc swap (dedicated, not frag_b)
 ) {
     let k_sub_steps = (spec.tile_k / 16) as usize;
+    let load_ab_hi = k.wmma_ab_frag_size() > 4;
+    let loads_per_frag: u8 = if load_ab_hi { 2 } else { 1 };
 
     for r in 0..n_row_blocks {
         for ksub in 0..k_sub_steps {
@@ -2701,24 +2738,31 @@ fn emit_lds_read_and_wmma_swap(
 
             // ── Load A fragment for row_block r ──
             k.ds_load_b128(frag_a[0], x_lds_reads_0[r], buf_off + k_byte_within);
-            k.ds_load_b128(VReg(frag_a[0].0 + 4), x_lds_reads_16[r], buf_off + k_byte_within);
+            if load_ab_hi {
+                k.ds_load_b128(VReg(frag_a[0].0 + 4), x_lds_reads_16[r], buf_off + k_byte_within);
+            }
 
             // ── Streaming B columns (same as original streaming mode) ──
             let fb_ping = frag_b[0];
             let fb_pong = frag_b_shared;
 
             // Prefetch B[0] and B[1]
-            let base0: u16 = (lds_x as u16) + (0u16) * (16 * wt_row_stride as u16);
-            k.ds_load_b128(fb_ping, wt_base_0, base0 + buf_off + k_byte_within);
-            k.ds_load_b128(VReg(fb_ping.0 + 4), wt_base_16, base0 + buf_off + k_byte_within);
+            let off0 = (lds_x as u16).wrapping_add(buf_off).wrapping_add(k_byte_within);
+            k.ds_load_b128(fb_ping, wt_base_0, off0);
+            if load_ab_hi {
+                k.ds_load_b128(VReg(fb_ping.0 + 4), wt_base_16, off0);
+            }
             if n_col_tiles > 1 {
-                let base1: u16 = (lds_x as u16) + (1u16) * (16 * wt_row_stride as u16);
-                k.ds_load_b128(fb_pong, wt_base_0, base1 + buf_off + k_byte_within);
-                k.ds_load_b128(VReg(fb_pong.0 + 4), wt_base_16, base1 + buf_off + k_byte_within);
+                let off1 = ((lds_x + 16 * wt_row_stride) as u16)
+                    .wrapping_add(buf_off).wrapping_add(k_byte_within);
+                k.ds_load_b128(fb_pong, wt_base_0, off1);
+                if load_ab_hi {
+                    k.ds_load_b128(VReg(fb_pong.0 + 4), wt_base_16, off1);
+                }
             }
 
             // Wait for A + B[0] (keep B[1] in flight if present)
-            let initial_wait = if n_col_tiles > 1 { 2u8 } else { 0u8 };
+            let initial_wait = if n_col_tiles > 1 { loads_per_frag } else { 0u8 };
             k.wait_lgkmcnt(initial_wait);
 
             for c in 0..n_col_tiles {
@@ -2729,14 +2773,17 @@ fn emit_lds_read_and_wmma_swap(
 
                 // Prefetch B[c+2] into the consumed buffer
                 if c + 2 < n_col_tiles {
-                    let next2_base: u16 = (lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16;
-                    k.ds_load_b128(cur_fb, wt_base_0, next2_base + buf_off + k_byte_within);
-                    k.ds_load_b128(VReg(cur_fb.0 + 4), wt_base_16, next2_base + buf_off + k_byte_within);
+                    let off_c2 = ((lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16)
+                        .wrapping_add(buf_off).wrapping_add(k_byte_within);
+                    k.ds_load_b128(cur_fb, wt_base_0, off_c2);
+                    if load_ab_hi {
+                        k.ds_load_b128(VReg(cur_fb.0 + 4), wt_base_16, off_c2);
+                    }
                 }
 
                 // Wait for next column's B data
                 if c + 1 < n_col_tiles {
-                    let remaining = if c + 2 < n_col_tiles { 2u8 } else { 0u8 };
+                    let remaining = if c + 2 < n_col_tiles { loads_per_frag } else { 0u8 };
                     k.wait_lgkmcnt(remaining);
                 }
             }
@@ -2898,7 +2945,7 @@ mod tests {
         // Core test: lower_gemm produces a kernel that compiles to ELF
         let spec = TileGemm::tile_128x64_k16();
         let kernel = lower_gemm(&spec);
-        let result = kernel.compile(Target::GFX1100);
+        let result = kernel.compile(Target::detect());
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
         let elf = result.unwrap();
         assert!(elf.len() > 100, "ELF too small: {} bytes", elf.len());
@@ -2909,7 +2956,7 @@ mod tests {
     fn test_lower_gemm_64x64_compiles() {
         let spec = TileGemm::tile_64x64_k16();
         let kernel = lower_gemm(&spec);
-        let result = kernel.compile(Target::GFX1100);
+        let result = kernel.compile(Target::detect());
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
         eprintln!("[tile_ir] {} → {} bytes ELF", spec.name(), result.unwrap().len());
     }
@@ -2918,7 +2965,7 @@ mod tests {
     fn test_lower_gemm_32x64_compiles() {
         let spec = TileGemm::tile_32x64_k16();
         let kernel = lower_gemm(&spec);
-        let result = kernel.compile(Target::GFX1100);
+        let result = kernel.compile(Target::detect());
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
         eprintln!("[tile_ir] {} → {} bytes ELF", spec.name(), result.unwrap().len());
     }
@@ -2930,7 +2977,7 @@ mod tests {
             spec.name(), spec.lds_total(),
             spec.lds_per_buffer() * 2, spec.acc_swap_region_size());
         let kernel = lower_gemm(&spec);
-        let (elf, final_lds) = kernel.compile_with_info(Target::GFX1100)
+        let (elf, final_lds) = kernel.compile_with_info(Target::detect())
             .expect("compile failed for swap config");
         assert!(elf.len() > 100, "ELF too small: {} bytes", elf.len());
         eprintln!("[tile_ir] {} → {} bytes ELF, final_lds={}", spec.name(), elf.len(), final_lds);
@@ -2968,7 +3015,7 @@ mod tests {
             for op in body {
                 match op {
                     Op::WaitVmcnt(_) => phase_a_vmcnt += 1,
-                    Op::WaitLgkmcnt(_) => phase_a_lgkmcnt += 1,
+                    Op::WaitLgkmcnt(_) | Op::WaitKmcnt(_) => phase_a_lgkmcnt += 1,
                     _ => {}
                 }
             }
@@ -2988,7 +3035,7 @@ mod tests {
             eprintln!("╚══════════════════════════════════════════════════════╝");
         }
 
-        let (elf, final_lds) = kernel.compile_with_info(Target::GFX1100)
+        let (elf, final_lds) = kernel.compile_with_info(Target::detect())
             .expect("compile failed for k32 standard");
         assert!(elf.len() > 100, "ELF too small: {} bytes", elf.len());
         eprintln!("[tile_ir] {} → {} bytes ELF, final_lds={}", spec.name(), elf.len(), final_lds);
@@ -2996,7 +3043,7 @@ mod tests {
         // ── k48 compile disabled (panics: k48 is not power-of-2) ──
         // let spec48 = TileGemm::tile_128x128_k48();
         // let kernel48 = lower_gemm(&spec48);
-        // let (elf48, lds48) = kernel48.compile_with_info(Target::GFX1100)
+        // let (elf48, lds48) = kernel48.compile_with_info(Target::detect())
         //     .expect("compile failed for k48");
 
         // ── k64 configs (VGPR exploration) ──
@@ -3004,19 +3051,19 @@ mod tests {
         let spec64 = TileGemm::tile_128x128_k64();
         eprintln!("\n[tile_ir] compiling 128x128 k64: {} (LDS={})", spec64.name(), spec64.lds_total());
         let kernel64 = lower_gemm(&spec64);
-        let _ = kernel64.compile_with_info(Target::GFX1100);  // may fail, that's OK
+        let _ = kernel64.compile_with_info(Target::detect());  // may fail, that's OK
 
         // 128×64 k64: should fit (ACC=64, GMEM=48)
         let spec64s = TileGemm::tile_128x64_k64();
         eprintln!("\n[tile_ir] compiling 128x64 k64: {} (LDS={})", spec64s.name(), spec64s.lds_total());
         let kernel64s = lower_gemm(&spec64s);
-        let _ = kernel64s.compile_with_info(Target::GFX1100);
+        let _ = kernel64s.compile_with_info(Target::detect());
 
         // 256×64 k64 WGP: predicted ~166 VGPRs → 4 waves!
         let spec_wgp = TileGemm::tile_256x64_k64_wgp();
         eprintln!("\n[tile_ir] compiling 256x64 k64 WGP: {} (LDS={})", spec_wgp.name(), spec_wgp.lds_total());
         let kernel_wgp = lower_gemm(&spec_wgp);
-        let _ = kernel_wgp.compile_with_info(Target::GFX1100);
+        let _ = kernel_wgp.compile_with_info(Target::detect());
     }
 
     #[test]
@@ -3026,7 +3073,7 @@ mod tests {
 
         let spec = TileGemm::tile_128x128_k16_swap();
         let kernel = lower_gemm(&spec);
-        let (elf, final_lds) = kernel.compile_with_info(Target::GFX1100)
+        let (elf, final_lds) = kernel.compile_with_info(Target::detect())
             .expect("compile failed");
 
         let device = KfdDevice::open().unwrap();
@@ -3267,7 +3314,7 @@ mod compile_tests {
             };
 
             // Compile to ELF to get regalloc info
-            match t0k.compile(Target::GFX1100) {
+            match t0k.compile(Target::detect()) {
                 Ok(elf) => {
                     eprintln!("{:<15} {:<28} {:>8} {:>8} {:>8} {:>10} {}  grid={:?}",
                         format!("{}×{}×{}", m, k, n),
@@ -3316,13 +3363,13 @@ mod compile_tests {
         // ── A: compile WITH T0_SKIP_WAITOPT (baseline, current production) ──
         std::env::set_var("T0_SKIP_WAITOPT", "1");
         let kernel_a = lower_gemm(&spec);
-        let asm_a = kernel_a.to_assembly(Target::GFX1100).expect("compile A");
+        let asm_a = kernel_a.to_assembly(Target::detect()).expect("compile A");
 
         // ── B: compile WITHOUT T0_SKIP_WAITOPT (new, with BufferLoad fix) ──
         std::env::remove_var("T0_SKIP_WAITOPT");
         // Must create a fresh kernel so env var takes effect at compile time
         let kernel_b = lower_gemm(&spec);
-        let asm_b = kernel_b.to_assembly(Target::GFX1100).expect("compile B");
+        let asm_b = kernel_b.to_assembly(Target::detect()).expect("compile B");
 
         // Re-enable skip for other tests
         std::env::set_var("T0_SKIP_WAITOPT", "1");
@@ -3426,7 +3473,7 @@ mod compile_tests {
             eprintln!("  x_loads/thread={}, wt_loads/thread={}", x_loads, wt_loads);
 
             // Compile
-            match t0k.compile(Target::GFX1100) {
+            match t0k.compile(Target::detect()) {
                 Ok(_) => eprintln!("  ✅ compile OK"),
                 Err(e) => eprintln!("  ❌ compile FAILED: {}", e),
             }
@@ -3456,7 +3503,7 @@ mod compile_tests {
         for &(m, k, n) in &sizes {
             let cfg = gemm_gen::auto_select(m, k, n);
             let t0k = gemm_gen::generate(&cfg);
-            match t0k.compile(Target::GFX1100) {
+            match t0k.compile(Target::detect()) {
                 Ok(_) => {
                     let (gx, gy) = gemm_gen::compute_grid_auto(&cfg, m, n);
                     eprintln!("{:<15} {:<25} ✅ grid=[{},{},1]",
@@ -4415,8 +4462,8 @@ mod gpu_tests {
         let k32 = lower_gemm(&spec32);
         let k64 = lower_gemm(&spec64);
 
-        let asm32 = k32.to_assembly(crate::t0::ir::Target::GFX1100).unwrap();
-        let asm64 = k64.to_assembly(crate::t0::ir::Target::GFX1100).unwrap();
+        let asm32 = k32.to_assembly(crate::t0::ir::Target::detect()).unwrap();
+        let asm64 = k64.to_assembly(crate::t0::ir::Target::detect()).unwrap();
 
         // Save full assembly to /tmp for inspection
         std::fs::write("/tmp/tile_32x64.s", &asm32).unwrap();
@@ -4951,7 +4998,7 @@ mod gpu_tests {
             .with_epilogue(vec![EpilogueOp::ReLU]);
         assert!(spec.name().contains("_relu"));
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ GEMM+ReLU: {} bytes ELF", elf.len());
     }
@@ -4962,7 +5009,7 @@ mod gpu_tests {
             .with_epilogue(vec![EpilogueOp::SiLU]);
         assert!(spec.name().contains("_silu"));
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ GEMM+SiLU: {} bytes ELF", elf.len());
     }
@@ -4973,7 +5020,7 @@ mod gpu_tests {
             .with_epilogue(vec![EpilogueOp::GELU]);
         assert!(spec.name().contains("_gelu"));
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ GEMM+GELU: {} bytes ELF", elf.len());
     }
@@ -4985,7 +5032,7 @@ mod gpu_tests {
         assert!(spec.name().contains("_bias_relu"));
         assert!(spec.has_epilogue_bias());
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         // kernel should have extra bias_ptr argument
         let args = kernel.args();
@@ -4999,7 +5046,7 @@ mod gpu_tests {
         let spec = TileGemm::tile_64x64_k16()
             .with_epilogue(vec![EpilogueOp::Scale]);
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         let args = kernel.args();
         let has_scale_arg = args.iter().any(|a| a.name == "epi_scale");
@@ -5014,7 +5061,7 @@ mod gpu_tests {
         assert!(spec.epilogue.is_empty());
         assert!(!spec.name().contains("_relu"));
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ Plain GEMM (no epilogue): {} bytes ELF", elf.len());
     }

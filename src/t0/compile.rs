@@ -49,6 +49,8 @@ pub struct T0Kernel {
     /// Opt passes must not separate instructions belonging to a group.
     coalesced_groups: Vec<CoalescedGroup>,
     next_coalesced_group_id: u32,
+    /// Target GPU (affects WMMA operand widths, encoding, etc.)
+    target: Target,
 }
 
 /// A group of VRegs that must be allocated to consecutive physical registers.
@@ -84,6 +86,22 @@ impl T0Kernel {
             skip_cse: false,
             coalesced_groups: Vec::new(),
             next_coalesced_group_id: 0,
+            target: Target::detect(),
+        }
+    }
+
+    /// Get the target GPU for this kernel.
+    pub fn target(&self) -> Target { self.target }
+
+    /// Override the target GPU (default: Target::detect()).
+    pub fn set_target(&mut self, t: Target) { self.target = t; }
+
+    /// Returns the number of VGPRs per fragment for WMMA A/B operands on this target.
+    /// GFX1100 (wave64 bf16): 8 VGPRs; GFX1200 (wave32 bf16): 4 VGPRs.
+    pub fn wmma_ab_frag_size(&self) -> u32 {
+        match self.target {
+            Target::GFX1200 => 4,
+            Target::GFX1100 => 8,
         }
     }
 
@@ -453,7 +471,8 @@ impl T0Kernel {
     }
 
     pub fn wmma_bf16_f32(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
-        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::BF16_F32 });
+        let ab_width = self.wmma_ab_frag_size() as u8;
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::BF16_F32, ab_width });
     }
 
     pub fn label(&mut self, name: &str) {
@@ -478,6 +497,10 @@ impl T0Kernel {
 
     pub fn wait_lgkmcnt(&mut self, n: u8) {
         self.ops.push(Op::WaitLgkmcnt(n));
+    }
+
+    pub fn wait_kmcnt(&mut self, n: u8) {
+        self.ops.push(Op::WaitKmcnt(n));
     }
 
     pub fn wait_vscnt(&mut self, n: u8) {

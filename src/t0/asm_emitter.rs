@@ -11,6 +11,7 @@ use super::regalloc::RegAlloc;
 pub struct AsmEmitter {
     buf: String,
     indent: &'static str,
+    target: Target,
     // Waitcnt tracking: count outstanding memory ops to avoid redundant waits
     outstanding_vmcnt: u32,   // pending global loads
     outstanding_lgkmcnt: u32, // pending LDS / scalar loads
@@ -28,6 +29,7 @@ impl AsmEmitter {
         Self {
             buf: String::with_capacity(8192),
             indent: "  ",
+            target: Target::detect(),
             outstanding_vmcnt: 0,
             outstanding_lgkmcnt: 0,
             outstanding_vscnt: 0,
@@ -50,6 +52,7 @@ impl AsmEmitter {
         lds_size: u32,
         wgp_mode: bool,
     ) {
+        self.target = target;
         // Header
         writeln!(self.buf, ".amdgcn_target \"amdgcn-amd-amdhsa--{}\"", target.mcpu_str()).unwrap();
         writeln!(self.buf).unwrap();
@@ -60,6 +63,12 @@ impl AsmEmitter {
         writeln!(self.buf, ".p2align 8").unwrap();
         writeln!(self.buf, ".type {},@function", name).unwrap();
         writeln!(self.buf, "{}:", name).unwrap();
+
+        // GFX1200: MUBUF soffset must be an SGPR, not an immediate literal.
+        // Reserve s63 as a dedicated zero register for buffer instructions.
+        if target == Target::GFX1200 {
+            writeln!(self.buf, "  s_mov_b32 s63, 0").unwrap();
+        }
 
         // Emit all ops
         for op in ops {
@@ -80,7 +89,13 @@ impl AsmEmitter {
         writeln!(self.buf, "  .amdhsa_kernarg_size {}", kernarg_size).unwrap();
         writeln!(self.buf, "  .amdhsa_user_sgpr_kernarg_segment_ptr 1").unwrap();
         writeln!(self.buf, "  .amdhsa_next_free_vgpr {}", alloc.total_vgprs).unwrap();
-        writeln!(self.buf, "  .amdhsa_next_free_sgpr {}", alloc.total_sgprs).unwrap();
+        // GFX1200: s63 is reserved as zero register for MUBUF soffset
+        let sgpr_count = if target == Target::GFX1200 {
+            alloc.total_sgprs.max(64)
+        } else {
+            alloc.total_sgprs
+        };
+        writeln!(self.buf, "  .amdhsa_next_free_sgpr {}", sgpr_count).unwrap();
         writeln!(self.buf, "  .amdhsa_wavefront_size32 1").unwrap();
         writeln!(self.buf, "  .amdhsa_system_sgpr_workgroup_id_x 1").unwrap();
         writeln!(self.buf, "  .amdhsa_system_sgpr_workgroup_id_y 1").unwrap();
@@ -108,7 +123,7 @@ impl AsmEmitter {
         // On control flow / sync, reset tracking (conservative but correct).
         if matches!(op, Op::Label(_) | Op::Branch(_) | Op::BranchScc0(_) | Op::BranchScc1(_)
             | Op::BranchVccz(_) | Op::Barrier | Op::SBarrier
-            | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)) {
+            | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) | Op::WaitKmcnt(_)) {
             self.last_writer.fill(0);
         }
 
@@ -218,8 +233,13 @@ impl AsmEmitter {
                     Width::B128 => "buffer_load_b128",
                 };
                 let dst_str = vreg_range_str(vd, width.vreg_count());
+                // GFX1200: MUBUF soffset must be SGPR, not immediate literal
                 let soff_str = if *soffset == SOFFSET_ZERO {
-                    "0".to_string()
+                    if self.target == Target::GFX1200 {
+                        "s63".to_string()
+                    } else {
+                        "0".to_string()
+                    }
                 } else {
                     format!("s{}", a.phys_s(*soffset))
                 };
@@ -244,8 +264,13 @@ impl AsmEmitter {
                     Width::B128 => "buffer_store_b128",
                 };
                 let src_str = vreg_range_str(vs, width.vreg_count());
+                // GFX1200: MUBUF soffset must be SGPR, not immediate literal
                 let soff_str = if *soffset == SOFFSET_ZERO {
-                    "0".to_string()
+                    if self.target == Target::GFX1200 {
+                        "s63".to_string()
+                    } else {
+                        "0".to_string()
+                    }
                 } else {
                     format!("s{}", a.phys_s(*soffset))
                 };
@@ -493,7 +518,7 @@ impl AsmEmitter {
             }
 
             // ── WMMA ──
-            Op::Wmma { dst, a: va, b: vb, c: vc, format } => {
+            Op::Wmma { dst, a: va, b: vb, c: vc, format, .. } => {
                 let d = a.phys_v(*dst);
                 let pa = a.phys_v(*va);
                 let pb = a.phys_v(*vb);
@@ -503,9 +528,15 @@ impl AsmEmitter {
                     WmmaFormat::F16_F32 => "v_wmma_f32_16x16x16_f16",
                     WmmaFormat::BF16_BF16 => "v_wmma_bf16_16x16x16_bf16",
                 };
+                // GFX1200 (RDNA4 wave32): A/B use 4 VGPRs, dst/C use 8 VGPRs
+                // GFX1100 (RDNA3 wave32): all operands use 8 VGPRs
+                let (a_end, b_end) = match self.target {
+                    Target::GFX1200 => (pa + 3, pb + 3),
+                    Target::GFX1100 => (pa + 7, pb + 7),
+                };
                 writeln!(self.buf, "{}{} v[{}:{}], v[{}:{}], v[{}:{}], v[{}:{}]",
                     self.indent, instr,
-                    d, d + 7, pa, pa + 7, pb, pb + 7, pc, pc + 7).unwrap();
+                    d, d + 7, pa, a_end, pb, b_end, pc, pc + 7).unwrap();
             }
 
             // ── Control flow ──
@@ -521,12 +552,25 @@ impl AsmEmitter {
 
             // ── Synchronization ──
             Op::Barrier => {
-                writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
+                match self.target {
+                    Target::GFX1200 => {
+                        writeln!(self.buf, "{}s_barrier_signal -1", self.indent).unwrap();
+                        writeln!(self.buf, "{}s_barrier_wait -1", self.indent).unwrap();
+                    }
+                    Target::GFX1100 => {
+                        writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
+                    }
+                }
             }
             Op::WaitVmcnt(n) => {
                 if self.outstanding_vmcnt > 0 || *n > 0 {
                     let actual = (*n as u32).min(self.outstanding_vmcnt);
-                    writeln!(self.buf, "{}s_waitcnt vmcnt({})", self.indent, actual).unwrap();
+                    match self.target {
+                        Target::GFX1200 =>
+                            writeln!(self.buf, "{}s_wait_loadcnt {}", self.indent, actual).unwrap(),
+                        Target::GFX1100 =>
+                            writeln!(self.buf, "{}s_waitcnt vmcnt({})", self.indent, actual).unwrap(),
+                    }
                     self.outstanding_vmcnt = actual;
                     self.waits_emitted += 1;
                 } else {
@@ -536,7 +580,12 @@ impl AsmEmitter {
             Op::WaitLgkmcnt(n) => {
                 if self.outstanding_lgkmcnt > 0 || *n > 0 {
                     let actual = (*n as u32).min(self.outstanding_lgkmcnt);
-                    writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
+                    match self.target {
+                        Target::GFX1200 =>
+                            writeln!(self.buf, "{}s_wait_kmcnt {}", self.indent, actual).unwrap(),
+                        Target::GFX1100 =>
+                            writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap(),
+                    }
                     self.outstanding_lgkmcnt = actual;
                     self.waits_emitted += 1;
                 } else {
@@ -546,12 +595,34 @@ impl AsmEmitter {
             Op::WaitVscnt(n) => {
                 if self.outstanding_vscnt > 0 || *n > 0 {
                     let actual = (*n as u32).min(self.outstanding_vscnt);
-                    writeln!(self.buf, "{}s_waitcnt_vscnt null, {:#x}", self.indent, actual).unwrap();
+                    // GFX11 exposes VSCNT via the split s_waitcnt_vscnt (VINTRP space);
+                    // GFX12 removed it — the unified s_waitcnt simm16 encodes
+                    // storecnt, and the dedicated form is s_wait_storecnt.
+                    match self.target {
+                        Target::GFX1200 => {
+                            writeln!(self.buf, "{}s_wait_storecnt {:#x}", self.indent, actual).unwrap();
+                        }
+                        Target::GFX1100 => {
+                            writeln!(self.buf, "{}s_waitcnt_vscnt null, {:#x}", self.indent, actual).unwrap();
+                        }
+                    }
                     self.outstanding_vscnt = actual;
                     self.waits_emitted += 1;
                 } else {
                     self.waits_elided += 1;
                 }
+            }
+            Op::WaitKmcnt(n) => {
+                // Scalar memory wait: s_wait_kmcnt on GFX1200, s_waitcnt lgkmcnt on GFX11
+                match self.target {
+                    Target::GFX1200 => {
+                        writeln!(self.buf, "{}s_wait_kmcnt {}", self.indent, n).unwrap();
+                    }
+                    Target::GFX1100 => {
+                        writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, n).unwrap();
+                    }
+                }
+                self.waits_emitted += 1;
             }
             Op::ClearVcc => {
                 writeln!(self.buf, "{}s_mov_b32 vcc_lo, 0", self.indent).unwrap();
@@ -656,13 +727,17 @@ impl AsmEmitter {
             Op::WaveReduceAddF32 { val, tmp } => {
                 let vv = a.phys_v(*val);
                 let vt = a.phys_v(*tmp);
+                let ds_wait = match self.target {
+                    Target::GFX1200 => "s_wait_dscnt 0",
+                    Target::GFX1100 => "s_waitcnt lgkmcnt(0)",
+                };
                 for (offset, label) in &[
                     (0x401Fu16, "xor16"), (0x201F, "xor8"),
                     (0x101F, "xor4"), (0x081F, "xor2"), (0x041F, "xor1"),
                 ] {
                     writeln!(self.buf, "{}ds_swizzle_b32 v{}, v{} offset:{:#06x}  ; {}",
                         self.indent, vt, vv, offset, label).unwrap();
-                    writeln!(self.buf, "{}s_waitcnt lgkmcnt(0)", self.indent).unwrap();
+                    writeln!(self.buf, "{}{}", self.indent, ds_wait).unwrap();
                     writeln!(self.buf, "{}v_add_f32 v{}, v{}, v{}",
                         self.indent, vv, vv, vt).unwrap();
                 }
@@ -670,13 +745,17 @@ impl AsmEmitter {
             Op::WaveReduceMaxF32 { val, tmp } => {
                 let vv = a.phys_v(*val);
                 let vt = a.phys_v(*tmp);
+                let ds_wait = match self.target {
+                    Target::GFX1200 => "s_wait_dscnt 0",
+                    Target::GFX1100 => "s_waitcnt lgkmcnt(0)",
+                };
                 for (offset, label) in &[
                     (0x401Fu16, "xor16"), (0x201F, "xor8"),
                     (0x101F, "xor4"), (0x081F, "xor2"), (0x041F, "xor1"),
                 ] {
                     writeln!(self.buf, "{}ds_swizzle_b32 v{}, v{} offset:{:#06x}  ; {}",
                         self.indent, vt, vv, offset, label).unwrap();
-                    writeln!(self.buf, "{}s_waitcnt lgkmcnt(0)", self.indent).unwrap();
+                    writeln!(self.buf, "{}{}", self.indent, ds_wait).unwrap();
                     writeln!(self.buf, "{}v_max_f32 v{}, v{}, v{}",
                         self.indent, vv, vv, vt).unwrap();
                 }
@@ -788,7 +867,15 @@ impl AsmEmitter {
                     self.indent, vd, va, offset).unwrap();
             }
             Op::SBarrier => {
-                writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
+                match self.target {
+                    Target::GFX1200 => {
+                        writeln!(self.buf, "{}s_barrier_signal -1", self.indent).unwrap();
+                        writeln!(self.buf, "{}s_barrier_wait -1", self.indent).unwrap();
+                    }
+                    Target::GFX1100 => {
+                        writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
+                    }
+                }
             }
 
             Op::VCmpLtU32 { src0, src1 } => {

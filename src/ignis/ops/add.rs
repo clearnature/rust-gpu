@@ -56,7 +56,7 @@ pub fn add(a: &Tensor, b: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, S
             let sum = va.add(&mut kb, vb);
             kb.store_checked(out_ptr, off, sum, n_arg);
 
-            let compiled = kb.compile(Target::GFX1100)?;
+            let compiled = kb.compile(Target::detect())?;
             runtime.compile_dsl(compiled)?
         }
     };
@@ -157,7 +157,7 @@ pub fn scale(a: &Tensor, scalar: f32, _device: &Arc<KfdDevice>) -> Result<Tensor
             let scaled = va.mul(&mut kb, s_arg);
             kb.store_checked(out_ptr, off, scaled, n_arg);
 
-            let compiled = kb.compile(Target::GFX1100)?;
+            let compiled = kb.compile(Target::detect())?;
             runtime.compile_dsl(compiled)?
         }
     };
@@ -256,7 +256,7 @@ pub fn sum(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
                 let mask_lane0 = tid.lt(&mut kb, one);
                 kb.store(out_ptr, pid, wg_sum, mask_lane0);
 
-                let compiled = kb.compile(Target::GFX1100)?;
+                let compiled = kb.compile(Target::detect())?;
                 runtime.compile_dsl(compiled)?
             }
         };
@@ -343,7 +343,7 @@ pub fn elementwise_mul(a: &Tensor, b: &Tensor, _device: &Arc<KfdDevice>) -> Resu
             let prod = va.mul(&mut kb, vb);
             kb.store_checked(out_ptr, off, prod, n_arg);
 
-            let compiled = kb.compile(Target::GFX1100)?;
+            let compiled = kb.compile(Target::detect())?;
             runtime.compile_dsl(compiled)?
         }
     };

@@ -1488,7 +1488,7 @@ impl LoweredTiledGemm {
 /// let mut f = TileFunc::new("my_gemm");
 /// // ... build with tile_load_2d, tile_dot, tile_store_2d ...
 /// let result = lower_tiled_gemm(&f)?;
-/// let elf = result.kernel.compile(Target::GFX1100)?;
+/// let elf = result.kernel.compile(Target::detect())?;
 /// ```
 pub fn lower_tiled_gemm(func: &TileFunc) -> Result<LoweredTiledGemm, String> {
     // Step 1: 分析 SSA 图
@@ -1560,7 +1560,7 @@ mod tests {
         assert_eq!(lowered.wg_size, 128);
 
         // Verify it compiles to ELF
-        let elf = lowered.kernel.compile(Target::GFX1100);
+        let elf = lowered.kernel.compile(Target::detect());
         assert!(elf.is_ok(), "Compilation failed: {:?}", elf.err());
         let elf_bytes = elf.unwrap();
         assert!(elf_bytes.len() > 100, "ELF too small: {} bytes", elf_bytes.len());
@@ -1583,7 +1583,7 @@ mod tests {
         f.return_();
 
         let lowered = lower_elementwise_1d(&f, 128, 1).unwrap();
-        let asm = lowered.kernel.to_assembly(Target::GFX1100).unwrap();
+        let asm = lowered.kernel.to_assembly(Target::detect()).unwrap();
         std::fs::write("/tmp/vadd_asm.txt", &asm).unwrap();
         eprintln!("✓ ASM written to /tmp/vadd_asm.txt ({} bytes, kernarg={})",
                   asm.len(), lowered.kernel.kernarg_size());
@@ -1608,7 +1608,7 @@ mod tests {
         let result = lower_elementwise_1d(&f, 64, 1);
         assert!(result.is_ok(), "Lowering failed: {:?}", result.err());
 
-        let elf = result.unwrap().kernel.compile(Target::GFX1100);
+        let elf = result.unwrap().kernel.compile(Target::detect());
         assert!(elf.is_ok(), "Compilation failed: {:?}", elf.err());
         eprintln!("✓ scale: SSA → ELF ({} bytes)", elf.unwrap().len());
     }
@@ -1630,7 +1630,7 @@ mod tests {
         let result = lower_elementwise_1d(&f, 128, 1);
         assert!(result.is_ok(), "Lowering failed: {:?}", result.err());
 
-        let elf = result.unwrap().kernel.compile(Target::GFX1100);
+        let elf = result.unwrap().kernel.compile(Target::detect());
         assert!(elf.is_ok(), "Compilation failed: {:?}", elf.err());
         eprintln!("✓ silu: SSA → ELF ({} bytes)", elf.unwrap().len());
     }
@@ -1654,7 +1654,7 @@ mod tests {
         f.return_();
 
         let lowered = lower_elementwise_1d(&f, 128, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
 
         let device = KfdDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
@@ -1724,7 +1724,7 @@ mod tests {
         f.return_();
 
         let lowered = lower_elementwise_1d(&f, n, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
 
         let device = KfdDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
@@ -1810,7 +1810,7 @@ mod tests {
         f.return_();
 
         let lowered = lower_elementwise_1d(&f, wg_size, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
 
         let device = KfdDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
@@ -1895,10 +1895,10 @@ mod tests {
         let lowered = lower_elementwise_1d(&f, n, 1).unwrap();
 
         // Dump asm for debugging
-        let asm = lowered.kernel.to_assembly(Target::GFX1100).unwrap();
+        let asm = lowered.kernel.to_assembly(Target::detect()).unwrap();
         eprintln!("=== forloop asm ===\n{}\n===", asm);
 
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
 
         let device = KfdDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
@@ -1966,7 +1966,7 @@ mod tests {
         f.return_();
 
         let lowered = lower_elementwise_1d(&f, n, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
 
         let device = KfdDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
@@ -2038,7 +2038,7 @@ mod tests {
         assert_eq!(u64::from_le_bytes(ka[8..16].try_into().unwrap()), 0x2000);
 
         // Compile to ELF
-        let elf = dot.kernel.compile(Target::GFX1100);
+        let elf = dot.kernel.compile(Target::detect());
         assert!(elf.is_ok(), "GEMM ELF compilation failed: {:?}", elf.err());
         let elf_bytes = elf.unwrap();
         assert!(elf_bytes.len() > 500, "GEMM ELF too small: {} bytes", elf_bytes.len());
@@ -2065,7 +2065,7 @@ mod tests {
         // ── Generate GEMM kernel ──
         let dot = lower_dot(m, k_dim, n).expect("lower_dot failed");
         eprintln!("[dot_gpu] config={}, wg={}, lds={}", dot.config.name(), dot.wg_size(), dot.lds_size());
-        let elf = dot.kernel.compile(Target::GFX1100).expect("compile failed");
+        let elf = dot.kernel.compile(Target::detect()).expect("compile failed");
         eprintln!("[dot_gpu] ELF compiled: {} bytes", elf.len());
 
         // ── Prepare bf16 input data ──
@@ -2190,7 +2190,7 @@ mod tests {
             lowered.spec.name(), lowered.wg_size(), lowered.lds_size());
 
         // Compile to ELF
-        let elf = lowered.kernel.compile(Target::GFX1100);
+        let elf = lowered.kernel.compile(Target::detect());
         assert!(elf.is_ok(), "ELF compilation failed: {:?}", elf.err());
         let elf_bytes = elf.unwrap();
         assert!(elf_bytes.len() > 100, "ELF too small: {} bytes", elf_bytes.len());
@@ -2234,7 +2234,7 @@ mod tests {
 
         // Lower
         let lowered = lower_tiled_gemm(&f).expect("lower_tiled_gemm failed");
-        let elf = lowered.kernel.compile(Target::GFX1100).expect("compile failed");
+        let elf = lowered.kernel.compile(Target::detect()).expect("compile failed");
         eprintln!("[tiled_gemm_gpu] spec={}, wg={}, lds={}, ELF={}B",
             lowered.spec.name(), lowered.wg_size(), lowered.lds_size(), elf.len());
 
@@ -2324,7 +2324,7 @@ mod tests {
     fn test_elem_chain_swiglu_compile() {
         let func = ElemChain::swiglu(256);
         let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         assert_eq!(&elf[0..4], &[0x7f, b'E', b'L', b'F']);
         eprintln!("✓ swiglu: {} bytes ELF", elf.len());
@@ -2334,7 +2334,7 @@ mod tests {
     fn test_elem_chain_scale_add_compile() {
         let func = ElemChain::scale_add(256);
         let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ scale_add: {} bytes ELF", elf.len());
     }
@@ -2343,7 +2343,7 @@ mod tests {
     fn test_elem_chain_residual_scale_compile() {
         let func = ElemChain::residual_add_scale(256);
         let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ residual_scale: {} bytes ELF", elf.len());
     }
@@ -2352,7 +2352,7 @@ mod tests {
     fn test_elem_chain_weight_decay_compile() {
         let func = ElemChain::weight_decay_update(256);
         let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ weight_decay: {} bytes ELF", elf.len());
     }
@@ -2361,7 +2361,7 @@ mod tests {
     fn test_elem_chain_abs_clip_compile() {
         let func = ElemChain::abs_clip(256);
         let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ abs_clip: {} bytes ELF", elf.len());
     }
@@ -2370,7 +2370,7 @@ mod tests {
     fn test_elem_chain_axpy_compile() {
         let func = ElemChain::axpy(256);
         let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ axpy: {} bytes ELF", elf.len());
     }
@@ -2384,7 +2384,7 @@ mod tests {
             .relu()
             .build(128);
         let lowered = lower_elementwise_1d(&func, 128, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ custom_relu: {} bytes ELF", elf.len());
     }
@@ -2397,7 +2397,7 @@ mod tests {
             .sigmoid_op()
             .build(128);
         let lowered = lower_elementwise_1d(&func, 128, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ custom_sigmoid: {} bytes ELF", elf.len());
     }
@@ -2411,7 +2411,7 @@ mod tests {
             .relu()
             .build(128);
         let lowered = lower_elementwise_1d(&func, 128, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ inplace_relu: {} bytes ELF", elf.len());
     }
@@ -2448,7 +2448,7 @@ mod tests {
 
         let n = expected.len() as u32;
         let lowered = lower_elementwise_1d(func, wg_size, 1).unwrap();
-        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        let elf = lowered.kernel.compile(Target::detect()).unwrap();
 
         let device = KfdDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
@@ -2640,20 +2640,20 @@ mod tests {
         // Fused kernel: out = a * alpha + b (1 dispatch)
         let fused_func = ElemChain::scale_add(wg_size);
         let fused_lowered = lower_elementwise_1d(&fused_func, wg_size, 1).unwrap();
-        let fused_elf = fused_lowered.kernel.compile(Target::GFX1100).unwrap();
+        let fused_elf = fused_lowered.kernel.compile(Target::detect()).unwrap();
 
         // Separate kernels: scale + add (2 dispatches)
         let scale_func = ElemChain::new("scale_only")
             .input("x").output("y").scalar("alpha")
             .scale("alpha").build(wg_size);
         let scale_lowered = lower_elementwise_1d(&scale_func, wg_size, 1).unwrap();
-        let scale_elf = scale_lowered.kernel.compile(Target::GFX1100).unwrap();
+        let scale_elf = scale_lowered.kernel.compile(Target::detect()).unwrap();
 
         let add_func = ElemChain::new("add_only")
             .input("a").input("b").output("y")
             .add_input(1).build(wg_size);
         let add_lowered = lower_elementwise_1d(&add_func, wg_size, 1).unwrap();
-        let add_elf = add_lowered.kernel.compile(Target::GFX1100).unwrap();
+        let add_elf = add_lowered.kernel.compile(Target::detect()).unwrap();
 
         use crate::kfd::{GpuKernel, KernelLoadConfig};
         let load_cfg = KernelLoadConfig { workgroup_size: [wg_size, 1, 1], lds_size: 0 };

@@ -78,7 +78,7 @@ pub fn embedding_forward(
                 kb.store(out_ptr, o_idx, val, mask);
             }
 
-            let compiled = kb.compile(Target::GFX1100)?;
+            let compiled = kb.compile(Target::detect())?;
             runtime.compile_dsl(compiled)?
         }
     };
@@ -155,7 +155,7 @@ pub fn embedding_forward(
                             kb.atomic_add_f32(grad_table_ptr, t_idx, gval, mask);
                         }
 
-                        let compiled = kb.compile(Target::GFX1100)?;
+                        let compiled = kb.compile(Target::detect())?;
                         runtime.compile_dsl(compiled)?
                     }
                 };

@@ -208,6 +208,13 @@ pub fn verify_ops(ops: &[Op]) -> VerifyResult {
                     pending_lds_loads -= *n as u32;
                 }
             }
+            Op::WaitKmcnt(n) => {
+                if *n == 0 {
+                    pending_lds_loads = 0;
+                } else if pending_lds_loads > *n as u32 {
+                    pending_lds_loads -= *n as u32;
+                }
+            }
 
             // -- WMMA operand alignment check --
             // This check is ONLY meaningful after regalloc has mapped virtual VRegs
@@ -357,6 +364,7 @@ fn format_op_short(op: &Op) -> String {
                 dst.0, dst.0+7, a.0, a.0+7, b.0, b.0+7, c.0, c.0+7),
         Op::WaitVmcnt(n) => format!("s_waitcnt vmcnt({})", n),
         Op::WaitLgkmcnt(n) => format!("s_waitcnt lgkmcnt({})", n),
+        Op::WaitKmcnt(n) => format!("s_wait_kmcnt {}", n),
         Op::Barrier | Op::SBarrier => "s_barrier".into(),
         Op::SaveExec { dst } => format!("s_and_saveexec_b32 s{}, vcc", dst.0),
         Op::RestoreExec { src } => format!("s_mov_b32 exec_lo, s{}", src.0),
@@ -390,6 +398,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::BranchScc0(_) => "s_cbranch_scc0",
         Op::WaitVmcnt(_) => "s_waitcnt_vmcnt",
         Op::WaitLgkmcnt(_) => "s_waitcnt_lgkmcnt",
+        Op::WaitKmcnt(_) => "s_wait_kmcnt",
         _ => "op",
     }
 }

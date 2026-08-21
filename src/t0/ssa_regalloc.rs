@@ -998,11 +998,15 @@ mod tests {
             }
         }
 
-        // Verify: should have a VMov initializing the spill address register
-        let has_spill_init = test_ops.iter().any(|op| {
-            matches!(op, Op::VMov { src: Operand::InlineInt(0), .. })
+        // Verify: should have VMov (stride) + VMulLoU32 (spill_addr = v0 * stride)
+        let has_spill_stride = test_ops.iter().any(|op| {
+            matches!(op, Op::VMov { src: Operand::Literal(_), .. })
         });
-        assert!(has_spill_init, "should initialize spill addr VReg to 0");
+        let has_spill_mul = test_ops.iter().any(|op| {
+            matches!(op, Op::VMulLoU32 { src0: VReg(0), .. })
+        });
+        assert!(has_spill_stride, "should initialize spill stride VReg");
+        assert!(has_spill_mul, "should compute spill addr via v_mul_lo_u32");
 
         eprintln!("[test] spill insertion: {} stores, {} loads, {} LDS bytes",
             result.stores_inserted, result.loads_inserted, result.spill_lds_bytes);

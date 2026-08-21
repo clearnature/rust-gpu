@@ -10,7 +10,7 @@
 //! let mut kb = BlockKernel::new("vadd", 256);
 //! let x = kb.arg_ptr("x");
 //! // ... build kernel ...
-//! let compiled = kb.compile(Target::GFX1100)?;
+//! let compiled = kb.compile(Target::detect())?;
 //! ```
 
 pub mod ir;

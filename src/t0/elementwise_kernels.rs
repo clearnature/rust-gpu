@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn test_memcpy_compiles() {
         let kb = build_memcpy();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("memcpy compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("memcpy compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ memcpy: {} bytes ELF", ck.elf.len());
     }
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn test_residual_add_compiles() {
         let kb = build_residual_add();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("residual_add compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("residual_add compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ residual_add: {} bytes ELF", ck.elf.len());
     }
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn test_scale_compiles() {
         let kb = build_scale();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("scale compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("scale compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ scale: {} bytes ELF", ck.elf.len());
     }
@@ -142,7 +142,7 @@ mod tests {
         let output_buf = rt.alloc_f32(n as usize).unwrap();
 
         let kb = build_memcpy();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile");
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile");
         let kernel = GpuKernel::load(&rt.device, &ck.elf, &KernelLoadConfig {
             workgroup_size: ck.workgroup_size, lds_size: ck.lds_size,
         }).expect("load");
@@ -187,7 +187,7 @@ mod tests {
         let y_buf = rt.upload_f32(&y).unwrap();
 
         let kb = build_residual_add();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile");
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile");
         let kernel = GpuKernel::load(&rt.device, &ck.elf, &KernelLoadConfig {
             workgroup_size: ck.workgroup_size, lds_size: ck.lds_size,
         }).expect("load");

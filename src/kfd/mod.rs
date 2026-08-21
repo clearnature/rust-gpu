@@ -258,6 +258,8 @@ pub struct KfdDevice {
     pub kfd_fd: RawFd,
     drm_fd: RawFd,
     pub gpu_id: u32,
+    /// GFX target version from sysfs decimal format (e.g. 110000 for gfx1100, 120000 for gfx1200)
+    pub gfx_target_version: u32,
     /// Base VA for user allocations (auto-incremented, 2MB aligned)
     next_va: std::sync::atomic::AtomicU64,
     /// Event page handle for cleanup (allocated during open)
@@ -414,6 +416,34 @@ impl KfdDevice {
             alloc_args.handle
         };
 
+        // Read gfx_target_version from sysfs topology (decimal format: 110000=gfx1100, 120000=gfx1200)
+        let gfx_target_version = {
+            let mut ver = 110000u32; // default: gfx1100
+            for node in 1..=8 {
+                // Check gpu_id from separate sysfs file
+                let gpu_id_path = format!("/sys/class/kfd/kfd/topology/nodes/{}/gpu_id", node);
+                let node_gpu_id: u32 = std::fs::read_to_string(&gpu_id_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
+                if node_gpu_id != gpu_id { continue; }
+                // Found matching node — read gfx_target_version from properties
+                let prop_path = format!("/sys/class/kfd/kfd/topology/nodes/{}/properties", node);
+                if let Ok(props) = std::fs::read_to_string(&prop_path) {
+                    for line in props.lines() {
+                        let mut it = line.split_whitespace();
+                        if let (Some("gfx_target_version"), Some(v)) = (it.next(), it.next()) {
+                            ver = v.parse().unwrap_or(110000);
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+            ver
+        };
+        eprintln!("[KFD] GFX target version: {} (gfx{})", gfx_target_version, gfx_target_version / 10000);
+
         // CREATE_EVENT with event_page_offset = handle
         // This initializes the KFD event page in the kernel
         #[repr(C)]
@@ -439,6 +469,7 @@ impl KfdDevice {
             kfd_fd,
             drm_fd,
             gpu_id,
+            gfx_target_version,
             next_va: std::sync::atomic::AtomicU64::new(0x1_0000_0000),
             event_page_handle: event_page,
             event_page_va: 0, // VA is managed by kernel, not tracked for munmap
@@ -665,6 +696,72 @@ impl KfdDevice {
         })
     }
 
+    /// Determine CWSR sizes for this GPU. Reads the KFD topology properties
+    /// once, then either trusts the kernel-reported values (cwsr_size /
+    /// ctl_stack_size, exported by modern kernels) or falls back to the
+    /// official libhsakmt formula from update_ctx_save_restore_size()
+    /// (rocr-runtime/libhsakmt/src/queues.c):
+    ///   cu_num  = NumFComputeCores / NumSIMDPerCU / NumXcc
+    ///   wave_num = cu_num * 32          (gfxv >= NAVI10)
+    ///   ctl_stack = PAGE_ALIGN(sizeof(HsaUserContextSaveAreaHeader=40) + wave_num*12 + 8)
+    ///   wg_data   = cu_num * (vgpr + sgpr + lds + hwreg)
+    ///     where vgpr=0x60000 for gfx1151/gfx1200/gfx1201 (hsakmt_get_vgpr_size_per_cu),
+    ///           sgpr=0x4000 (SGPR_SIZE_PER_CU), hwreg=0x1000 (HWREG_SIZE_PER_CU),
+    ///           lds from topology lds_size_in_kb
+    ///   ctx_save_restore_size = ctl_stack + PAGE_ALIGN(wg_data)
+    /// Returns (ctx_save_restore_size, ctl_stack_size, wave_num).
+    fn cwsr_sizes(&self) -> Result<(u32, u32, u32), String> {
+        let mut simd_count = 0u32;
+        let mut simd_per_cu = 2u32;
+        let mut num_xcc = 1u32;
+        let mut lds_kb = 64u32;
+        let mut gfxv: u32 = 120000; // default gfx1200 (sysfs decimal format)
+        let mut sysfs_cwsr = 0u32;
+        let mut sysfs_ctl = 0u32;
+        for node in 0..=8 {
+            let gpu_path = format!("/sys/class/kfd/kfd/topology/nodes/{}/gpu_id", node);
+            if let Ok(content) = std::fs::read_to_string(&gpu_path) {
+                let id: u32 = content.trim().parse().unwrap_or(0);
+                if id == self.gpu_id {
+                    let prop_path = format!("/sys/class/kfd/kfd/topology/nodes/{}/properties", node);
+                    if let Ok(props) = std::fs::read_to_string(&prop_path) {
+                        for line in props.lines() {
+                            let mut it = line.split_whitespace();
+                            match (it.next(), it.next()) {
+                                (Some("simd_count"), Some(v)) => simd_count = v.parse().unwrap_or(0),
+                                (Some("simd_per_cu"), Some(v)) => simd_per_cu = v.parse().unwrap_or(2),
+                                (Some("num_xcc"), Some(v)) => num_xcc = v.parse().unwrap_or(1),
+                                (Some("lds_size_in_kb"), Some(v)) => lds_kb = v.parse().unwrap_or(64),
+                                (Some("gfx_target_version"), Some(v)) => gfxv = v.parse().unwrap_or(120000),
+                                (Some("cwsr_size"), Some(v)) => sysfs_cwsr = v.parse().unwrap_or(0),
+                                (Some("ctl_stack_size"), Some(v)) => sysfs_ctl = v.parse().unwrap_or(0),
+                                _ => {}
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if simd_count == 0 || simd_per_cu == 0 {
+            return Err("cannot read simd_count/simd_per_cu from KFD topology".to_string());
+        }
+        let cu_num = simd_count / simd_per_cu / num_xcc.max(1);
+        let wave_num = cu_num * 32; // gfxv >= NAVI10 (all RDNA+)
+        if sysfs_cwsr > 0 && sysfs_ctl > 0 {
+            return Ok((sysfs_cwsr, sysfs_ctl, wave_num));
+        }
+        let ctl_stack = (40u64 + wave_num as u64 * 12 + 8).div_ceil(4096) as u32 * 4096;
+        let vgpr: u32 = match gfxv {
+            110001 | 110002 | 120000 | 120001 => 0x60000, // gfx1151/gfx1200/gfx1201 (plum_bonito/wheat_nas class)
+            _ => 0x40000,
+        };
+        let wg_data = cu_num as u64 * (vgpr as u64 + 0x4000 + ((lds_kb as u64) << 10) + 0x1000);
+        let wg_data_page = wg_data.div_ceil(4096) as u32 * 4096;
+        let ctx_save = ctl_stack + wg_data_page;
+        Ok((ctx_save, ctl_stack, wave_num))
+    }
+
     /// Create an AQL compute queue with default ring size (4MB = 65536 packets)
     pub fn create_queue(self: &Arc<Self>) -> Result<AqlQueue, String> {
         self.create_queue_sized(4 << 20)  // 4MB default
@@ -703,20 +800,26 @@ impl KfdDevice {
         let eop_buffer = self.alloc_uncached(4096)?;
 
         // CWSR (Context Wave Save Restore) buffer
-        // The hardcoded sizes below are specific to 96 CU (RX 7900 XTX).
-        // On other GPUs, set KFD_NO_CWSR=1 to skip CWSR allocation.
+        // Sizes are ASIC-specific. Preferred source: the kernel's own topology
+        // report (sysfs properties `cwsr_size` / `ctl_stack_size`) — the kernel
+        // validates CREATE_QUEUE against these exact values.
+        // Fallback: compute via the official libhsakmt formula (see
+        // compute_cwsr_sizes), which reproduces the sysfs numbers on gfx1200
+        // (RX 9070 XT: 32 WGP-CUs × 0x75000 → cwsr=15351808, ctl=16384).
+        // On GPUs without CWSR support, set KFD_NO_CWSR=1 to skip allocation.
         let cwsr_disabled = std::env::var("KFD_NO_CWSR").map(|v| v == "1").unwrap_or(false);
         let (cwsr_buffer, cwsr_size, ctl_stack_size) = if !cwsr_disabled {
-            // Kernel formula (kfd_queue.c kfd_queue_ctx_save_restore_size):
-            //   cu_num = 96, wave_num = 3072 (cu_num * 32 for gfxv >= 100100)
-            //   ctl_stack = ALIGN(40 + 3072*12 + 8, 4096) = 40960
-            //   wg_data = ALIGN(96 * (0x60000+0x4000+0x10000+0x1000), 4096) = 46006272
-            //   cwsr_size = 40960 + 46006272 = 46047232
-            //   debug_memory = ALIGN(3072 * 32, 64) = 98304
-            //   total_alloc = ALIGN(cwsr_size + debug_memory, 4096) = 46145536
-            let total_cwsr_alloc: usize = 46145536;    // 0x2C02000 — buffer alloc (incl debug)
+            // debug memory follows libhsakmt: wave_num * 32B, 64B-aligned, appended
+            // after ctx_save_restore (total page-aligned at alloc time below).
+            let (ctx_save, ctl_stack, wave_num) = self.cwsr_sizes()?;
+            let debug_mem = (wave_num as u64 * 32).div_ceil(64) as u32 * 64;
+            let total_cwsr_alloc: usize = (ctx_save as u64 + debug_mem as u64).div_ceil(4096) as usize * 4096;
+            if std::env::var("KFD_DEBUG").is_ok() {
+                eprintln!("[KFD] CWSR: cwsr_size={} ctl_stack={} wave_num={} debug_mem={} total_alloc={}",
+                    ctx_save, ctl_stack, wave_num, debug_mem, total_cwsr_alloc);
+            }
             let buf = self.alloc_uncached(total_cwsr_alloc)?;
-            (Some(buf), 46047232u32, 40960u32)
+            (Some(buf), ctx_save, ctl_stack)
         } else {
             (None, 0u32, 0u32)
         };
@@ -1758,19 +1861,35 @@ impl AqlQueue {
         use crate::rdna3_asm::gfx11;
         use crate::rdna3_code_object::{AmdGpuCodeObject, KernelConfig};
 
-        // Lazy-init: build + load kernel once, reuse forever
-        static MEMSET_KERNEL: OnceLock<GpuKernel> = OnceLock::new();
-        static MEMSET_KA_BUF: OnceLock<GpuBuffer> = OnceLock::new();
+        let is_gfx1200 = buf.device.gfx_target_version >= 120000;
+        let target_gfx = if is_gfx1200 { "gfx1200" } else { "gfx1100" };
 
-        let kernel = MEMSET_KERNEL.get_or_init(|| {
+        // Separate statics per target (kernel binary differs due to wait instructions)
+        static MEMSET_KERNEL_GFX1100: OnceLock<GpuKernel> = OnceLock::new();
+        static MEMSET_KA_BUF_GFX1100: OnceLock<GpuBuffer> = OnceLock::new();
+        static MEMSET_KERNEL_GFX1200: OnceLock<GpuKernel> = OnceLock::new();
+        static MEMSET_KA_BUF_GFX1200: OnceLock<GpuBuffer> = OnceLock::new();
+
+        let (kernel_src, ka_buf_src) = if is_gfx1200 {
+            (&MEMSET_KERNEL_GFX1200, &MEMSET_KA_BUF_GFX1200)
+        } else {
+            (&MEMSET_KERNEL_GFX1100, &MEMSET_KA_BUF_GFX1100)
+        };
+
+        let kernel = kernel_src.get_or_init(|| {
             let mut asm = crate::rdna3_asm::Rdna3Assembler::new();
+            asm.set_target(if is_gfx1200 { "gfx1200" } else { "gfx1100" });
 
             // Kernarg: [ptr: u64(0), n_dwords: u32(8), pad: u32(12)]
             // SGPR: s[0:1]=kernarg_ptr, s2=workgroup_id_x (TGID_X_EN=1)
             // Load kernargs into s[4:7]
-            let words = gfx11::s_load_dwordx4(4, 0, 0);
+            let words = if is_gfx1200 {
+                gfx11::s_load_dwordx4_gfx1200(4, 0, 0)
+            } else {
+                gfx11::s_load_dwordx4(4, 0, 0)
+            };
             asm.emit(words[0]); asm.emit(words[1]);
-            asm.emit(gfx11::s_waitcnt_lgkmcnt(0));
+            asm.wait_kmcnt(0);
 
             // global_id = workgroup_id_x * 256 + thread_id
             asm.emit(gfx11::v_mov_b32_from_sgpr(1, 2));  // v1 = wg_id_x
@@ -1800,8 +1919,8 @@ impl AqlQueue {
             asm.emit(gfx11::v_mov_b32_imm(13, 0));
             asm.global_store_dwordx4(5, 10, 0);
 
-            asm.emit(gfx11::s_waitcnt_vmcnt(0));
-            asm.emit(gfx11::s_waitcnt_vscnt(0));
+            asm.wait_loadcnt(0);
+            asm.wait_vscnt(0);
             asm.emit(gfx11::S_ENDPGM);
 
             let co = AmdGpuCodeObject::from_assembler(&asm, KernelConfig {
@@ -1810,9 +1929,9 @@ impl AqlQueue {
                 vgpr_count: 16, sgpr_count: 16,
                 workgroup_size_x: 256, workgroup_size_y: 1, workgroup_size_z: 1,
                 scratch_size: 0,
+                target_gfx: target_gfx.into(),
             });
             let hsaco = co.to_code_object_llvm().expect("gpu_memset LLVM build");
-            // Use the device from the buffer's allocation context
             GpuKernel::load(&buf.device, &hsaco, &KernelLoadConfig {
                 lds_size: 0,
                 workgroup_size: [256, 1, 1],
@@ -1821,10 +1940,10 @@ impl AqlQueue {
 
         // Prepare kernargs: [ptr(8), n_dwords(4), pad(4)]
         let n_dwords = (buf.size / 4) as u32;
-        let _ka_buf = MEMSET_KA_BUF.get_or_init(|| {
+        ka_buf_src.get_or_init(|| {
             buf.device.alloc_uncached(256).expect("memset ka buf")
         });
-        let ka_buf = MEMSET_KA_BUF.get().unwrap();
+        let ka_buf = ka_buf_src.get().unwrap();
 
         // Write kernargs directly
         let mut ka_data = [0u8; 16];
@@ -2946,14 +3065,22 @@ impl GpuMemset {
         use crate::rdna3_asm::{Rdna3Assembler, gfx11};
         use crate::rdna3_code_object::{AmdGpuCodeObject, KernelConfig};
 
+        let is_gfx1200 = device.gfx_target_version >= 120000;
+        let target_gfx = if is_gfx1200 { "gfx1200" } else { "gfx1100" };
+
         let mut asm = Rdna3Assembler::new();
+        asm.set_target(target_gfx);
         // s[0:1] = kernarg_ptr, s2 = wg_id_x, v0 = thread_id_x
         // Kernarg: [ptr:u64, n_dw4:u32, pad:u32]
 
         // Load kernargs -> s[4:7]
-        let [w0, w1] = gfx11::s_load_dwordx4(4, 0, 0);
+        let [w0, w1] = if is_gfx1200 {
+            gfx11::s_load_dwordx4_gfx1200(4, 0, 0)
+        } else {
+            gfx11::s_load_dwordx4(4, 0, 0)
+        };
         asm.emit(w0); asm.emit(w1);
-        asm.emit(gfx11::s_waitcnt_lgkmcnt(0));
+        asm.wait_kmcnt(0);
 
         // global_id = wg_id_x * 256 + thread_id
         asm.emit(gfx11::v_mov_b32_from_sgpr(1, 2));
@@ -2982,7 +3109,7 @@ impl GpuMemset {
         // store zeros (only active EXEC lanes)
         asm.global_store_dwordx4(3, 6, 0);
 
-        asm.emit(gfx11::s_waitcnt_vscnt(0));
+        asm.wait_vscnt(0);
         asm.emit(gfx11::S_ENDPGM);
 
         let co = AmdGpuCodeObject::from_assembler(&asm, KernelConfig {
@@ -2995,6 +3122,7 @@ impl GpuMemset {
             workgroup_size_y: 1,
             workgroup_size_z: 1,
             scratch_size: 0,
+            target_gfx: target_gfx.into(),
         });
 
         let hsaco = co.to_code_object_llvm().map_err(|e| format!("memset LLVM: {e}"))?;

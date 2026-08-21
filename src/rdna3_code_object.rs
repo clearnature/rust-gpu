@@ -46,6 +46,8 @@ pub struct KernelConfig {
     pub workgroup_size_z: u16,
     /// Scratch (private segment) size per work-item in bytes (0 = no scratch)
     pub scratch_size: u32,
+    /// GFX target triple for .amdgcn_target (e.g. "gfx1100", "gfx1200")
+    pub target_gfx: String,
 }
 
 impl Default for KernelConfig {
@@ -60,6 +62,7 @@ impl Default for KernelConfig {
             workgroup_size_y: 1,
             workgroup_size_z: 1,
             scratch_size: 0,
+            target_gfx: "gfx1100".to_string(),
         }
     }
 }
@@ -470,7 +473,7 @@ impl AmdGpuCodeObject {
             e_entry: 0,
             e_phoff: phdrs_offset as u64,
             e_shoff: shdrs_offset as u64,
-            e_flags: 0x041, // GFX1100
+            e_flags: if self.config.target_gfx.starts_with("gfx12") { 0x048 } else { 0x041 }, // GFX1200=0x048, GFX1100=0x041
             e_ehsize: elf_header_size as u16,
             e_phentsize: phdr_size as u16,
             e_phnum: num_phdrs as u16,
@@ -478,12 +481,12 @@ impl AmdGpuCodeObject {
             e_shnum: num_shdrs as u16,
             e_shstrndx: 6,  // .shstrtab is section 6
         };
-        
+
         // Write ELF header
         buf.extend_from_slice(unsafe {
             std::slice::from_raw_parts(&elf_header as *const _ as *const u8, elf_header_size)
         });
-        
+
         // Program headers
         let phdr_load = Elf64Phdr {
             p_type: 1,  // PT_LOAD
@@ -789,7 +792,7 @@ impl AmdGpuCodeObject {
             e_entry: 0,
             e_phoff: phdrs_offset as u64,
             e_shoff: shdrs_offset as u64,
-            e_flags: 0x041, // GFX1100
+            e_flags: if self.config.target_gfx.starts_with("gfx12") { 0x048 } else { 0x041 }, // GFX1200=0x048, GFX1100=0x041
             e_ehsize: elf_header_size as u16,
             e_phentsize: phdr_size as u16,
             e_phnum: num_phdrs as u16,
@@ -1216,9 +1219,10 @@ impl AmdGpuCodeObject {
         
         // 2. amdhsa.target (required for ROCm)
         msg.extend_from_slice(b"\xADamdhsa.target"); // key (13 chars)
-        // Value: "amdgcn-amd-amdhsa--gfx1100" (26 chars)
-        msg.extend_from_slice(b"\xBA"); // str8 with 26 chars
-        msg.extend_from_slice(b"amdgcn-amd-amdhsa--gfx1100");
+        // Value: "amdgcn-amd-amdhsa--{target_gfx}"
+        let target_str = format!("amdgcn-amd-amdhsa--{}", self.config.target_gfx);
+        msg.extend_from_slice(&[0xA0 | (target_str.len() as u8)]); // str8 with len
+        msg.extend_from_slice(target_str.as_bytes());
         
         // 3. amdhsa.version
         msg.extend_from_slice(b"\xAEamdhsa.version"); // key (14 chars)
@@ -1237,7 +1241,7 @@ impl AmdGpuCodeObject {
         let mut asm = String::new();
         
         // Header
-        asm.push_str("    .amdgcn_target \"amdgcn-amd-amdhsa--gfx1100\"\n\n");
+        asm.push_str(&format!("    .amdgcn_target \"amdgcn-amd-amdhsa--{}\"\n\n", self.config.target_gfx));
         
         // Text section with kernel code
         asm.push_str("    .text\n");
@@ -1292,7 +1296,7 @@ impl AmdGpuCodeObject {
         // Critical: must include amdhsa.target and .args for proper kernel dispatch
         asm.push_str("\n    .amdgpu_metadata\n");
         asm.push_str("---\n");
-        asm.push_str("amdhsa.target: amdgcn-amd-amdhsa--gfx1100\n");
+        asm.push_str(&format!("amdhsa.target: amdgcn-amd-amdhsa--{}\n", self.config.target_gfx));
         asm.push_str("amdhsa.version:\n");
         asm.push_str("  - 1\n");
         asm.push_str("  - 2\n");
@@ -1362,7 +1366,7 @@ impl AmdGpuCodeObject {
             .args([
                 "-x", "assembler",
                 "-target", "amdgcn-amd-amdhsa",
-                "-mcpu=gfx1100",
+                &format!("-mcpu={}", self.config.target_gfx),
                 "-c",
                 &asm_path.to_string_lossy(),
                 "-o",

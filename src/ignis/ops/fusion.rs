@@ -74,7 +74,7 @@ impl FusedOp {
                 let result = f(&mut kb, va);
                 kb.store_checked(out_ptr, off, result, n_arg);
 
-                let compiled = kb.compile(Target::GFX1100)?;
+                let compiled = kb.compile(Target::detect())?;
                 runtime.compile_dsl(compiled)?
             }
         };
@@ -138,7 +138,7 @@ impl FusedOp {
                 let result = f(&mut kb, va, vb);
                 kb.store_checked(out_ptr, off, result, n_arg);
 
-                let compiled = kb.compile(Target::GFX1100)?;
+                let compiled = kb.compile(Target::detect())?;
                 runtime.compile_dsl(compiled)?
             }
         };
@@ -207,7 +207,7 @@ impl FusedOp {
                 let result = f(&mut kb, va, vb, vc);
                 kb.store_checked(out_ptr, off, result, n_arg);
 
-                let compiled = kb.compile(Target::GFX1100)?;
+                let compiled = kb.compile(Target::detect())?;
                 runtime.compile_dsl(compiled)?
             }
         };

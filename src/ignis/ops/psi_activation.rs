@@ -45,7 +45,7 @@ pub fn psi_inplace(
             let result = two.mul(&mut kb, sig).add(&mut kb, one); // 1 + 2σ(x)
             kb.store_checked(ptr, off, result, n_arg);
 
-            let compiled = kb.compile(Target::GFX1100)?;
+            let compiled = kb.compile(Target::detect())?;
             runtime.compile_dsl(compiled)?
         }
     };

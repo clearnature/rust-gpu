@@ -9,7 +9,7 @@
 //! use t0_gpu::t0::gemm_gen::{GemmConfig, generate};
 //! let config = GemmConfig::tile_64x64_k16();
 //! let kernel = generate(&config);
-//! let elf = kernel.compile(t0_gpu::t0::ir::Target::GFX1100).unwrap();
+//! let elf = kernel.compile(t0_gpu::t0::ir::Target::detect()).unwrap();
 //! ```
 
 use super::ir::*;
@@ -1334,6 +1334,7 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
                 }
 
                 k.global_store(y_addr, acc_reg, Width::B32, 0);
+                k.wait_vscnt(0); // wait for store before next split-k iteration
                 if vk < 7 {
                     k.v_add_co(y_addr, y_addr, row_stride);
                     k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));

@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn test_rmsnorm_fwd_compiles() {
         let kb = build_rmsnorm_forward();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("rmsnorm fwd compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("rmsnorm fwd compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ RMSNorm forward: {} bytes ELF, wg={:?}, lds={}",
             ck.elf.len(), ck.workgroup_size, ck.lds_size);
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn test_rmsnorm_bwd_compiles() {
         let kb = build_rmsnorm_backward();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("rmsnorm bwd compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("rmsnorm bwd compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ RMSNorm backward: {} bytes ELF, wg={:?}, lds={}",
             ck.elf.len(), ck.workgroup_size, ck.lds_size);
@@ -257,7 +257,7 @@ mod tests {
         let output_buf = rt.alloc_f32(n).unwrap();
 
         let kb = build_rmsnorm_forward();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile");
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile");
         let kernel = GpuKernel::load(&rt.device, &ck.elf, &KernelLoadConfig {
             workgroup_size: ck.workgroup_size, lds_size: ck.lds_size,
         }).expect("load");

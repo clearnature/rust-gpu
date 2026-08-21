@@ -2257,6 +2257,15 @@ pub fn optimize_waitcnt_mach_func(func: &mut MachFunc) -> usize {
                         pending_lgkmcnt = n;
                     }
                 }
+                Op::WaitKmcnt(n) => {
+                    // On GFX1200, kmcnt replaces lgkmcnt for scalar loads
+                    let n = *n as u32;
+                    if pending_lgkmcnt <= n {
+                        to_remove.push(idx);
+                    } else {
+                        pending_lgkmcnt = n;
+                    }
+                }
                 Op::WaitVscnt(n) => {
                     let n = *n as u32;
                     if pending_vscnt <= n {

@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn test_adamw_compiles() {
         let kb = build_adamw_step();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("adamw compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("adamw compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ AdamW: {} bytes ELF, wg={:?}, lds={}",
             ck.elf.len(), ck.workgroup_size, ck.lds_size);
@@ -211,7 +211,7 @@ mod tests {
         let bc2 = 1.0f32 / (1.0 - beta2.powi(t as i32));
 
         let kb = build_adamw_step();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile");
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile");
         let kernel = GpuKernel::load(&rt.device, &ck.elf, &KernelLoadConfig {
             workgroup_size: ck.workgroup_size, lds_size: ck.lds_size,
         }).expect("load");

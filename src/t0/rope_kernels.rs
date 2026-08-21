@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn test_rope_fwd_compiles() {
         let kb = build_rope_forward();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("RoPE fwd compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("RoPE fwd compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ RoPE fwd: {} bytes ELF, wg={:?}", ck.elf.len(), ck.workgroup_size);
     }
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn test_rope_bwd_compiles() {
         let kb = build_rope_backward();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("RoPE bwd compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("RoPE bwd compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ RoPE bwd: {} bytes ELF, wg={:?}", ck.elf.len(), ck.workgroup_size);
     }
@@ -296,7 +296,7 @@ mod tests {
         let out_buf = rt.alloc_f32(n).unwrap();
 
         let kb = build_rope_forward();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile");
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile");
         let config = KernelLoadConfig {
             workgroup_size: ck.workgroup_size,
             lds_size: ck.lds_size,

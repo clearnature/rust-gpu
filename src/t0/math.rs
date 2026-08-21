@@ -1668,6 +1668,10 @@ fn t0_row_broadcast_generic(op: RowBroadcastOp) -> T0Kernel {
     // Restore EXEC
     k.push(Op::RestoreExec { src: saved_exec });
 
+    // CRITICAL: wait for store to complete before next loop iteration
+    // Without this, store buffer fills up and GPU hangs on GFX1200
+    k.wait_vscnt(0);
+
     // loop_base += 32
     k.s_add_u32(loop_base, loop_base, 32);
     k.s_cmp_lt_u32(loop_base, SReg(cols_arg.0));

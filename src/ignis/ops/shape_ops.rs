@@ -219,7 +219,7 @@ pub fn relu(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
             let result = x.relu(&mut kb);
             kb.store_checked(out_ptr, off, result, n_arg);
 
-            let compiled = kb.compile(Target::GFX1100)?;
+            let compiled = kb.compile(Target::detect())?;
             runtime.compile_dsl(compiled)?
         }
     };

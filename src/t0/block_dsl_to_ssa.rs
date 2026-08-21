@@ -590,7 +590,7 @@ mod tests {
         let c = a.add(&mut kb, b);
         kb.store(out_ptr, offsets, c, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa failed");
         eprintln!("✓ vadd compile_via_ssa: {} bytes ELF, kernarg_size={}, wg={}",
             compiled.elf.len(), compiled.kernarg_size, compiled.workgroup_size[0]);
@@ -614,7 +614,7 @@ mod tests {
         let y = x.silu(&mut kb);
         kb.store(out_ptr, offsets, y, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa failed for SiLU");
         eprintln!("✓ silu compile_via_ssa: {} bytes ELF, kernarg_size={}, wg={}",
             compiled.elf.len(), compiled.kernarg_size, compiled.workgroup_size[0]);
@@ -642,7 +642,7 @@ mod tests {
         let c = a.add(&mut kb, b);
         kb.store(out_ptr, offsets, c, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa failed");
         eprintln!("✓ compile_via_ssa: {} bytes ELF (ka_size={})", compiled.elf.len(), compiled.kernarg_size);
 
@@ -742,7 +742,7 @@ mod tests {
 
         kb.store(out_ptr, offsets, y, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa with LDS failed");
         eprintln!("✓ LDS compile_via_ssa: {} bytes ELF, lds_size={}",
             compiled.elf.len(), compiled.lds_size);
@@ -765,7 +765,7 @@ mod tests {
 
         kb.atomic_add_f32(out_ptr, offsets, x, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa with atomic failed");
         eprintln!("✓ atomic compile_via_ssa: {} bytes ELF", compiled.elf.len());
         assert!(compiled.elf.len() > 100);
@@ -796,7 +796,7 @@ mod tests {
 
         kb.store(out_ptr, offsets, y, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa with LDS failed");
 
         let device = KfdDevice::open().unwrap();
@@ -886,7 +886,7 @@ mod tests {
         let one = kb.const_f32(42.0);
         kb.store(out_ptr, offsets, one, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa with for loop failed");
         eprintln!("✓ ForLoop compile_via_ssa: {} bytes ELF", compiled.elf.len());
         assert!(compiled.elf.len() > 100);
@@ -918,7 +918,7 @@ mod tests {
         let result_val = kb.const_f32(99.5);
         kb.store(out_ptr, offsets, result_val, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa with for loop failed");
 
         let device = KfdDevice::open().unwrap();
@@ -1006,7 +1006,7 @@ mod tests {
         let mask = offsets.lt(&mut kb, n);
         kb.store(out_ptr, offsets, elem, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa with WMMA failed");
         eprintln!("✓ WMMA compile_via_ssa: {} bytes ELF", compiled.elf.len());
         assert!(compiled.elf.len() > 100);
@@ -1046,7 +1046,7 @@ mod tests {
         let mask = offsets.lt(&mut kb, n);
         kb.store(out_ptr, offsets, sum, mask);
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa with WgReduce failed");
         eprintln!("✓ WgReduceAdd compile_via_ssa: {} bytes ELF", compiled.elf.len());
         assert!(compiled.elf.len() > 100);
@@ -1135,7 +1135,7 @@ mod tests {
         kb.tile_gemm(x, w, y, k, n, config);
 
         // This exercises: block_to_ssa → analyze_tiled_gemm → lower_tiled_gemm → ELF
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa for TileGemm failed");
         eprintln!("✓ TileGemm compile_via_ssa: {} bytes ELF, kernarg_size={}, wg=[{},{},{}], lds={}",
             compiled.elf.len(), compiled.kernarg_size,
@@ -1219,7 +1219,7 @@ mod tests {
         let epl = 1u32;
         let mut lowered = crate::t0::tile_ssa_lower::lower_elementwise_1d(&func, wg_size, epl)?;
         lowered.kernel.set_ssa_regalloc(true);
-        let elf = lowered.kernel.compile(Target::GFX1100)?;
+        let elf = lowered.kernel.compile(Target::detect())?;
 
         let args: Vec<KernArgMeta> = lowered.kernel.args().iter().map(|a| {
             KernArgMeta {
@@ -1264,7 +1264,7 @@ mod tests {
             kb
         };
 
-        let compiled_legacy = build_vadd().compile(Target::GFX1100).expect("compile failed");
+        let compiled_legacy = build_vadd().compile(Target::detect()).expect("compile failed");
         let compiled_ssa = compile_with_ssa_regalloc(&build_vadd()).expect("SSA regalloc compile failed");
 
         let x_data: Vec<f32> = (0..n).map(|i| (i + 1) as f32).collect();
@@ -1302,7 +1302,7 @@ mod tests {
             kb
         };
 
-        let compiled_legacy = build_silu().compile(Target::GFX1100).expect("compile failed");
+        let compiled_legacy = build_silu().compile(Target::detect()).expect("compile failed");
         let compiled_ssa = compile_with_ssa_regalloc(&build_silu()).expect("SSA regalloc compile failed");
 
         let x_data: Vec<f32> = (0..n).map(|i| (i as f32 - 32.0) * 0.2).collect();
@@ -1344,7 +1344,7 @@ mod tests {
             kb
         };
 
-        let compiled_legacy = build_fma().compile(Target::GFX1100).expect("compile failed");
+        let compiled_legacy = build_fma().compile(Target::detect()).expect("compile failed");
         let compiled_ssa = compile_with_ssa_regalloc(&build_fma()).expect("SSA regalloc compile failed");
 
         let a_data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
@@ -1415,7 +1415,7 @@ mod tests {
         let y_val = a_val.add(&mut kb, b_val);
         kb.store(y_ptr, offset, y_val, mask);
 
-        let compiled = kb.compile(Target::GFX1100).expect("2D matrix add compile failed");
+        let compiled = kb.compile(Target::detect()).expect("2D matrix add compile failed");
         assert!(compiled.elf.len() > 100, "ELF too small");
         assert_eq!(compiled.workgroup_size, [block_m, block_n, 1],
             "Expected 2D WG [32, 4, 1], got {:?}", compiled.workgroup_size);
@@ -1461,7 +1461,7 @@ mod tests {
         let dst_off = col.mul(&mut kb, stride_y).add(&mut kb, row);
         kb.store(y_ptr, dst_off, val, mask);
 
-        let compiled = kb.compile(Target::GFX1100).expect("2D transpose compile failed");
+        let compiled = kb.compile(Target::detect()).expect("2D transpose compile failed");
         assert!(compiled.elf.len() > 100);
         assert_eq!(compiled.workgroup_size, [block_m, block_n, 1]);
         eprintln!("✓ T2 2D transpose compiled: {} bytes, WG={:?}",
@@ -1499,7 +1499,7 @@ mod tests {
         let y_val = x_val.mul(&mut kb, s);
         kb.store(y_ptr, off, y_val, mask);
 
-        let compiled = kb.compile(Target::GFX1100).expect("2D scalar_mul compile failed");
+        let compiled = kb.compile(Target::detect()).expect("2D scalar_mul compile failed");
         assert!(compiled.elf.len() > 100);
         assert_eq!(compiled.workgroup_size, [block_m, block_n, 1]);
         eprintln!("✓ T3 2D scalar_mul compiled: {} bytes, WG={:?}",
@@ -1533,7 +1533,7 @@ mod tests {
         let y_val = x_val.silu(&mut kb);
         kb.store(y_ptr, off, y_val, mask);
 
-        let compiled = kb.compile(Target::GFX1100).expect("Non-square 2D compile failed");
+        let compiled = kb.compile(Target::detect()).expect("Non-square 2D compile failed");
         assert!(compiled.elf.len() > 100);
         assert_eq!(compiled.workgroup_size, [block_m, block_n, 1]);
         eprintln!("✓ T4 Non-square 2D [64×2] compiled: {} bytes, WG={:?}",
@@ -1571,7 +1571,7 @@ mod tests {
         let first_mask = tid_y.lt(&mut kb, one); // tid_y < 1 → tid_y == 0
         kb.store(y_ptr, row, sum, first_mask);
 
-        let compiled = kb.compile(Target::GFX1100).expect("2D row_sum compile failed");
+        let compiled = kb.compile(Target::detect()).expect("2D row_sum compile failed");
         assert!(compiled.elf.len() > 100);
         assert_eq!(compiled.workgroup_size, [block_m, block_n, 1]);
         eprintln!("✓ T5 2D row_sum [32×32] compiled: {} bytes, WG={:?}",
@@ -1599,7 +1599,7 @@ mod tests {
         let zv = xv.add(&mut kb, yv);
         kb.store(z, idx, zv, mask);
 
-        let compiled = kb.compile(Target::GFX1100).expect("1D regression compile failed");
+        let compiled = kb.compile(Target::detect()).expect("1D regression compile failed");
         assert!(compiled.elf.len() > 100);
         assert_eq!(compiled.workgroup_size, [256, 1, 1],
             "1D kernel should have workgroup_size [256, 1, 1], got {:?}", compiled.workgroup_size);
@@ -1730,7 +1730,7 @@ mod tests {
         kb.store(y, offsets, zero, mask);
         kb.end_if();
 
-        let compiled = kb.compile_via_ssa(Target::GFX1100)
+        let compiled = kb.compile_via_ssa(Target::detect())
             .expect("compile_via_ssa with if/else failed");
         eprintln!("✓ if_else compile_via_ssa: {} bytes ELF, ka_size={}, wg={}",
             compiled.elf.len(), compiled.kernarg_size, compiled.workgroup_size[0]);
@@ -1800,7 +1800,7 @@ mod tests {
         kb.store(c_ptr, c_off, result, mask_m);
 
         // COMPILE ONLY — no GPU dispatch!
-        let compiled = kb.compile(Target::GFX1100).unwrap();
+        let compiled = kb.compile(Target::detect()).unwrap();
         eprintln!("✓ gemm_tn_naive COMPILE-ONLY: elf={} bytes, lds={}, ka={}, wg=[{},{}]",
             compiled.elf.len(), compiled.lds_size, compiled.kernarg_size,
             compiled.workgroup_size[0], compiled.workgroup_size[1]);

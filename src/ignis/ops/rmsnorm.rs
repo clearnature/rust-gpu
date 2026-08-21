@@ -108,7 +108,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                 kb.store(out_ptr, idx, normed, mask);
             }
 
-            let compiled = kb.compile(Target::GFX1100)?;
+            let compiled = kb.compile(Target::detect())?;
             runtime.compile_dsl(compiled)?
         }
     };
@@ -215,7 +215,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                                 kb.store(dx_ptr, idx, result, mask);
                             }
 
-                            let compiled = kb.compile(Target::GFX1100)?;
+                            let compiled = kb.compile(Target::detect())?;
                             runtime.compile_dsl(compiled)?
                         }
                     };
@@ -275,7 +275,7 @@ pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<T
                                 kb.atomic_add_f32(dg_ptr, col, contrib, mask);
                             }
 
-                            let compiled = kb.compile(Target::GFX1100)?;
+                            let compiled = kb.compile(Target::detect())?;
                             runtime.compile_dsl(compiled)?
                         }
                     };

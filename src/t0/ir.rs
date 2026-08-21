@@ -154,14 +154,36 @@ pub enum SOperand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     GFX1100,  // RDNA3, Navi 31
-    // Future: GFX1030, GFX900, etc.
+    GFX1200,  // RDNA4, Navi 48 (RX 9070 XT)
 }
 
 impl Target {
     pub fn mcpu_str(&self) -> &'static str {
         match self {
             Target::GFX1100 => "gfx1100",
+            Target::GFX1200 => "gfx1200",
         }
+    }
+
+    /// Detect the GPU present in this machine from KFD topology sysfs.
+    /// Falls back to GFX1100 when no AMD GPU (or topology) is found —
+    /// compilation itself never touches the GPU, so this only picks the ISA.
+    pub fn detect() -> Target {
+        for node in 1..=8 {
+            let prop_path = format!("/sys/class/kfd/kfd/topology/nodes/{}/properties", node);
+            if let Ok(props) = std::fs::read_to_string(&prop_path) {
+                if let Some(line) = props.lines().find(|l| l.starts_with("gfx_target_version")) {
+                    if let Some(v) = line.split_whitespace().nth(1) {
+                        match v {
+                            "120000" | "120001" => return Target::GFX1200,
+                            "110000" | "110001" | "110002" => return Target::GFX1100,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        Target::GFX1100
     }
 }
 
@@ -261,10 +283,11 @@ pub enum Op {
     // ── WMMA (Wave Matrix Multiply Accumulate) ──
     Wmma {
         dst: VReg,  // first of 8 consecutive VGPRs
-        a: VReg,    // first of 8 consecutive VGPRs (A fragment)
-        b: VReg,    // first of 8 consecutive VGPRs (B fragment)
+        a: VReg,    // first of ab_width consecutive VGPRs (A fragment)
+        b: VReg,    // first of ab_width consecutive VGPRs (B fragment)
         c: VReg,    // first of 8 consecutive VGPRs (accumulator input)
         format: WmmaFormat,
+        ab_width: u8, // 4 for GFX1200, 8 for GFX1100
     },
 
     // ── Control flow ──
@@ -280,6 +303,7 @@ pub enum Op {
     WaitVmcnt(u8),
     WaitLgkmcnt(u8),
     WaitVscnt(u8),
+    WaitKmcnt(u8),
     /// Clear VCC (s_mov_b32 vcc_lo, 0) — prevent carry residual from mask ops
     ClearVcc,
     /// Move VCC_LO from SGPR: s_mov_b32 vcc_lo, src (restore saved mask)
@@ -566,15 +590,14 @@ impl Op {
             Op::SMov { .. } | Op::SCmpLtU32 { .. } |
             Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } => vec![],
 
-            // WMMA: 8 consecutive VGPRs for each of dst, a, b, c
-            Op::Wmma { dst, a, b, c, .. } => {
+            // WMMA: ab_width consecutive VGPRs for a/b, 8 for dst/c
+            Op::Wmma { dst, a, b, c, ab_width, .. } => {
+                let aw = *ab_width as u32;
                 let mut v = Vec::with_capacity(32);
-                for i in 0..8u32 {
-                    v.push(VReg(dst.0 + i));
-                    v.push(VReg(a.0 + i));
-                    v.push(VReg(b.0 + i));
-                    v.push(VReg(c.0 + i));
-                }
+                for i in 0..8u32 { v.push(VReg(dst.0 + i)); }
+                for i in 0..aw { v.push(VReg(a.0 + i)); }
+                for i in 0..aw { v.push(VReg(b.0 + i)); }
+                for i in 0..8u32 { v.push(VReg(c.0 + i)); }
                 v
             }
 
@@ -582,7 +605,8 @@ impl Op {
             Op::Label(_) | Op::BranchScc1(_) | Op::Branch(_) => vec![],
 
             // Sync (no VGPRs)
-            Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) | Op::ClearVcc
+            Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)
+            | Op::WaitKmcnt(_) | Op::ClearVcc
             | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } => vec![],
             Op::Endpgm => vec![],
 
@@ -809,20 +833,20 @@ impl Op {
             Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } => vec![],
 
             // ── WMMA: a, b, c are reads; dst is write only ──
-            Op::Wmma { a, b, c, .. } => {
+            Op::Wmma { a, b, c, ab_width, .. } => {
+                let aw = *ab_width as u32;
                 let mut v = Vec::with_capacity(24);
-                for i in 0..8u32 {
-                    v.push(VReg(a.0 + i));
-                    v.push(VReg(b.0 + i));
-                    v.push(VReg(c.0 + i));
-                }
+                for i in 0..aw { v.push(VReg(a.0 + i)); }
+                for i in 0..aw { v.push(VReg(b.0 + i)); }
+                for i in 0..8u32 { v.push(VReg(c.0 + i)); }
                 v
             }
 
             // ── Control flow, sync ──
             Op::Label(_) | Op::BranchScc1(_) | Op::Branch(_) |
             Op::BranchScc0(_) | Op::BranchVccz(_) |
-            Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
+            Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)
+            | Op::WaitKmcnt(_) |
             Op::ClearVcc | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } |
             Op::Endpgm | Op::SBarrier => vec![],
 
@@ -1000,6 +1024,7 @@ impl Op {
             Op::Branch(_) | Op::BranchVccz(_) |
             Op::Barrier | Op::SBarrier |
             Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
+            Op::WaitKmcnt(_) |
             Op::ClearVcc | Op::SMovToVcc { .. } |
             Op::SaveExec { .. } | Op::RestoreExec { .. } | Op::XorExec { .. } |
             Op::Endpgm | Op::RawAsm(_) |

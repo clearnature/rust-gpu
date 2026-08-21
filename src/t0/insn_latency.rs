@@ -192,7 +192,8 @@ pub fn op_latency(op: &Op) -> InsnLatency {
         Op::Barrier | Op::SBarrier => InsnLatency {
             class: InsnClass::CTRL, issue: 1, result: 0, recip_throughput: 1.0,
         },
-        Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) => InsnLatency {
+        Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
+        Op::WaitKmcnt(_) => InsnLatency {
             class: InsnClass::CTRL, issue: 1, result: 0, recip_throughput: 1.0,
         },
         Op::ClearVcc => InsnLatency::salu(),
@@ -387,6 +388,7 @@ mod tests {
             b: super::super::ir::VReg(16),
             c: super::super::ir::VReg(0),
             format: super::super::ir::WmmaFormat::BF16_F32,
+            ab_width: 8,
         };
         let lat = op_latency(&op);
         assert_eq!(lat.class, InsnClass::WMMA);

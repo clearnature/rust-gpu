@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn test_causal_mask_compiles() {
         let kb = build_causal_mask();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("causal mask compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("causal mask compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ causal_mask: {} bytes ELF, wg={:?}", ck.elf.len(), ck.workgroup_size);
     }
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn test_causal_mask_bwd_compiles() {
         let kb = build_causal_mask_backward();
-        let ck = kb.compile_via_ssa(Target::GFX1100).expect("causal mask bwd compile");
+        let ck = kb.compile_via_ssa(Target::detect()).expect("causal mask bwd compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ causal_mask_bwd: {} bytes ELF, wg={:?}", ck.elf.len(), ck.workgroup_size);
     }
@@ -203,7 +203,7 @@ mod tests {
         let out_buf = rt.alloc_f32(n).unwrap();
 
         let kb = build_causal_mask();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100).expect("compile");
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::detect()).expect("compile");
         let kernel = GpuKernel::load(&rt.device, &ck.elf, &KernelLoadConfig {
             workgroup_size: ck.workgroup_size, lds_size: ck.lds_size,
         }).expect("load");

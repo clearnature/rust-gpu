@@ -91,7 +91,7 @@ impl Schedule for GFX1100Schedule {
     fn workgroup_size(&self) -> (u16, u16, u16) { (64, 1, 1) }
     fn elems_per_thread(&self) -> usize { 4 }
     fn lds_budget(&self) -> u32 { 65536 }
-    fn target(&self) -> Target { Target::GFX1100 }
+    fn target(&self) -> Target { Target::detect() }
 }
 
 // ============================================================================
@@ -324,7 +324,7 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
 /// ```rust
 /// let sched = AutoGemmSchedule::for_problem(4096, 4096, 512);
 /// let kernel = build_gemm_forward(&sched); // uses auto-selected tiles
-/// let elf = kernel.compile(Target::GFX1100).unwrap();
+/// let elf = kernel.compile(Target::detect()).unwrap();
 /// ```
 #[derive(Clone, Debug)]
 pub struct AutoGemmSchedule {
@@ -393,7 +393,7 @@ impl Schedule for AutoGemmSchedule {
     }
     fn elems_per_thread(&self) -> usize { 4 }
     fn lds_budget(&self) -> u32 { 65536 }
-    fn target(&self) -> Target { Target::GFX1100 }
+    fn target(&self) -> Target { Target::detect() }
 }
 
 /// One-call entry point: auto-select tiles → build GEMM kernel → return T0Kernel.
@@ -401,7 +401,7 @@ impl Schedule for AutoGemmSchedule {
 /// # Example
 /// ```rust
 /// let kernel = auto_build_gemm(4096, 4096, 512);
-/// let elf = kernel.compile(Target::GFX1100).unwrap();
+/// let elf = kernel.compile(Target::detect()).unwrap();
 /// ```
 pub fn auto_build_gemm(m: u32, n: u32, k: u32) -> T0Kernel {
     let sched = AutoGemmSchedule::for_problem(m, n, k);
@@ -431,7 +431,7 @@ mod tests {
     fn test_build_elementwise_scale() {
         let sched = GFX1100Schedule;
         let kernel = build_elementwise_scale(&sched);
-        let asm = kernel.to_assembly(Target::GFX1100).unwrap();
+        let asm = kernel.to_assembly(Target::detect()).unwrap();
         assert!(asm.contains("global_load_b32"));
         assert!(asm.contains("v_mul_f32"));
         assert!(asm.contains("global_store_b32"));
@@ -444,7 +444,7 @@ mod tests {
     fn test_elementwise_scale_elf() {
         let sched = GFX1100Schedule;
         let kernel = build_elementwise_scale(&sched);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         assert_eq!(&elf[0..4], &[0x7f, b'E', b'L', b'F']);
         eprintln!("Elementwise scale ELF: {} bytes", elf.len());
@@ -454,7 +454,7 @@ mod tests {
     fn test_build_gemm_forward() {
         let sched = GFX1100Schedule;
         let kernel = build_gemm_forward(&sched);
-        let asm = kernel.to_assembly(Target::GFX1100).unwrap();
+        let asm = kernel.to_assembly(Target::detect()).unwrap();
         assert!(asm.contains("v_wmma_f32_16x16x16_bf16"));
         assert!(asm.contains("s_cbranch_scc1"));
         assert!(asm.contains("s_mov_b32"));  // TGID capture
@@ -466,7 +466,7 @@ mod tests {
     fn test_gemm_forward_elf() {
         let sched = GFX1100Schedule;
         let kernel = build_gemm_forward(&sched);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         assert_eq!(&elf[0..4], &[0x7f, b'E', b'L', b'F']);
         eprintln!("GEMM Forward ELF: {} bytes", elf.len());
@@ -492,7 +492,7 @@ mod tests {
     fn test_auto_build_gemm_generates_asm() {
         // Full pipeline: auto-select tiles → build kernel → generate assembly
         let kernel = auto_build_gemm(2048, 2048, 256);
-        let asm = kernel.to_assembly(Target::GFX1100).unwrap();
+        let asm = kernel.to_assembly(Target::detect()).unwrap();
         assert!(asm.contains("v_wmma_f32_16x16x16_bf16"), "should contain WMMA");
         assert!(asm.contains("s_cbranch_scc1"), "should contain K-loop branch");
         assert!(asm.contains("s_endpgm"), "should contain endpgm");
@@ -504,11 +504,11 @@ mod tests {
     fn test_auto_vs_manual_schedule_both_compile() {
         // Manual schedule
         let manual_kernel = build_gemm_forward(&GFX1100Schedule);
-        let manual_asm = manual_kernel.to_assembly(Target::GFX1100).unwrap();
+        let manual_asm = manual_kernel.to_assembly(Target::detect()).unwrap();
 
         // Auto schedule
         let auto_kernel = auto_build_gemm(4096, 4096, 512);
-        let auto_asm = auto_kernel.to_assembly(Target::GFX1100).unwrap();
+        let auto_asm = auto_kernel.to_assembly(Target::detect()).unwrap();
 
         // Both should produce valid assembly
         assert!(manual_asm.contains("v_wmma"));
@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn test_auto_build_gemm_elf() {
         let kernel = auto_build_gemm(4096, 4096, 512);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::detect()).unwrap();
         assert!(elf.len() > 0);
         assert_eq!(&elf[0..4], &[0x7f, b'E', b'L', b'F']);
         eprintln!("Auto GEMM ELF: {} bytes", elf.len());

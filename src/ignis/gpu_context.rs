@@ -182,7 +182,7 @@ impl GpuRuntime {
 
         let t0k = builder();
         let wg_actual = [t0k.wg_size(), 1, 1]; // use wg from kernel, not hardcoded
-        let elf = t0k.compile(crate::t0::ir::Target::GFX1100)?;
+        let elf = t0k.compile(crate::t0::ir::Target::detect())?;
         let lds = if lds_override > 0 { lds_override } else { t0k.lds_size() };
         let config = KernelLoadConfig {
             workgroup_size: if wg_size[0] > 0 { wg_size } else { wg_actual },
@@ -234,7 +234,7 @@ impl GpuRuntime {
         }
 
         let kb = builder();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100)
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::detect())
             .map_err(|e| format!("BlockDSL compile '{}': {}", name, e))?;
 
         let config = KernelLoadConfig {

@@ -106,7 +106,31 @@ pub mod gfx11 {
         // null destination is encoded as 0x7C in the sdst field
         0xBC7C0000 | (n as u32)
     }
-    
+
+    /// GFX1200 replacement for s_waitcnt_vscnt — DIFFERENT encoding!
+    /// LLVM verified: s_wait_storecnt 0 = 0xBFC10000
+    pub fn s_wait_storecnt(n: u8) -> u32 {
+        0xBFC10000 | (n as u32)
+    }
+
+    /// GFX1200 s_wait_loadcnt: wait for N or fewer outstanding vector loads.
+    /// LLVM verified: s_wait_loadcnt 0 = 0xBFC00000
+    pub fn s_wait_loadcnt(n: u8) -> u32 {
+        0xBFC00000 | (n as u32)
+    }
+
+    /// GFX1200 s_wait_dscnt: wait for N or fewer outstanding data share ops.
+    /// LLVM verified: s_wait_dscnt 0 = 0xBFC60000
+    pub fn s_wait_dscnt(n: u8) -> u32 {
+        0xBFC60000 | (n as u32)
+    }
+
+    /// GFX1200 s_wait_kmcnt: wait for N or fewer outstanding kernel memory ops.
+    /// LLVM verified: s_wait_kmcnt 0 = 0xBFC70000
+    pub fn s_wait_kmcnt(n: u8) -> u32 {
+        0xBFC70000 | (n as u32)
+    }
+
     /// s_barrier: Workgroup barrier
     /// LLVM: s_barrier = [0x00,0x00,0xbd,0xbf] = 0xBFBD0000
     /// NOTE: Old encoding 0xBF8A0000 was actually s_wait_idle (works but slower)
@@ -471,7 +495,44 @@ pub mod gfx11 {
         let word1 = 0xF8000000u32 | (offset & 0xFFFFFF);
         [word0, word1]
     }
-    
+
+    // =========================================================================
+    // GFX1200 SMEM encoding (different from GFX11)
+    // =========================================================================
+    // GFX1200 SMEM word0 layout (llvm-mc multi-register combo verified):
+    //   bits[5:0]   = SBASE (base/2)
+    //   bits[11:6]  = SDATA: B32=dst, B64=dst, B128=dst
+    //   bits[14:12] = SIZE: B32=0, B64=2, B128=4
+    //   bits[31:26] = 0x3D  (SMEM encoding prefix)
+    // word0 = 0xF4000000 | (size << 12) | (sdst << 6) | (base/2)
+    // word1 = 0xF8000000 | (offset & 0xFFFFFF)
+
+    /// GFX1200 s_load_b128 s[dst:dst+3], s[base:base+1], offset
+    pub fn s_load_dwordx4_gfx1200(dst: u8, base: u8, offset: u32) -> [u32; 2] {
+        assert!(dst % 4 == 0, "s_load_dwordx4 dst must be 4-aligned, got s{}", dst);
+        assert!(base % 2 == 0, "s_load_dwordx4 base must be 2-aligned, got s{}", base);
+        let word0 = 0xF4000000u32 | (4u32 << 12) | ((dst as u32) << 6) | (base as u32 / 2);
+        let word1 = 0xF8000000u32 | (offset & 0xFFFFFF);
+        [word0, word1]
+    }
+
+    /// GFX1200 s_load_b64 s[dst:dst+1], s[base:base+1], offset
+    pub fn s_load_dwordx2_gfx1200(dst: u8, base: u8, offset: u32) -> [u32; 2] {
+        assert!(dst % 2 == 0, "s_load_dwordx2 dst must be 2-aligned, got s{}", dst);
+        assert!(base % 2 == 0, "s_load_dwordx2 base must be 2-aligned, got s{}", base);
+        let word0 = 0xF4000000u32 | (2u32 << 12) | ((dst as u32) << 6) | (base as u32 / 2);
+        let word1 = 0xF8000000u32 | (offset & 0xFFFFFF);
+        [word0, word1]
+    }
+
+    /// GFX1200 s_load_b32 s_dst, s[base:base+1], offset
+    pub fn s_load_dword_gfx1200(dst: u8, base: u8, offset: u32) -> [u32; 2] {
+        assert!(base % 2 == 0, "s_load_dword base must be 2-aligned, got s{}", base);
+        let word0 = 0xF4000000u32 | ((dst as u32) << 6) | (base as u32 / 2);
+        let word1 = 0xF8000000u32 | (offset & 0xFFFFFF);
+        [word0, word1]
+    }
+
     // =========================================================================
     // Global Memory (Vector) - GFX11 encoding
     // =========================================================================
@@ -575,6 +636,128 @@ pub mod gfx11 {
         let word0 = 0xDC660000u32 | offset_enc;
         let word1 = (0x7C << 16) | ((vsrc as u32) << 8) | (vaddr as u32);
         [word0, word1]
+    }
+
+    // =========================================================================
+    // GFX1200 FLAT encoding (3-dword format, different from GFX11 2-dword)
+    // =========================================================================
+    // GFX12 VGLOBAL 96-bit format (llvm-mc verified):
+    //   word0 = 0xEE000000 | (OP << 18) | (SIZE << 16) | 0x7C
+    //   word1 = (vdst/vsrc_lo7) | ((vsrc_odd_bit) << 23)  [loads: vdst, stores: vsrc]
+    //   word2 = (offset << 8) | vaddr
+    // OP base: loads=0x2B, stores=0x23
+
+    /// GFX1200 global_store_b32 v[addr:addr+1], vdata, off [offset:N]
+    /// llvm-mc: global_store_b32 v[0:1], v5, off → [0x7c,0x80,0x06,0xee,0x00,0x00,0x80,0x02,...]
+    pub fn global_store_dword_gfx1200(vaddr: u8, vsrc: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE06807Cu32;
+        let word1 = (vsrc as u32 / 2) | (((vsrc as u32 & 1) as u32) << 23);
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_store_b64 v[addr:addr+1], v[src:src+1], off [offset:N]
+    pub fn global_store_dwordx2_gfx1200(vaddr: u8, vsrc: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE06C07Cu32;
+        let word1 = (vsrc as u32 / 2) | (((vsrc as u32 & 1) as u32) << 23);
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_store_b128 v[addr:addr+1], v[src:src+3], off [offset:N]
+    pub fn global_store_dwordx4_gfx1200(vaddr: u8, vsrc: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE07407Cu32;
+        let word1 = (vsrc as u32 / 2) | (((vsrc as u32 & 1) as u32) << 23);
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_store_b16 v[addr:addr+1], vdata, off [offset:N]
+    /// llvm-mc: global_store_b16 v[0:1], v5, off → [0x7c,0x40,0x06,0xee,...]
+    pub fn global_store_short_gfx1200(vaddr: u8, vsrc: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE06407Cu32; // SIZE=0 (B16), OP=store(0x23)+base(0x23)
+        let word1 = (vsrc as u32 / 2) | (((vsrc as u32 & 1) as u32) << 23);
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_load_b32 vdst, v[addr:addr+1], off [offset:N]
+    /// llvm-mc: global_load_b32 v5, v[0:1], off → [0x7c,0x00,0x05,0xee,0x05,...]
+    pub fn global_load_dword_gfx1200(vdst: u8, vaddr: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE05007Cu32;
+        let word1 = vdst as u32;
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_load_b64 v[dst:dst+1], v[addr:addr+1], off [offset:N]
+    pub fn global_load_dwordx2_gfx1200(vdst: u8, vaddr: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE05407Cu32;
+        let word1 = vdst as u32;
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_load_b128 v[dst:dst+3], v[addr:addr+1], off [offset:N]
+    pub fn global_load_dwordx4_gfx1200(vdst: u8, vaddr: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE05C07Cu32;
+        let word1 = vdst as u32;
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_load_u16 vdst, v[addr:addr+1], off [offset:N]
+    /// llvm-mc: global_load_u16 v5, v[0:1], off → [0x7c,0x80,0x04,0xee,0x05,...]
+    pub fn global_load_ushort_gfx1200(vdst: u8, vaddr: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE04807Cu32; // SIZE=0 (B16), OP=load(0x10)+base(0x2B)-0x01
+        let word1 = vdst as u32;
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    // =========================================================================
+    // GFX1200 Global Atomics (3-dword format, llvm-mc verified)
+    // =========================================================================
+    // VGLOBAL atomic word0 layout:
+    //   bits[6:0]   = VADDR (address register)
+    //   bits[14:8]  = VDATA (data register) << 1
+    //   bits[31:26] = 0x3B (VGLOBAL prefix)
+    // OP base: u32_rtn=0xEE0D407C, u32_nortn=0xEE05407C, f32_rtn=0xEE15407C, f32_nortn=0xEE0D407C
+    // word1: rtn = vdst | (1<<16); no_rtn = 0
+    // word2: (offset << 8) | vaddr
+
+    /// GFX1200 global_atomic_add_u32 vdst, v[addr:addr+1], vdata, off th:TH_ATOMIC_RETURN
+    /// llvm-mc: → [0x7c,0x40,0x0d,0xee, 0x05,0x00,0x10,0x05, ...]
+    pub fn global_atomic_add_u32_gfx1200(vdst: u8, vaddr: u8, vdata: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE0D407Cu32 | ((vdata as u32) << 1);
+        let word1 = (vdst as u32) | (1u32 << 16);
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_atomic_add_u32 v[addr:addr+1], vdata, off (no return)
+    pub fn global_atomic_add_u32_no_rtn_gfx1200(vaddr: u8, vdata: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE05407Cu32 | ((vdata as u32) << 1);
+        let word1 = 0u32;
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_atomic_add_f32 vdst, v[addr:addr+1], vdata, off th:TH_ATOMIC_RETURN
+    /// llvm-mc: → [0x7c,0x80,0x15,0xee, 0x05,0x00,0x10,0x05, ...]
+    pub fn global_atomic_add_f32_gfx1200(vdst: u8, vaddr: u8, vdata: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE15407Cu32 | ((vdata as u32) << 1);
+        let word1 = (vdst as u32) | (1u32 << 16);
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
+    }
+
+    /// GFX1200 global_atomic_add_f32 v[addr:addr+1], vdata, off (no return, fire-and-forget)
+    pub fn global_atomic_add_f32_no_rtn_gfx1200(vaddr: u8, vdata: u8, offset: i32) -> [u32; 3] {
+        let word0 = 0xEE0D407Cu32 | ((vdata as u32) << 1);
+        let word1 = 0u32;
+        let word2 = ((offset as u32) << 8) | (vaddr as u32);
+        [word0, word1, word2]
     }
 
     // =========================================================================
@@ -1801,6 +1984,8 @@ pub struct Rdna3Assembler {
     max_vgpr: u8,
     /// Highest SGPR index used + 1 (for KernelConfig validation)
     max_sgpr: u8,
+    /// Target GPU: "gfx1100" or "gfx1200"
+    target_gfx: String,
 }
 
 impl Rdna3Assembler {
@@ -1811,7 +1996,16 @@ impl Rdna3Assembler {
             lgkmcnt: 0,
             max_vgpr: 1, // v0 always used (workitem_id)
             max_sgpr: 2, // s[0:1] always used (kernarg_ptr)
+            target_gfx: "gfx1100".to_string(),
         }
+    }
+
+    pub fn set_target(&mut self, target: &str) {
+        self.target_gfx = target.to_string();
+    }
+
+    fn is_gfx1200(&self) -> bool {
+        self.target_gfx.starts_with("gfx12")
     }
 
     /// Declare the highest VGPR index used in this kernel (e.g., `use_vgprs(48)` means v0..v47).
@@ -1955,21 +2149,36 @@ impl Rdna3Assembler {
     // High-level instruction emitters with automatic waitcnt tracking
     // =========================================================================
     
-    /// global_load_dwordx4 with vmcnt tracking
+    /// global_load_dwordx4 with vmcnt tracking (GFX1200-aware)
     pub fn global_load_dwordx4(&mut self, vdst: u8, vaddr: u8, offset: i32) {
-        self.emit2(gfx11::global_load_dwordx4(vdst, vaddr, offset));
+        if self.is_gfx1200() {
+            let enc = gfx11::global_load_dwordx4_gfx1200(vdst, vaddr, offset);
+            self.emit(enc[0]); self.emit(enc[1]); self.emit(enc[2]);
+        } else {
+            self.emit2(gfx11::global_load_dwordx4(vdst, vaddr, offset));
+        }
         self.vmcnt = self.vmcnt.saturating_add(1);
     }
 
-    /// global_load_dword with vmcnt tracking
+    /// global_load_dword with vmcnt tracking (GFX1200-aware)
     pub fn global_load_dword(&mut self, vdst: u8, vaddr: u8, offset: i32) {
-        self.emit2(gfx11::global_load_dword(vdst, vaddr, offset));
+        if self.is_gfx1200() {
+            let enc = gfx11::global_load_dword_gfx1200(vdst, vaddr, offset);
+            self.emit(enc[0]); self.emit(enc[1]); self.emit(enc[2]);
+        } else {
+            self.emit2(gfx11::global_load_dword(vdst, vaddr, offset));
+        }
         self.vmcnt = self.vmcnt.saturating_add(1);
     }
 
-    /// global_load_dwordx2 with vmcnt tracking
+    /// global_load_dwordx2 with vmcnt tracking (GFX1200-aware)
     pub fn global_load_dwordx2(&mut self, vdst: u8, vaddr: u8, offset: i32) {
-        self.emit2(gfx11::global_load_dwordx2(vdst, vaddr, offset));
+        if self.is_gfx1200() {
+            let enc = gfx11::global_load_dwordx2_gfx1200(vdst, vaddr, offset);
+            self.emit(enc[0]); self.emit(enc[1]); self.emit(enc[2]);
+        } else {
+            self.emit2(gfx11::global_load_dwordx2(vdst, vaddr, offset));
+        }
         self.vmcnt = self.vmcnt.saturating_add(1);
     }
     
@@ -1979,15 +2188,14 @@ impl Rdna3Assembler {
     /// For VGPR offset, we need to use SADDR mode differently
     pub fn global_load_dwordx4_voffset(&mut self, vdst: u8, vaddr: u8, _voffset: u8) {
         // GFX11 global_load with VADDR + VOFFSET:
-        // Use the TFE bit or different encoding
-        // Simpler approach: add voffset to vaddr before load
-        // This requires the caller to have computed: v[vaddr] += v[voffset]
-        // OR use the standard encoding with SADDR=off and immediate offset=0
-        // The VADDR will be v[vaddr:vaddr+1] containing base + per-lane offset
-        
         // For now, use standard encoding with offset=0
         // Caller must pre-compute: v[vaddr] = base + lane_offset
-        self.emit2(gfx11::global_load_dwordx4(vdst, vaddr, 0));
+        if self.is_gfx1200() {
+            let enc = gfx11::global_load_dwordx4_gfx1200(vdst, vaddr, 0);
+            self.emit(enc[0]); self.emit(enc[1]); self.emit(enc[2]);
+        } else {
+            self.emit2(gfx11::global_load_dwordx4(vdst, vaddr, 0));
+        }
         self.vmcnt = self.vmcnt.saturating_add(1);
     }
     
@@ -1999,19 +2207,34 @@ impl Rdna3Assembler {
         self.lgkmcnt = self.lgkmcnt.saturating_add(1);
     }
     
-    /// global_store_dwordx4
+    /// global_store_dwordx4 (GFX1200-aware)
     pub fn global_store_dwordx4(&mut self, vaddr: u8, vsrc: u8, offset: i32) {
-        self.emit2(gfx11::global_store_dwordx4(vaddr, vsrc, offset));
+        if self.is_gfx1200() {
+            let enc = gfx11::global_store_dwordx4_gfx1200(vaddr, vsrc, offset);
+            self.emit(enc[0]); self.emit(enc[1]); self.emit(enc[2]);
+        } else {
+            self.emit2(gfx11::global_store_dwordx4(vaddr, vsrc, offset));
+        }
     }
-    
-    /// global_store_dwordx2 - stores 2 dwords (64 bits)
+
+    /// global_store_dwordx2 - stores 2 dwords (64 bits) (GFX1200-aware)
     pub fn global_store_dwordx2(&mut self, vaddr: u8, vsrc: u8, offset: i32) {
-        self.emit2(gfx11::global_store_dwordx2(vaddr, vsrc, offset));
+        if self.is_gfx1200() {
+            let enc = gfx11::global_store_dwordx2_gfx1200(vaddr, vsrc, offset);
+            self.emit(enc[0]); self.emit(enc[1]); self.emit(enc[2]);
+        } else {
+            self.emit2(gfx11::global_store_dwordx2(vaddr, vsrc, offset));
+        }
     }
     
-    /// global_store_dword - stores 1 dword
+    /// global_store_dword - stores 1 dword (GFX1200-aware)
     pub fn global_store_dword(&mut self, vaddr: u8, vsrc: u8, offset: i32) {
-        self.emit2(gfx11::global_store_dword(vaddr, vsrc, offset));
+        if self.is_gfx1200() {
+            let enc = gfx11::global_store_dword_gfx1200(vaddr, vsrc, offset);
+            self.emit(enc[0]); self.emit(enc[1]); self.emit(enc[2]);
+        } else {
+            self.emit2(gfx11::global_store_dword(vaddr, vsrc, offset));
+        }
     }
     
     /// Store a 16×16 WMMA C-layout tile to global memory in row-major order.
@@ -2056,7 +2279,12 @@ impl Rdna3Assembler {
 
     /// global_atomic_add_f32 — fire-and-forget, no return value, with offset
     pub fn global_atomic_add_f32_ff(&mut self, vaddr: u8, vdata: u8, offset: i32) {
-        self.emit2(gfx11::global_atomic_add_f32_no_rtn(vaddr, vdata, offset));
+        if self.is_gfx1200() {
+            let enc = gfx11::global_atomic_add_f32_no_rtn_gfx1200(vaddr, vdata, offset);
+            self.emit(enc[0]); self.emit(enc[1]); self.emit(enc[2]);
+        } else {
+            self.emit2(gfx11::global_atomic_add_f32_no_rtn(vaddr, vdata, offset));
+        }
     }
 
     /// Atomically add a 16×16 WMMA C-layout tile to global memory in row-major order.
@@ -2161,8 +2389,14 @@ impl Rdna3Assembler {
     }
     
     /// Wait for N pending vmem loads to complete
+    /// GFX11: s_waitcnt vmcnt(N)
+    /// GFX1200: s_wait_loadcnt N
     pub fn wait_vmcnt(&mut self, n: u8) {
-        self.emit(gfx11::s_waitcnt_vmcnt(n));
+        if self.is_gfx1200() {
+            self.emit(gfx11::s_wait_loadcnt(n));
+        } else {
+            self.emit(gfx11::s_waitcnt_vmcnt(n));
+        }
         if n == 0 {
             self.vmcnt = 0;
         } else {
@@ -2170,26 +2404,67 @@ impl Rdna3Assembler {
         }
     }
     
-    /// Wait for N pending lgkm ops to complete
+    /// Wait for N pending lgkm/data-share ops to complete
+    /// GFX11: s_waitcnt lgkmcnt(N)
+    /// GFX1200: s_wait_dscnt N (for ds_* ops) — use wait_kmcnt for s_load_* ops
     pub fn wait_lgkmcnt(&mut self, n: u8) {
-        self.emit(gfx11::s_waitcnt_lgkmcnt(n));
+        if self.is_gfx1200() {
+            self.emit(gfx11::s_wait_dscnt(n));
+        } else {
+            self.emit(gfx11::s_waitcnt_lgkmcnt(n));
+        }
         if n == 0 {
             self.lgkmcnt = 0;
         } else {
             self.lgkmcnt = self.lgkmcnt.saturating_sub(self.lgkmcnt - n);
         }
     }
-    
-    /// Wait for N pending vector stores to complete (GFX11 CRITICAL!)
-    /// On GFX11, vmcnt only waits for loads. Stores require vscnt!
-    /// MUST be called before s_endpgm to ensure data is written to memory!
+
+    /// Wait for N pending kernel/scalar memory ops to complete
+    /// GFX11: s_waitcnt lgkmcnt(N) — same as wait_lgkmcnt on GFX11
+    /// GFX1200: s_wait_kmcnt N — for s_load_* instructions
+    pub fn wait_kmcnt(&mut self, n: u8) {
+        if self.is_gfx1200() {
+            self.emit(gfx11::s_wait_kmcnt(n));
+        } else {
+            self.emit(gfx11::s_waitcnt_lgkmcnt(n));
+        }
+    }
+
+    /// Wait for N pending vector stores to complete
+    /// GFX11: s_waitcnt_vscnt null, N (0xBC7C0000 | n)
+    /// GFX1200: s_wait_storecnt N (0xBFC10000 | n)
     pub fn wait_vscnt(&mut self, n: u8) {
-        self.emit(gfx11::s_waitcnt_vscnt(n));
+        if self.is_gfx1200() {
+            self.emit(gfx11::s_wait_storecnt(n));
+        } else {
+            self.emit(gfx11::s_waitcnt_vscnt(n));
+        }
+    }
+
+    /// Wait for N pending vector loads to complete
+    /// GFX11: s_waitcnt vmcnt(N)
+    /// GFX1200: s_wait_loadcnt N
+    pub fn wait_loadcnt(&mut self, n: u8) {
+        if self.is_gfx1200() {
+            self.emit(gfx11::s_wait_loadcnt(n));
+        } else {
+            self.emit(gfx11::s_waitcnt_vmcnt(n));
+        }
     }
     
     /// Wait for all pending memory ops
+    /// GFX11: s_barrier (0xBFBD0000)
+    /// GFX1200: s_barrier_signal -1 + s_barrier_wait -1 (llvm-mc verified)
     pub fn barrier(&mut self) {
-        self.emit(gfx11::S_BARRIER);
+        if self.is_gfx1200() {
+            // s_barrier_signal -1: 0xBE804EC1
+            // s_barrier_wait -1:   0xBF94FFFF
+            self.emit(0xBE804EC1u32);
+            self.emit(0xBF94FFFFu32);
+        } else {
+            self.emit(gfx11::S_BARRIER);
+        }
     }
     
     /// WMMA matrix multiply
@@ -3110,5 +3385,232 @@ mod tests {
     #[test]
     fn test_endpgm() {
         assert_eq!(gfx11::S_ENDPGM, 0xBFB00000, "S_ENDPGM encoding");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // GFX1200 (RDNA4) Encoding Tests — llvm-mc verified
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── SMEM (s_load_*) ──
+
+    #[test]
+    fn test_gfx1200_s_load_b32() {
+        // llvm-mc: s_load_b32 s5, s[0:1], 0x0 → [0x40,0x01,0x00,0xf4,0x00,0x00,0x00,0xf8]
+        let [w0, w1] = gfx11::s_load_dword_gfx1200(5, 0, 0);
+        assert_eq!(w0, 0xF4000140, "s_load_b32 s5,s[0:1],0 word0");
+        assert_eq!(w1, 0xF8000000, "s_load_b32 s5,s[0:1],0 word1");
+    }
+
+    #[test]
+    fn test_gfx1200_s_load_b64() {
+        // llvm-mc: s_load_b64 s[4:5], s[0:1], 0x0 → [0x00,0x21,0x00,0xf4,...]
+        let [w0, w1] = gfx11::s_load_dwordx2_gfx1200(4, 0, 0);
+        assert_eq!(w0, 0xF4002100, "s_load_b64 s[4:5],s[0:1],0 word0");
+        assert_eq!(w1, 0xF8000000, "s_load_b64 word1");
+    }
+
+    #[test]
+    fn test_gfx1200_s_load_b128() {
+        // llvm-mc: s_load_b128 s[4:7], s[0:1], 0x0 → [0x00,0x41,0x00,0xf4,...]
+        let [w0, w1] = gfx11::s_load_dwordx4_gfx1200(4, 0, 0);
+        assert_eq!(w0, 0xF4004100, "s_load_b128 s[4:7],s[0:1],0 word0");
+        assert_eq!(w1, 0xF8000000, "s_load_b128 word1");
+    }
+
+    #[test]
+    fn test_gfx1200_s_load_b64_offset() {
+        // llvm-mc: s_load_b64 s[4:5], s[0:1], 0x10 → word1 = 0xF8000010
+        let [w0, w1] = gfx11::s_load_dwordx2_gfx1200(4, 0, 0x10);
+        assert_eq!(w0, 0xF4002100, "s_load_b64 with offset word0 unchanged");
+        assert_eq!(w1, 0xF8000010, "s_load_b64 offset 0x10 in word1");
+    }
+
+    // ── VGLOBAL FLAT (global_load/store) ──
+
+    #[test]
+    fn test_gfx1200_global_load_b32() {
+        // llvm-mc: global_load_b32 v5, v[0:1], off → [0x7c,0x00,0x05,0xee,0x05,...]
+        let [w0, w1, w2] = gfx11::global_load_dword_gfx1200(5, 0, 0);
+        assert_eq!(w0, 0xEE05007C, "global_load_b32 word0");
+        assert_eq!(w1, 0x00000005, "global_load_b32 vdst=5");
+        assert_eq!(w2, 0x00000000, "global_load_b32 no offset");
+    }
+
+    #[test]
+    fn test_gfx1200_global_load_b128() {
+        // llvm-mc: global_load_b128 v[5:8], v[0:1], off → word0=0xEE05C07C
+        let [w0, w1, w2] = gfx11::global_load_dwordx4_gfx1200(5, 0, 0);
+        assert_eq!(w0, 0xEE05C07C, "global_load_b128 word0");
+        assert_eq!(w1, 0x00000005, "global_load_b128 vdst=5");
+        assert_eq!(w2, 0x00000000, "global_load_b128 no offset");
+    }
+
+    #[test]
+    fn test_gfx1200_global_load_offset() {
+        // llvm-mc: global_load_b128 v[5:8], v[0:1], off offset:64 → word2=0x00004000
+        let [w0, w1, w2] = gfx11::global_load_dwordx4_gfx1200(5, 0, 64);
+        assert_eq!(w0, 0xEE05C07C, "global_load_b128 offset:64 word0");
+        assert_eq!(w2, 0x00004000, "offset 64 << 8 = 0x4000");
+    }
+
+    #[test]
+    fn test_gfx1200_global_store_b32_even_vsrc() {
+        // llvm-mc: global_store_b32 v[0:1], v6, off → word1=0x00000003
+        let [w0, w1, w2] = gfx11::global_store_dword_gfx1200(0, 6, 0);
+        assert_eq!(w0, 0xEE06807C, "global_store_b32 word0");
+        assert_eq!(w1, 0x00000003, "vsrc=6 → word1 = 6/2 = 3");
+        assert_eq!(w2, 0x00000000, "no offset");
+    }
+
+    #[test]
+    fn test_gfx1200_global_store_b32_odd_vsrc() {
+        // llvm-mc: global_store_b32 v[0:1], v5, off → word1=0x00800002
+        let [w0, w1, w2] = gfx11::global_store_dword_gfx1200(0, 5, 0);
+        assert_eq!(w0, 0xEE06807C, "global_store_b32 word0");
+        assert_eq!(w1, 0x00800002, "vsrc=5 → word1 = 5/2 | (1<<23)");
+        assert_eq!(w2, 0x00000000, "no offset");
+    }
+
+    #[test]
+    fn test_gfx1200_global_store_b128() {
+        // llvm-mc: global_store_b128 v[0:1], v[5:8], off → word0=0xEE07407C
+        let [w0, w1, w2] = gfx11::global_store_dwordx4_gfx1200(0, 5, 0);
+        assert_eq!(w0, 0xEE07407C, "global_store_b128 word0");
+        assert_eq!(w1, 0x00800002, "vsrc=5 odd");
+    }
+
+    #[test]
+    fn test_gfx1200_global_store_b16() {
+        // llvm-mc: global_store_b16 v[0:1], v5, off → word0=0xEE06407C
+        let [w0, w1, _] = gfx11::global_store_short_gfx1200(0, 5, 0);
+        assert_eq!(w0, 0xEE06407C, "global_store_b16 word0");
+        assert_eq!(w1, 0x00800002, "vsrc=5 odd");
+    }
+
+    #[test]
+    fn test_gfx1200_global_load_u16() {
+        // llvm-mc: global_load_u16 v5, v[0:1], off → word0=0xEE04807C
+        let [w0, w1, _] = gfx11::global_load_ushort_gfx1200(5, 0, 0);
+        assert_eq!(w0, 0xEE04807C, "global_load_u16 word0");
+        assert_eq!(w1, 0x00000005, "vdst=5");
+    }
+
+    // ── VGLOBAL Atomics ──
+
+    #[test]
+    fn test_gfx1200_global_atomic_add_u32_rtn() {
+        // llvm-mc: global_atomic_add_u32 v5, v[0:1], v10, off th:TH_ATOMIC_RETURN
+        let [w0, w1, w2] = gfx11::global_atomic_add_u32_gfx1200(5, 0, 10, 0);
+        assert_eq!(w0, 0xEE0D407C | (10 << 1), "atomic_u32_rtn word0");
+        assert_eq!(w1, 0x00010005, "atomic_u32_rtn word1: vdst=5, GLC(bit16)");
+        assert_eq!(w2, 0x00000000, "no offset");
+    }
+
+    #[test]
+    fn test_gfx1200_global_atomic_add_u32_no_rtn() {
+        // llvm-mc: global_atomic_add_u32 v[0:1], v10, off (no return)
+        let [w0, w1, w2] = gfx11::global_atomic_add_u32_no_rtn_gfx1200(0, 10, 0);
+        assert_eq!(w0, 0xEE05407C | (10 << 1), "atomic_u32_nortn word0");
+        assert_eq!(w1, 0x00000000, "atomic_u32_nortn word1: no return = 0");
+        assert_eq!(w2, 0x00000000, "no offset");
+    }
+
+    #[test]
+    fn test_gfx1200_global_atomic_add_f32_rtn() {
+        // llvm-mc: global_atomic_add_f32 v5, v[0:1], v10, off th:TH_ATOMIC_RETURN
+        let [w0, w1, _] = gfx11::global_atomic_add_f32_gfx1200(5, 0, 10, 0);
+        assert_eq!(w0, 0xEE15407C | (10 << 1), "atomic_f32_rtn word0");
+        assert_eq!(w1, 0x00010005, "atomic_f32_rtn word1");
+    }
+
+    #[test]
+    fn test_gfx1200_global_atomic_add_f32_no_rtn() {
+        // llvm-mc: global_atomic_add_f32 v[0:1], v10, off (no return)
+        let [w0, w1, _] = gfx11::global_atomic_add_f32_no_rtn_gfx1200(0, 10, 0);
+        assert_eq!(w0, 0xEE0D407C | (10 << 1), "atomic_f32_nortn word0");
+        assert_eq!(w1, 0x00000000, "atomic_f32_nortn word1: no return = 0");
+    }
+
+    #[test]
+    fn test_gfx1200_atomic_offset_encoding() {
+        // offset=16 → word2 = 16 << 8 = 0x1000
+        let [_, _, w2] = gfx11::global_atomic_add_f32_no_rtn_gfx1200(0, 10, 16);
+        assert_eq!(w2, 0x00001000, "offset 16 << 8 = 0x1000");
+    }
+
+    // ── Waitcnt (SOPP) ──
+
+    #[test]
+    fn test_gfx1200_waitcnt() {
+        // s_wait_loadcnt 0 → 0xBFC00000
+        assert_eq!(gfx11::s_wait_loadcnt(0), 0xBFC00000, "s_wait_loadcnt 0");
+        // s_wait_storecnt 0 → 0xBFC10000
+        assert_eq!(gfx11::s_wait_storecnt(0), 0xBFC10000, "s_wait_storecnt 0");
+        // s_wait_dscnt 0 → 0xBFC60000
+        assert_eq!(gfx11::s_wait_dscnt(0), 0xBFC60000, "s_wait_dscnt 0");
+        // s_wait_kmcnt 0 → 0xBFC70000
+        assert_eq!(gfx11::s_wait_kmcnt(0), 0xBFC70000, "s_wait_kmcnt 0");
+    }
+
+    #[test]
+    fn test_gfx1200_waitcnt_nonzero() {
+        // s_wait_loadcnt 4 → 0xBFC00004
+        assert_eq!(gfx11::s_wait_loadcnt(4), 0xBFC00004, "s_wait_loadcnt 4");
+        // s_wait_kmcnt 1 → 0xBFC70001
+        assert_eq!(gfx11::s_wait_kmcnt(1), 0xBFC70001, "s_wait_kmcnt 1");
+    }
+
+    // ── Barrier ──
+
+    #[test]
+    fn test_gfx1200_barrier_signal_wait() {
+        // s_barrier_signal -1 → 0xBE804EC1
+        // s_barrier_wait -1 → 0xBF94FFFF
+        let mut asm = Rdna3Assembler::new();
+        asm.set_target("gfx1200");
+        asm.barrier();
+        let code = &asm.code;
+        assert_eq!(code.len(), 2, "GFX1200 barrier emits 2 instructions");
+        assert_eq!(code[0], 0xBE804EC1, "s_barrier_signal -1");
+        assert_eq!(code[1], 0xBF94FFFF, "s_barrier_wait -1");
+    }
+
+    // ── Assembler GFX1200 branching ──
+
+    #[test]
+    fn test_gfx1200_assembler_global_load_store() {
+        let mut asm = Rdna3Assembler::new();
+        asm.set_target("gfx1200");
+        asm.global_load_dwordx4(5, 0, 0);
+        asm.global_store_dwordx4(0, 5, 0);
+        let code = &asm.code;
+        // global_load_b128: 3 dwords, global_store_b128: 3 dwords
+        assert_eq!(code.len(), 6, "GFX1200 load+store = 6 dwords");
+        assert_eq!(code[0], 0xEE05C07C, "global_load_b128 word0");
+        assert_eq!(code[3], 0xEE07407C, "global_store_b128 word0");
+    }
+
+    #[test]
+    fn test_gfx1200_assembler_waitcnt() {
+        let mut asm = Rdna3Assembler::new();
+        asm.set_target("gfx1200");
+        asm.wait_vmcnt(0);
+        asm.wait_lgkmcnt(0);
+        let code = &asm.code;
+        assert_eq!(code[0], 0xBFC00000, "GFX1200 wait_vmcnt → s_wait_loadcnt 0");
+        assert_eq!(code[1], 0xBFC60000, "GFX1200 wait_lgkmcnt → s_wait_dscnt 0");
+    }
+
+    // ── Cross-architecture: GFX11 unchanged ──
+
+    #[test]
+    fn test_gfx11_unchanged_after_gfx1200_changes() {
+        // Verify GFX11 global_load_b128 is still 2-dword 0xDC format
+        let [w0, _] = gfx11::global_load_dwordx4(0, 10, 0);
+        let prefix = (w0 >> 24) & 0xFF;
+        assert_eq!(prefix, 0xDC, "GFX11 global_load still uses 0xDC prefix");
+        // GFX11 SMEM still uses 0xF4 prefix with old layout
+        let [w0, _] = gfx11::s_load_dwordx4(4, 0, 0);
+        assert_eq!(w0, 0xF4080100, "GFX11 s_load_b128 unchanged");
     }
 }

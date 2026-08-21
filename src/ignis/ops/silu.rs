@@ -53,7 +53,7 @@ pub fn silu_gate(gate: &Tensor, up: &Tensor, _device: &Arc<KfdDevice>) -> Result
             let result = g.silu(&mut kb).mul(&mut kb, u); // silu(gate) * up
             kb.store_checked(out_ptr, off, result, n_arg);
 
-            let compiled = kb.compile(Target::GFX1100)?;
+            let compiled = kb.compile(Target::detect())?;
             runtime.compile_dsl(compiled)?
         }
     };
@@ -132,7 +132,7 @@ pub fn silu_gate(gate: &Tensor, up: &Tensor, _device: &Arc<KfdDevice>) -> Result
                         kb.store_checked(dgate_ptr, off, d_gate, n_arg);
                         kb.store_checked(dup_ptr, off, d_up, n_arg);
 
-                        let compiled = kb.compile(Target::GFX1100)?;
+                        let compiled = kb.compile(Target::detect())?;
                         runtime.compile_dsl(compiled)?
                     }
                 };

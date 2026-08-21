@@ -57,7 +57,7 @@ mod tests {
         let _m = kb.arg_u32("M");
         let tile_k = cfg.tile_k;
         kb.tile_gemm(_x, _w, _y, _k, _n, cfg);
-        let compiled = kb.compile(Target::GFX1100)?;
+        let compiled = kb.compile(Target::detect())?;
 
         // Prepare data — pad K to tile_k alignment for safe K-loop ceiling
         let k_padded = (k + tile_k - 1) & !(tile_k - 1);  // ceil(K, tile_k)

@@ -18,7 +18,7 @@
 //! let kernel = gemm(1024, 1024, 4096).compile()?;
 //!
 //! // 融合操作
-//! let fused = KernelBuilder::new(Target::GFX1100)
+//! let fused = KernelBuilder::new(Target::detect())
 //!     .op(Op::SiLU)
 //!     .op(Op::Mul)
 //!     .compile()?;

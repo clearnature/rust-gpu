@@ -185,7 +185,7 @@ mod precision_tests {
         let swiglu_func = tile_ssa::ElemChain::swiglu(256);
         let lowered = crate::t0::tile_ssa_lower::lower_elementwise_1d(&swiglu_func, 256, 1)
             .expect("SwiGLU lower failed");
-        let swiglu_elf = lowered.kernel.compile(Target::GFX1100)
+        let swiglu_elf = lowered.kernel.compile(Target::detect())
             .expect("SwiGLU compile failed");
 
         // Build CompiledKernel manually for compile_dsl
@@ -248,7 +248,7 @@ mod precision_tests {
             // Store as BF16 with bounds check
             kb.store_bf16_checked(dst, idx, val, count);
 
-            let ck = kb.compile_via_ssa(Target::GFX1100).expect("f32→bf16 compile");
+            let ck = kb.compile_via_ssa(Target::detect()).expect("f32→bf16 compile");
             let cvt_kernel = rt.compile_dsl(ck).expect("f32→bf16 load");
             let ka = crate::kernargs![
                 swiglu_buf.gpu_addr() => u64,
