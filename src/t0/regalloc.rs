@@ -140,18 +140,33 @@ pub fn allocate(
     let mut sgpr_map: HashMap<SReg, u8> = HashMap::new();
     let mut next_sgpr: u8 = 5; // s0:s1 = kernarg ptr, s2/s3/s4 = TGID
 
+    // s63 is RESERVED: on GFX1200 the asm emitter uses it as the zero soffset
+    // for buffer_load/buffer_store (SOFFSET_ZERO). If allocated as a general SGPR,
+    // it gets clobbered and stores write to wrong addresses (+64 bytes for K-loop k_step).
+    const RESERVED_S63: u8 = 63;
+
     for sa in sreg_allocs {
+        // Skip s63 if we'd land on it (reserved for SOFFSET_ZERO on GFX1200)
+        if next_sgpr == RESERVED_S63 {
+            next_sgpr += 1;
+        }
         if sa.count == 1 {
             sgpr_map.insert(sa.sreg, next_sgpr);
             next_sgpr += 1;
         } else if sa.count == 2 {
             let aligned = (next_sgpr + 1) & !1;
+            // Ensure aligned block doesn't straddle s63
+            let aligned = if aligned == RESERVED_S63 { aligned + 2 } else { aligned };
             sgpr_map.insert(sa.sreg, aligned);
             sgpr_map.insert(SReg(sa.sreg.0 + 1), aligned + 1);
             next_sgpr = aligned + 2;
         } else if sa.count == 4 {
             // Buffer resource descriptors need 4-aligned SGPRs
             let aligned = (next_sgpr + 3) & !3;
+            // Skip s63 if it falls within the 4-register block
+            let aligned = if aligned <= RESERVED_S63 && aligned + 4 > RESERVED_S63 {
+                ((RESERVED_S63 + 1 + 3) & !3)
+            } else { aligned };
             for i in 0..4u32 {
                 sgpr_map.insert(SReg(sa.sreg.0 + i), aligned + i as u8);
             }

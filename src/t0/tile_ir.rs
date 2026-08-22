@@ -927,20 +927,6 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
         k.s_and_b32(tile_col_s, tile_idx_s, n_tiles_n_mask);
         k.s_mov_imm(split_k_id_s, 0);
 
-        // DIAGNOSTIC: write tile_idx to output[4] to confirm loop runs
-        // Uses alloc_vreg_array for consecutive VGPR pair
-        {
-            let d_arr = k.alloc_vreg_array(2, Alignment::Align2);
-            let d_lo = VReg(d_arr.0);
-            let d_hi = VReg(d_arr.0 + 1);
-            k.v_mov_from_sgpr(d_lo, SReg(y_ptr.0));
-            k.v_mov_from_sgpr(d_hi, SReg(y_ptr.0 + 1));
-            // output[4] = y_ptr + 16 bytes
-            let d_val = k.alloc_vreg();
-            k.v_mov_from_sgpr(d_val, tile_idx_s);
-            k.global_store(d_lo, d_val, Width::B32, 16);  // +16 offset = output[4]
-            k.wait_vscnt(0);
-        }
     } else if spec.swap_grid {
         // ── Static TGID-based assignment (non-persistent) ──
         k.push(Op::SAddU32 { dst: tile_col_s, src0: tgid_x_s, src1: SOperand::InlineInt(0) });
