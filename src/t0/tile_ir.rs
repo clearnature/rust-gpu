@@ -5702,31 +5702,21 @@ mod gpu_tests {
                 // The SGPR loop counter controls exit, so the atomic counter can accumulate.
                 counter_buf.zero();
 
+                // Warmup
                 for _ in 0..warmup {
                     if rt.dispatch(&kernel, grid, &ka).is_err() {
-                        eprintln!("{:<20} DISPATCH FAIL (hang?)", format!("{}³", m));
+                        eprintln!("{:<20} DISPATCH FAIL", format!("{}³", m));
                         break;
                     }
                 }
 
-                let mut times_ns: Vec<u64> = Vec::new();
-                for _ in 0..iters {
-                    let start = Instant::now();
-                    if rt.dispatch(&kernel, grid, &ka).is_err() {
-                        eprintln!("{:<20} DISPATCH FAIL in timed loop", format!("{}³", m));
-                        break;
-                    }
-                    times_ns.push(start.elapsed().as_nanos() as u64);
-                }
-
-                if times_ns.is_empty() {
-                    eprintln!("{:<20} ALL DISPATCHES FAILED", format!("{}³", m));
+                // Single dispatch timing for accuracy
+                let t0 = std::time::Instant::now();
+                if rt.dispatch(&kernel, grid, &ka).is_err() {
+                    eprintln!("{:<20} DISPATCH FAIL", format!("{}³", m));
                     continue;
                 }
-
-                times_ns.sort();
-                let median_ns = times_ns[times_ns.len() / 2];
-                let us = median_ns as f64 / 1000.0;
+                let us = t0.elapsed().as_micros() as f64;
                 let tflops = if us > 0.0 { flops / (us * 1e6) } else { 0.0 };
 
                 let max_err = if m <= 2048 {

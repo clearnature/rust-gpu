@@ -3078,6 +3078,9 @@ impl DispatchPool {
     ) -> Result<(), String> {
         self.signal.write_val::<u64>(0, 1);
         self.signal.write_val::<i64>(8, 1);
+        // WC readback drain: ensure signal reaches GPU VRAM before doorbell
+        // geisYaO: "SFENCE 不保证 PCIe 可见性，必须 readback drain"
+        unsafe { let _ = std::ptr::read_volatile(self.signal.host_ptr); }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         let ka = self.get_kernargs(ka_idx);
         queue.dispatch_signal(kernel, grid, ka, Some(&self.signal))
