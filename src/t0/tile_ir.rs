@@ -69,6 +69,23 @@ pub enum EpilogueOp {
 ///
 /// Determines how the B (weight) matrix is laid out in memory.
 /// The A (input) matrix is always row-major [M, K].
+///
+/// # FFN Fused Prefill Kernel
+///
+/// For prefill-stage FFN layers, a fused `residual_add + RMSNorm + GEMV` kernel
+/// is available in `ffn_fused_kernels::build_ffn_fused_rmsnorm_gemm()`.
+///
+/// This eliminates intermediate GMEM traffic by:
+/// 1. Fusing residual add with RMSNorm's sum_sq accumulation (one GMEM read)
+/// 2. Computing `normed = x2 × inv_rms × gamma` inline in the GEMV K-loop
+///    (normed values never touch GMEM — consumed in-register)
+///
+/// The kernel uses the mw4 (4-wave, 128 threads) pattern with for_range
+/// loops over model dimension D. For D=4096, each workgroup executes
+/// 32 loop iterations per pass (stride=128).
+///
+/// See `docs/blog_geisYaO_全部博文_2026-08-22.md` §3 for benchmark data:
+/// residual_add + rmsnorm + GEMV fusion achieved +15.9% tok/s improvement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileTranspose {
     /// Y[M,N] = A[M,K] @ B[N,K]^T — B is row-major with stride=K (forward GEMM)
@@ -114,6 +131,8 @@ pub struct TileGemm {
     /// Empty = no epilogue (plain GEMM output).
     /// Operations are applied in order: result = epilogue[n](...(epilogue[0](acc))...)
     pub epilogue: Vec<EpilogueOp>,
+    /// Persistent kernel mode: single workgroup processes all N-tiles in a loop.
+    pub persistent: bool,
 }
 
 impl TileGemm {
@@ -126,6 +145,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -138,6 +158,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -150,6 +171,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -162,6 +184,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -174,6 +197,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -186,6 +210,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -200,6 +225,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -212,6 +238,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -226,6 +253,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -242,6 +270,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -256,6 +285,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -270,6 +300,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: true,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -285,6 +316,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: true,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -301,6 +333,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -317,6 +350,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -334,6 +368,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -349,6 +384,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            persistent: false,
         }
     }
 
@@ -356,6 +392,49 @@ impl TileGemm {
     /// NOTE: multi-dispatch still hangs in both CU and WGP mode!
     /// Kept for single-dispatch use only.
     // pub fn tile_64x64_k16_wgp() removed: WGP doesn't fix 2-wave hang
+
+    /// Persistent decode kernel: 32×64 k16 for small M, large N scenarios.
+    ///
+    /// Designed for decode (M=1, N≥4096): single workgroup loops over all N-tiles
+    /// internally, eliminating dispatch overhead and improving L2 cache locality.
+    ///
+    /// Key differences from non-persistent:
+    /// - `persistent: true` — lower_gemm generates outer N-tile loop
+    /// - `swap_grid: false` — single workgroup, no grid decomposition
+    /// - Grid = [wg_size, 1, 1] — one workgroup processes all tiles
+    pub fn tile_persistent_decode() -> Self {
+        Self {
+            tile_m: 32, tile_n: 64, tile_k: 16,
+            wgp_mode: false, double_buffer: true,
+            split_k: 1, swap_grid: false,
+            transpose: TileTranspose::NT,
+            acc_swap: false,
+            epilogue: vec![],
+            persistent: true,
+        }
+    }
+
+    /// Persistent GEMM kernel: 128×64 k32 for large matrix (≥2048³).
+    ///
+    /// K6 atomic work claiming: dispatch 1-2 workgroups, each wave claims tiles
+    /// via atomicAdd(counter, WAVE_SIZE) + readfirstlane broadcast.
+    ///
+    /// Designed for GFX1200 (MES v2 firmware bug: ≥4 WG → MEC scheduler deadlock).
+    /// With 1 WG of 256 threads (8 waves), 8 CUs active simultaneously.
+    /// With 2 WGs, 16 CUs — half the RX 9060 XT's 32 CUs.
+    ///
+    /// Grid = [num_wg * wg_size, 1, 1] where num_wg = 1 or 2.
+    pub fn tile_persistent_128x64_k32() -> Self {
+        Self {
+            tile_m: 128, tile_n: 64, tile_k: 32,
+            wgp_mode: false, double_buffer: true,
+            split_k: 1, swap_grid: true,
+            transpose: TileTranspose::NT,
+            acc_swap: false,
+            epilogue: vec![],
+            persistent: true,
+        }
+    }
 
     /// Number of waves per workgroup = tile_m / 32
     pub fn n_waves(&self) -> u32 { self.tile_m / 32 }
@@ -413,6 +492,7 @@ impl TileGemm {
         let mg = if !self.swap_grid { "_mg" } else { "" };
         let tr = match self.transpose { TileTranspose::NN => "_nn", TileTranspose::NT => "" };
         let sw = if self.acc_swap { "_swap" } else { "" };
+        let persist = if self.persistent { "_persistent" } else { "" };
         let epi = if self.epilogue.is_empty() {
             String::new()
         } else {
@@ -428,7 +508,7 @@ impl TileGemm {
             }).collect();
             format!("_{}", ops.join("_"))
         };
-        format!("tile_gemm_{}x{}_k{}{}{}{}{}{}{}{}", self.tile_m, self.tile_n, self.tile_k, db, sk, mg, wgp, tr, sw, epi)
+        format!("tile_gemm_{}x{}_k{}{}{}{}{}{}{}{}{}", self.tile_m, self.tile_n, self.tile_k, db, sk, mg, wgp, tr, sw, persist, epi)
     }
 
     /// Add an epilogue operation to the fusion chain.
@@ -606,6 +686,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     k.set_lds_size(spec.lds_total());
     k.set_wg_size(spec.wg_size());
     k.set_wgp_mode(effective_wgp);
+    if spec.persistent {
+        k.set_skip_optimize(true);  // SSA passes can't handle persistent loop back-edge
+    }
 
     let x_row_stride = spec.tile_k * 2;  // bytes per row in LDS (no padding for Phase 1)
     let wt_row_stride = spec.tile_k * 2;
@@ -667,6 +750,13 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     let y_split_stride = k.arg_u32("y_split_stride");
     let m_dim = k.arg_u32("M");      // actual M (may not be tile-aligned)
 
+    // ── Persistent mode: atomic work counter pointer ──
+    let counter_ptr = if spec.persistent {
+        Some(k.arg_ptr("counter"))    // device u32 atomic counter (initialized to 0)
+    } else {
+        None
+    };
+
     // ── Epilogue kernel arguments (declared after standard GEMM args) ──
     let epi_bias_ptr = if spec.has_epilogue_bias() {
         Some(k.arg_ptr("bias"))       // [N] f32 bias vector
@@ -699,7 +789,93 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     let tile_row_s = k.alloc_sreg();
     let split_k_id_s = k.alloc_sreg();
 
-    if spec.swap_grid {
+    // Pre-allocate persistent labels (used only in persistent mode)
+    let persistent_exit = k.make_label("persistent_exit");
+    let persistent_loop = if spec.persistent {
+        Some(k.make_label("persistent_loop"))
+    } else {
+        None
+    };
+
+    if spec.persistent {
+        // ════════════════════════════════════════════════════════════
+        // K6 Atomic Work Claiming (readfirstlane + atomicAdd)
+        //
+        // Pattern from /data/rtl-sdr/swmmac/active/bench_stagger_final.cpp:
+        //   if(threadIdx.x==0) w_base = atomicAdd(cnt, 1);
+        //   w_base = __builtin_amdgcn_readfirstlane(w_base);
+        //   if(w_base >= total_tiles) return;
+        //
+        // Each wave claims one tile dynamically via atomicAdd.
+        // readfirstlane broadcasts the claimed index to all lanes.
+        // Early exit when all tiles are processed.
+        // ════════════════════════════════════════════════════════════
+        let cp = counter_ptr.expect("persistent mode requires counter_ptr");
+
+        // Persistent loop label: K6 claim → process → loop back
+        let ploop = persistent_loop.as_ref().unwrap();
+        k.label(ploop);
+
+        // Load counter_ptr from SGPR pair to contiguous VGPR pair (atomic needs VGPR address)
+        let cp_varr = k.alloc_vreg_array(2, Alignment::Align2);
+        let cp_vlo = VReg(cp_varr.0);
+        let cp_vhi = VReg(cp_varr.0 + 1);
+        k.v_mov_from_sgpr(cp_vlo, SReg(cp.0));
+        k.v_mov_from_sgpr(cp_vhi, SReg(cp.0 + 1));
+
+        // Compute total_tiles = ceil(M/tile_m) * ceil(N/tile_n)
+        // tile_m and tile_n are always powers of 2 → use shifts
+        let n_tiles_m_s = k.alloc_sreg();
+        let n_tiles_n_s = k.alloc_sreg();
+        let total_tiles_s = k.alloc_sreg();
+        let n_tiles_n_shift: u8;
+        {
+            let tm_shift = spec.tile_m.trailing_zeros() as u8;
+            let tn_shift = spec.tile_n.trailing_zeros() as u8;
+            n_tiles_n_shift = tn_shift;
+            // n_tiles_m = M >> tm_shift (floor division, assumes M is tile-aligned)
+            k.s_lshr_b32(n_tiles_m_s, SReg(m_dim.0), tm_shift);
+            // n_tiles_n = N >> tn_shift
+            k.s_lshr_b32(n_tiles_n_s, SReg(n_dim.0), tn_shift);
+            // total_tiles = n_tiles_m * n_tiles_n
+            k.push(Op::SMulI32 { dst: total_tiles_s, src0: n_tiles_m_s, src1: n_tiles_n_s });
+        }
+
+        // K6 pattern: atomicAdd(counter, 1) — each wave claims one tile.
+        //
+        // Each wave executes atomicAdd(counter, 1) and gets a unique tile index.
+        // readfirstlane broadcasts the tile index to all lanes in the wave.
+        // Early exit when tile_idx >= total_tiles.
+        let tile_idx_v = k.alloc_vreg();
+        let one_v = k.alloc_vreg();
+        k.v_mov_imm(one_v, 1);
+
+        // atomicAdd returns old value per lane; all lanes get same old value via readfirstlane
+        k.push(Op::GlobalAtomicAddU32Rtn {
+            dst: tile_idx_v,
+            addr: cp_vlo,
+            src: one_v,
+        });
+
+        // readfirstlane: broadcast lane 0's value to all lanes
+        let tile_idx_s = k.alloc_sreg();
+        k.push(Op::VReadfirstlane { dst: tile_idx_s, src: tile_idx_v });
+
+        // Early exit if tile_idx >= total_tiles
+        k.s_cmp_ge_u32(tile_idx_s, total_tiles_s);
+        k.branch_scc1(&persistent_exit);
+
+        // Decompose linear tile_idx → (tile_row, tile_col)
+        // tile_row = tile_idx >> n_tiles_n_shift (n_tiles_n is power of 2)
+        // tile_col = tile_idx & (n_tiles_n - 1)
+        k.s_lshr_b32(tile_row_s, tile_idx_s, n_tiles_n_shift);
+        let n_tiles_n_mask = k.alloc_sreg();
+        k.s_mov_imm(n_tiles_n_mask, ((1u32 << n_tiles_n_shift) - 1) as i32);
+        k.s_and_b32(tile_col_s, tile_idx_s, n_tiles_n_mask);
+        k.s_mov_imm(split_k_id_s, 0);
+
+    } else if spec.swap_grid {
+        // ── Static TGID-based assignment (non-persistent) ──
         k.push(Op::SAddU32 { dst: tile_col_s, src0: tgid_x_s, src1: SOperand::InlineInt(0) });
         if split_k <= 1 {
             k.push(Op::SAddU32 { dst: tile_row_s, src0: tgid_y_s, src1: SOperand::InlineInt(0) });
@@ -1578,6 +1754,16 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     // ── Early exit for fully OOB workgroups ──
     k.label(&early_exit_label);
     k.endpgm();
+
+    // ── Persistent mode: loop back or exit ──
+    if spec.persistent {
+        // Loop back to claim next tile
+        k.branch(persistent_loop.as_ref().unwrap());
+        // Exit when all tiles claimed
+        k.label(&persistent_exit);
+        k.endpgm();
+    }
+
     // Full SSA optimization pipeline (2026-03-28).
     // All passes enabled: const fold, alg simplify, copy prop, CSE, combine,
     // LICM, DCE, waitcnt opt, post-regalloc scheduling.
@@ -3222,9 +3408,19 @@ pub fn build_kernargs_m(
     k_dim: u32, n_dim: u32, m_dim: u32,
     spec: &TileGemm,
 ) -> Vec<u8> {
+    build_kernargs_m_with_counter(x_addr, wt_addr, y_addr, k_dim, n_dim, m_dim, spec, 0)
+}
+
+/// Build kernarg buffer with optional counter pointer for persistent mode.
+pub fn build_kernargs_m_with_counter(
+    x_addr: u64, wt_addr: u64, y_addr: u64,
+    k_dim: u32, n_dim: u32, m_dim: u32,
+    spec: &TileGemm,
+    counter_addr: u64,
+) -> Vec<u8> {
     let sk_shift: u32 = match spec.split_k { 1=>0, 2=>1, 4=>2, 8=>3, 16=>4, _=>0 };
     let y_split_stride: u32 = 0;
-    let mut ka = Vec::with_capacity(48);
+    let mut ka = Vec::with_capacity(56);
     ka.extend_from_slice(&x_addr.to_le_bytes());     // arg 0: X ptr
     ka.extend_from_slice(&wt_addr.to_le_bytes());    // arg 1: WT ptr
     ka.extend_from_slice(&y_addr.to_le_bytes());     // arg 2: Y ptr
@@ -3233,11 +3429,30 @@ pub fn build_kernargs_m(
     ka.extend_from_slice(&sk_shift.to_le_bytes());   // arg 5: split_k_shift
     ka.extend_from_slice(&y_split_stride.to_le_bytes()); // arg 6: y_split_stride
     ka.extend_from_slice(&m_dim.to_le_bytes());      // arg 7: M
+    if spec.persistent {
+        ka.extend_from_slice(&counter_addr.to_le_bytes()); // arg 8: counter ptr
+    }
     ka
 }
 
 /// Compute dispatch grid for tile_ir GEMM.
+///
+/// For persistent mode (K6 pattern): launches oversubscribed waves.
+/// Each wave claims work via atomicAdd(counter, 1).
+/// Oversubscription (4x) ensures all CUs stay busy even with uneven tile costs.
+///
+/// **GFX1200 note**: MES v2 firmware bug limits persistent dispatch to 2 WGs max.
+/// With 2 WGs the persistent loop keeps waves re-entering, so CU utilization
+/// depends on wave count per WG, not WG count.
 pub fn compute_grid(spec: &TileGemm, m: u32, n: u32) -> [u32; 3] {
+    if spec.persistent {
+        // K6 pattern: dispatch limited number of WGs for MES v2 compatibility.
+        // 2 WGs × wg_size threads. Each wave claims 1 tile via atomicAdd.
+        // The persistent loop re-enters until all tiles are processed.
+        let num_wg: u32 = 2;  // MES v2 safe: ≤2 WGs
+        return [num_wg * spec.wg_size(), 1, 1];
+    }
+
     let n_wgs_n = (n + spec.tile_n - 1) / spec.tile_n;
     let n_wgs_m = (m + spec.tile_m - 1) / spec.tile_m;
     if spec.swap_grid {
@@ -5361,6 +5576,596 @@ mod gpu_tests {
             eprintln!("  (ReLU fused at zero VRAM bandwidth cost)");
             eprintln!("═══════════════════════════════════════════════════════════\n");
         });
+    }
+
+    /// Persistent GEMM benchmark: K6 atomic work claiming on GFX1200 (RX 9060 XT).
+    ///
+    /// Dispatches 2 workgroups (512 threads, 16 waves) with persistent loop.
+    /// Each wave claims tiles via atomicAdd(counter, WAVE_SIZE) + readfirstlane.
+    ///
+    /// Run: cargo test --release --lib --features rocm -- test_persistent_gemm_benchmark --nocapture --test-threads=1
+    #[test]
+    fn test_persistent_gemm_benchmark() {
+        use std::time::Instant;
+
+        with_rt(|rt| {
+            let sizes: Vec<(u32, u32, u32)> = vec![
+                (1024, 1024, 1024),
+                (2048, 2048, 2048),
+                (4096, 4096, 4096),
+            ];
+            let warmup = 3u32;
+            let iters = 10u32;
+
+            eprintln!("\n╔══════════════════════════════════════════════════════════════════╗");
+            eprintln!("║  Persistent GEMM Benchmark — K6 Atomic Work Claiming            ║");
+            eprintln!("║  RX 9060 XT (GFX1200), BF16 WMMA, F32 output, 2 WG dispatch    ║");
+            eprintln!("╚══════════════════════════════════════════════════════════════════╝\n");
+            eprintln!("{:<20} {:>8} {:>10} {:>10} {:>10}",
+                "Size", "μs/iter", "TFLOPS", "max_err", "n_tiles");
+            eprintln!("{}", "-".repeat(62));
+
+            for &(m, k, n) in &sizes {
+                let flops = 2.0 * m as f64 * k as f64 * n as f64;
+                let spec = TileGemm::tile_persistent_128x64_k32();
+                let n_tiles = ((m + spec.tile_m - 1) / spec.tile_m)
+                            * ((n + spec.tile_n - 1) / spec.tile_n);
+
+                let x_bf16: Vec<u16> = (0..(m*k) as usize)
+                    .map(|i| f32_to_bf16(((i % 17) as f32 - 8.0) * 0.01)).collect();
+                let wt_bf16: Vec<u16> = (0..(n*k) as usize)
+                    .map(|i| f32_to_bf16(((i % 13) as f32 - 6.0) * 0.01)).collect();
+                let x_buf = upload_bf16(rt, &x_bf16);
+                let wt_buf = upload_bf16(rt, &wt_bf16);
+                let y_buf = rt.alloc_zero((m * n * 4) as usize).expect("alloc Y");
+                let counter_buf = rt.alloc_zero(4096).expect("alloc counter");
+
+                let name = format!("bench_persistent_{}", spec.name());
+                let kernel = match rt.ensure_kernel_t0(
+                    &name, || lower_gemm(&spec),
+                    [spec.wg_size(), 1, 1], spec.lds_total(),
+                ) {
+                    Ok(k) => k,
+                    Err(e) => { eprintln!("{:<20} COMPILE FAIL: {}", format!("{}³", m), e); continue; }
+                };
+
+                let grid = compute_grid(&spec, m, n);
+                let ka = build_kernargs_m_with_counter(
+                    x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                    k, n, m, &spec, counter_buf.gpu_addr(),
+                );
+
+                for _ in 0..warmup {
+                    counter_buf.zero();
+                    if rt.dispatch(&kernel, grid, &ka).is_err() {
+                        eprintln!("{:<20} DISPATCH FAIL (hang?)", format!("{}³", m));
+                        break;
+                    }
+                }
+
+                let mut times_ns: Vec<u64> = Vec::new();
+                for _ in 0..iters {
+                    counter_buf.zero();
+                    let start = Instant::now();
+                    if rt.dispatch(&kernel, grid, &ka).is_err() {
+                        eprintln!("{:<20} DISPATCH FAIL in timed loop", format!("{}³", m));
+                        break;
+                    }
+                    times_ns.push(start.elapsed().as_nanos() as u64);
+                }
+
+                if times_ns.is_empty() {
+                    eprintln!("{:<20} ALL DISPATCHES FAILED", format!("{}³", m));
+                    continue;
+                }
+
+                times_ns.sort();
+                let median_ns = times_ns[times_ns.len() / 2];
+                let us = median_ns as f64 / 1000.0;
+                let tflops = if us > 0.0 { flops / (us * 1e6) } else { 0.0 };
+
+                let max_err = if m <= 2048 {
+                    let result = rt.read_f32(&y_buf, (m * n) as usize);
+                    let expected = cpu_gemm_nt_bf16(&x_bf16, &wt_bf16, m as usize, k as usize, n as usize);
+                    result.iter().zip(expected.iter())
+                        .map(|(r, e)| (r - e).abs())
+                        .fold(0.0f32, f32::max)
+                } else {
+                    let result = rt.read_f32(&y_buf, 16);
+                    if result.iter().all(|&v| v == 0.0) { f32::INFINITY } else { 0.0 }
+                };
+
+                eprintln!("{:<20} {:>8.1} {:>10.3} {:>10.4} {:>10}",
+                    format!("{}×{}×{}", m, k, n), us, tflops, max_err, n_tiles);
+            }
+
+            eprintln!("\nNote: 2 WG × 256 threads = 16 waves for 32 CUs.");
+            eprintln!("Persistent loop: waves re-enter until all tiles processed.");
+        });
+    }
+
+    /// Side-by-side: non-persistent vs persistent at 4096³.
+    /// Run: cargo test --release --lib --features rocm -- test_persistent_vs_static_benchmark --nocapture --test-threads=1
+    #[test]
+    fn test_persistent_vs_static_benchmark() {
+        use std::time::Instant;
+
+        with_rt(|rt| {
+            let (m, k, n) = (4096u32, 4096u32, 4096u32);
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            let warmup = 3u32;
+            let iters = 10u32;
+
+            eprintln!("\n╔═══════════════════════════════════════════════════════════════╗");
+            eprintln!("║  Persistent vs Static GEMM @ 4096³ NT                       ║");
+            eprintln!("║  RX 9060 XT (GFX1200)                                        ║");
+            eprintln!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+            let x_bf16: Vec<u16> = (0..(m*k) as usize)
+                .map(|i| f32_to_bf16(((i % 17) as f32 - 8.0) * 0.01)).collect();
+            let wt_bf16: Vec<u16> = (0..(n*k) as usize)
+                .map(|i| f32_to_bf16(((i % 13) as f32 - 6.0) * 0.01)).collect();
+            let x_buf = upload_bf16(rt, &x_bf16);
+            let wt_buf = upload_bf16(rt, &wt_bf16);
+
+            // Config 1: static 128×64 k32 (non-persistent, many WGs)
+            {
+                let spec = TileGemm::tile_128x64_k32();
+                let y_buf = rt.alloc_zero((m * n * 4) as usize).expect("alloc Y");
+                let kernel = match rt.ensure_kernel_t0(
+                    "bench_static_128x64_k32", || lower_gemm(&spec),
+                    [spec.wg_size(), 1, 1], spec.lds_total(),
+                ) {
+                    Ok(k) => k,
+                    Err(e) => { eprintln!("static compile FAIL: {}", e); return; }
+                };
+                let ka = build_kernargs_m(
+                    x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                    k, n, m, &spec,
+                );
+                let grid = compute_grid(&spec, m, n);
+                eprintln!("Static 128×64 k32: grid={:?}, wg_size={}", grid, spec.wg_size());
+                for _ in 0..warmup { let _ = rt.dispatch(&kernel, grid, &ka); }
+                let t0 = Instant::now();
+                for _ in 0..iters { rt.dispatch_async(&kernel, grid, &ka); }
+                rt.wait_idle();
+                let us = t0.elapsed().as_micros() as f64 / iters as f64;
+                eprintln!("  Static:   {:>8.1} μs  {:>6.2} TFLOPS", us, flops / (us * 1e6));
+            }
+
+            // Config 2: persistent 128×64 k32 (K6 atomic, 2 WG)
+            {
+                let spec = TileGemm::tile_persistent_128x64_k32();
+                let y_buf = rt.alloc_zero((m * n * 4) as usize).expect("alloc Y");
+                let counter_buf = rt.alloc_zero(4096).expect("alloc counter");
+                let kernel = match rt.ensure_kernel_t0(
+                    "bench_persistent_128x64_k32", || lower_gemm(&spec),
+                    [spec.wg_size(), 1, 1], spec.lds_total(),
+                ) {
+                    Ok(k) => k,
+                    Err(e) => { eprintln!("persistent compile FAIL: {}", e); return; }
+                };
+                let ka = build_kernargs_m_with_counter(
+                    x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                    k, n, m, &spec, counter_buf.gpu_addr(),
+                );
+                let grid = compute_grid(&spec, m, n);
+                eprintln!("Persistent 2-WG 128×64 k32: grid={:?}, wg_size={}", grid, spec.wg_size());
+                let mut times_ns: Vec<u64> = Vec::new();
+                for _ in 0..(warmup + iters) {
+                    counter_buf.zero();
+                    let start = Instant::now();
+                    if rt.dispatch(&kernel, grid, &ka).is_err() { eprintln!("  DISPATCH FAIL"); break; }
+                    times_ns.push(start.elapsed().as_nanos() as u64);
+                }
+                if times_ns.len() > warmup as usize {
+                    let mut bench: Vec<u64> = times_ns[warmup as usize..].to_vec();
+                    bench.sort();
+                    let us = bench[bench.len() / 2] as f64 / 1000.0;
+                    eprintln!("  Persistent 2-WG: {:>8.1} μs  {:>6.2} TFLOPS", us, flops / (us * 1e6));
+                }
+            }
+
+            // Config 3: persistent 128×64 k32 (K6 atomic, 1 WG)
+            {
+                let spec = TileGemm::tile_persistent_128x64_k32();
+                let y_buf = rt.alloc_zero((m * n * 4) as usize).expect("alloc Y");
+                let counter_buf = rt.alloc_zero(4096).expect("alloc counter");
+                let kernel = match rt.ensure_kernel_t0(
+                    "bench_persistent_1wg_128x64_k32", || lower_gemm(&spec),
+                    [spec.wg_size(), 1, 1], spec.lds_total(),
+                ) {
+                    Ok(k) => k,
+                    Err(e) => { eprintln!("persistent 1-WG compile FAIL: {}", e); return; }
+                };
+                let ka = build_kernargs_m_with_counter(
+                    x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                    k, n, m, &spec, counter_buf.gpu_addr(),
+                );
+                let grid = [spec.wg_size(), 1u32, 1u32];
+                eprintln!("Persistent 1-WG 128×64 k32: grid={:?}", grid);
+                let mut times_ns: Vec<u64> = Vec::new();
+                for _ in 0..(warmup + iters) {
+                    counter_buf.zero();
+                    let start = Instant::now();
+                    if rt.dispatch(&kernel, grid, &ka).is_err() { eprintln!("  DISPATCH FAIL"); break; }
+                    times_ns.push(start.elapsed().as_nanos() as u64);
+                }
+                if times_ns.len() > warmup as usize {
+                    let mut bench: Vec<u64> = times_ns[warmup as usize..].to_vec();
+                    bench.sort();
+                    let us = bench[bench.len() / 2] as f64 / 1000.0;
+                    eprintln!("  Persistent 1-WG: {:>8.1} μs  {:>6.2} TFLOPS", us, flops / (us * 1e6));
+                }
+            }
+        });
+    }
+}
+
+// ============================================================================
+// WarpLayout — Warp distribution for FlashAttention chain-dot planning
+// ============================================================================
+
+/// Warp layout configuration for tile-level GEMM.
+///
+/// Describes how warps are distributed across the output tile [M, N].
+/// Different layouts optimize for different access patterns:
+/// - **Row-dominant**: each warp handles consecutive rows (good for Q@K^T)
+/// - **Col-dominant**: each warp handles consecutive columns (good for attn@V)
+///
+/// For FlashAttention chain-dot, using different layouts for the two GEMMs
+/// eliminates expensive layout transformations between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WarpLayout {
+    /// Number of warps in the workgroup
+    pub n_warps: u32,
+    /// Rows of the output tile each warp handles
+    pub rows_per_warp: u32,
+    /// Columns of the output tile each warp handles
+    pub cols_per_warp: u32,
+    /// Layout orientation
+    pub orientation: WarpOrientation,
+}
+
+/// Warp layout orientation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarpOrientation {
+    /// Each warp handles consecutive rows (row-major warp distribution)
+    /// Good for: Q@K^T where Q is row-major and K^T is column-major
+    RowDominant,
+    /// Each warp handles consecutive columns (column-major warp distribution)
+    /// Good for: attn@V where attn is row-major and V is column-major
+    ColDominant,
+    /// Square distribution: warps split evenly across rows and columns
+    Square,
+}
+
+impl WarpLayout {
+    /// Create a row-dominant warp layout.
+    ///
+    /// Each warp handles `rows_per_warp` rows and ALL columns.
+    pub fn row_dominant(n_warps: u32, tile_m: u32, tile_n: u32) -> Self {
+        assert!(n_warps > 0 && n_warps <= 8, "n_warps must be 1-8");
+
+        // For small M (decode), use fewer warps or adjust tile_m
+        let effective_warps = if tile_m < n_warps * 16 {
+            // Reduce warps to fit tile_m
+            tile_m / 16
+        } else {
+            n_warps
+        };
+
+        assert!(effective_warps > 0, "tile_m={} too small for any warp", tile_m);
+        assert!(tile_m % (effective_warps * 16) == 0,
+            "tile_m={} must be divisible by effective_warps*16={}", tile_m, effective_warps * 16);
+
+        Self {
+            n_warps: effective_warps,
+            rows_per_warp: tile_m / effective_warps,
+            cols_per_warp: tile_n,
+            orientation: WarpOrientation::RowDominant,
+        }
+    }
+
+    /// Create a column-dominant warp layout.
+    ///
+    /// Each warp handles ALL rows and `cols_per_warp` columns.
+    pub fn col_dominant(n_warps: u32, tile_m: u32, tile_n: u32) -> Self {
+        assert!(n_warps > 0 && n_warps <= 8, "n_warps must be 1-8");
+        assert!(tile_n % (n_warps * 16) == 0,
+            "tile_n={} must be divisible by n_warps*16={}", tile_n, n_warps * 16);
+
+        Self {
+            n_warps,
+            rows_per_warp: tile_m,
+            cols_per_warp: tile_n / n_warps,
+            orientation: WarpOrientation::ColDominant,
+        }
+    }
+
+    /// Create a square warp layout.
+    ///
+    /// Warps split evenly across both rows and columns.
+    pub fn square(n_warps: u32, tile_m: u32, tile_n: u32) -> Self {
+        assert!(n_warps == 4 || n_warps == 8,
+            "square layout requires 4 or 8 warps, got {}", n_warps);
+
+        let (row_warps, col_warps) = if n_warps == 4 { (2, 2) } else { (4, 2) };
+
+        assert!(tile_m % (row_warps * 16) == 0,
+            "tile_m={} must be divisible by {}*16={}", tile_m, row_warps, row_warps * 16);
+        assert!(tile_n % (col_warps * 16) == 0,
+            "tile_n={} must be divisible by {}*16={}", tile_n, col_warps, col_warps * 16);
+
+        Self {
+            n_warps,
+            rows_per_warp: tile_m / row_warps,
+            cols_per_warp: tile_n / col_warps,
+            orientation: WarpOrientation::Square,
+        }
+    }
+
+    /// Number of WMMA row blocks per warp.
+    pub fn wmma_row_blocks(&self) -> u32 {
+        self.rows_per_warp / 16
+    }
+
+    /// Number of WMMA column tiles per warp.
+    pub fn wmma_col_tiles(&self) -> u32 {
+        self.cols_per_warp / 16
+    }
+
+    /// Total WMMA operations per warp.
+    pub fn wmma_ops_per_warp(&self) -> u32 {
+        self.wmma_row_blocks() * self.wmma_col_tiles()
+    }
+
+    /// Accumulator VGPRs per warp (8 VGPRs per WMMA output).
+    pub fn acc_vgprs_per_warp(&self) -> u32 {
+        self.wmma_ops_per_warp() * 8
+    }
+
+    /// Workgroup size in threads.
+    pub fn wg_size(&self) -> u32 {
+        self.n_warps * 32
+    }
+
+    /// Check if this layout is compatible with a given tile size.
+    pub fn is_compatible(&self, tile_m: u32, tile_n: u32) -> bool {
+        tile_m % self.rows_per_warp == 0 && tile_n % self.cols_per_warp == 0
+    }
+}
+
+/// Plan warp layouts for FlashAttention chain-dot.
+///
+/// Returns (qk_layout, av_layout) optimized for the two GEMMs:
+/// - Q@K^T: [M, K] @ [K, N] → [M, N] (attention scores)
+/// - attn@V: [M, N] @ [N, D] → [M, D] (output)
+///
+/// The key insight: Q@K^T benefits from row-dominant layout (Q rows accessed
+/// together), while attn@V benefits from col-dominant layout (V columns accessed
+/// together). Using compatible layouts eliminates the layout transformation
+/// between the two GEMMs.
+pub fn plan_flash_attention_warps(
+    n_warps: u32, m: u32, n: u32, d: u32,
+) -> (WarpLayout, WarpLayout) {
+    // For small M (decode), limit warps so each gets ≥16 rows (WMMA minimum).
+    let effective_warps = n_warps.min(m.max(16) / 16).max(1);
+
+    let qk_layout = if m <= 32 {
+        // Small M (decode): row-dominant with reduced warp count
+        WarpLayout::row_dominant(effective_warps, m.max(effective_warps * 16), n)
+    } else if m >= 64 && n <= 128 {
+        // Large M, moderate N: row-dominant for better LDS reuse on Q rows
+        WarpLayout::row_dominant(n_warps, m, n)
+    } else if n >= 128 {
+        // Large N: row-dominant for better LDS reuse on K^T columns
+        WarpLayout::row_dominant(n_warps, m, n)
+    } else {
+        // Balanced: square layout
+        WarpLayout::square(n_warps, m, n)
+    };
+
+    // For attn@V: use col-dominant if compatible, otherwise square
+    let av_warps = qk_layout.n_warps;  // match warp count from dot1
+    let av_layout = if qk_layout.orientation == WarpOrientation::RowDominant {
+        if d % (av_warps * 16) == 0 {
+            WarpLayout::col_dominant(av_warps, m.max(av_warps * 16), d)
+        } else {
+            WarpLayout::square(av_warps, m.max(av_warps * 16), d.max(32))
+        }
+    } else {
+        WarpLayout::row_dominant(av_warps, m.max(av_warps * 16), d)
+    };
+
+    (qk_layout, av_layout)
+}
+
+/// Plan warp layouts for a single GEMM (non-chain-dot).
+///
+/// Returns the optimal layout for a single tile GEMM based on dimensions.
+pub fn plan_single_dot_warps(n_warps: u32, tile_m: u32, tile_n: u32) -> WarpLayout {
+    if tile_m >= tile_n * 2 {
+        // Tall matrix: row-dominant
+        WarpLayout::row_dominant(n_warps, tile_m, tile_n)
+    } else if tile_n >= tile_m * 2 {
+        // Wide matrix: col-dominant
+        WarpLayout::col_dominant(n_warps, tile_m, tile_n)
+    } else {
+        // Square-ish: row-dominant (default)
+        WarpLayout::row_dominant(n_warps, tile_m, tile_n)
+    }
+}
+
+// ============================================================================
+// WarpLayout Tests
+// ============================================================================
+
+#[cfg(test)]
+mod warp_layout_tests {
+    use super::*;
+
+    #[test]
+    fn test_warp_layout_row_dominant() {
+        // 128×64 with 4 warps: each warp gets 32 rows, all cover 64 cols
+        let l = WarpLayout::row_dominant(4, 128, 64);
+        assert_eq!(l.n_warps, 4);
+        assert_eq!(l.rows_per_warp, 32);
+        assert_eq!(l.cols_per_warp, 64);
+        assert_eq!(l.wmma_row_blocks(), 2);  // 32/16
+        assert_eq!(l.wmma_col_tiles(), 4);   // 64/16
+        assert_eq!(l.wmma_ops_per_warp(), 8); // 2*4
+        assert_eq!(l.acc_vgprs_per_warp(), 64); // 8*8
+    }
+
+    #[test]
+    fn test_warp_layout_col_dominant() {
+        // 64×128 with 4 warps: each warp covers all 64 rows, gets 32 cols
+        let l = WarpLayout::col_dominant(4, 64, 128);
+        assert_eq!(l.rows_per_warp, 64);
+        assert_eq!(l.cols_per_warp, 32);
+        assert_eq!(l.wmma_ops_per_warp(), 8); // 4*2
+    }
+
+    #[test]
+    fn test_warp_layout_square() {
+        // 128×128 with 4 warps: 2×2 grid
+        let l = WarpLayout::square(4, 128, 128);
+        assert_eq!(l.rows_per_warp, 64);
+        assert_eq!(l.cols_per_warp, 64);
+        assert_eq!(l.wmma_ops_per_warp(), 16); // 4*4
+    }
+
+    #[test]
+    fn test_flash_attention_plan() {
+        // Typical FlashAttention dimensions
+        let (qk, av) = plan_flash_attention_warps(4, 128, 64, 64);
+        // Q@K^T should be row-dominant
+        assert_eq!(qk.orientation, WarpOrientation::RowDominant);
+        // attn@V should be col-dominant (to avoid layout transform)
+        assert_eq!(av.orientation, WarpOrientation::ColDominant);
+    }
+
+    #[test]
+    fn test_flash_attention_decode() {
+        // Decode: M=1 (single token)
+        let (qk, av) = plan_flash_attention_warps(4, 16, 64, 64);
+        assert_eq!(qk.orientation, WarpOrientation::RowDominant);
+        // av may be col-dominant or square depending on dimensions
+    }
+
+    #[test]
+    fn test_single_dot_warps() {
+        // M > N: prefer row-dominant
+        let l = plan_single_dot_warps(4, 128, 64);
+        assert_eq!(l.rows_per_warp, 32);
+        assert_eq!(l.cols_per_warp, 64);
+
+        // M < N: prefer col-dominant
+        let l = plan_single_dot_warps(4, 64, 128);
+        assert_eq!(l.rows_per_warp, 64);
+        assert_eq!(l.cols_per_warp, 32);
+    }
+
+    #[test]
+    fn test_warp_layout_min_rows() {
+        // Small tile: ensure rows_per_warp >= 16 for WMMA
+        // Use 4 warps with 64 rows: 64/4 = 16 rows per warp (minimum)
+        let l = WarpLayout::row_dominant(4, 64, 64);
+        assert_eq!(l.rows_per_warp, 16, "rows_per_warp should be 16");
+        assert!(l.rows_per_warp >= 16, "rows_per_warp must be >= 16 for WMMA");
+    }
+}
+
+// ============================================================================
+// Persistent Kernel Tests
+// ============================================================================
+
+#[cfg(test)]
+mod persistent_tests {
+    use super::*;
+    use crate::t0::isa_verifier;
+
+    #[test]
+    fn test_persistent_decode_constructor() {
+        let spec = TileGemm::tile_persistent_decode();
+        assert!(spec.persistent, "should be persistent mode");
+        assert_eq!(spec.tile_m, 32);
+        assert_eq!(spec.tile_n, 64);
+        assert_eq!(spec.tile_k, 16);
+        assert!(!spec.swap_grid, "persistent mode should not swap grid");
+        assert_eq!(spec.split_k, 1, "persistent mode should not use split-k");
+    }
+
+    #[test]
+    fn test_persistent_grid_single_workgroup() {
+        let spec = TileGemm::tile_persistent_decode();
+        let grid = compute_grid(&spec, 1, 32768);
+        // K6 persistent mode: 2 WGs for MES v2 compatibility
+        assert_eq!(grid[1], 1, "grid.y should be 1");
+        assert_eq!(grid[2], 1, "grid.z should be 1");
+        // Grid = 2 * wg_size (not oversubscribed — persistent loop handles re-entry)
+        assert_eq!(grid[0], 2 * spec.wg_size(),
+            "grid.x should be 2 * wg_size = {}", 2 * spec.wg_size());
+    }
+
+    #[test]
+    fn test_non_persistent_grid_multiple_workgroups() {
+        let spec = TileGemm::tile_64x64_k16();
+        assert!(!spec.persistent, "should not be persistent mode");
+        let grid = compute_grid(&spec, 1, 32768);
+        // Non-persistent: multiple workgroups
+        assert!(grid[0] > spec.wg_size() || grid[1] > 1,
+            "non-persistent should have multiple workgroups");
+    }
+
+    #[test]
+    fn test_persistent_name_contains_persistent() {
+        let spec = TileGemm::tile_persistent_decode();
+        assert!(spec.name().contains("persistent"),
+            "name should contain 'persistent', got '{}'", spec.name());
+    }
+
+    #[test]
+    fn test_persistent_epilogue_support() {
+        let spec = TileGemm::tile_persistent_decode()
+            .with_epilogue(vec![EpilogueOp::ReLU]);
+        assert!(spec.persistent, "should still be persistent");
+        assert_eq!(spec.epilogue.len(), 1, "should have 1 epilogue op");
+    }
+
+    #[test]
+    fn test_persistent_128x64_compile() {
+        let spec = TileGemm::tile_persistent_128x64_k32();
+        assert!(spec.persistent, "should be persistent");
+        assert_eq!(spec.tile_m, 128);
+        assert_eq!(spec.tile_n, 64);
+        assert_eq!(spec.tile_k, 32);
+        assert_eq!(spec.wg_size(), 128, "4 waves × 32 lanes = 128 threads");
+        assert!(spec.name().contains("persistent"));
+
+        // Compile and verify ISA
+        let k = lower_gemm(&spec);
+        let asm = k.to_assembly(Target::detect()).expect("to_assembly");
+        assert!(asm.contains("s_endpgm"), "Missing s_endpgm");
+        assert!(asm.contains("global_atomic"), "Missing global_atomic for K6 pattern");
+
+        // Verify ELF
+        let elf = k.compile(Target::detect()).expect("compile");
+        assert!(elf.len() > 100, "ELF too small: {} bytes", elf.len());
+
+        // ISA verifier
+        let v = isa_verifier::verify_ops(k.ops());
+        assert!(v.is_ok(), "ISA verification failed: {:?}", v.errors);
+    }
+
+    #[test]
+    fn test_persistent_128x64_grid() {
+        let spec = TileGemm::tile_persistent_128x64_k32();
+        let grid = compute_grid(&spec, 4096, 4096);
+        assert_eq!(grid[0], 2 * 128, "grid.x = 2 WG × 128 threads = 256");
+        assert_eq!(grid[1], 1);
+        assert_eq!(grid[2], 1);
     }
 }
 

@@ -70,8 +70,9 @@ impl AsmEmitter {
             writeln!(self.buf, "  s_mov_b32 s63, 0").unwrap();
         }
 
-        // Emit all ops
-        for op in ops {
+        // Emit all ops (with SMEM batch optimization)
+        let optimized_ops = Self::optimize_smem_loads(ops);
+        for op in &optimized_ops {
             self.emit_op(op, alloc);
         }
 
@@ -116,6 +117,61 @@ impl AsmEmitter {
         // The metadata is only needed for HIP's hipModuleLoadData.
     }
 
+    /// Optimize SMEM loads by batching consecutive loads.
+    /// SMEM batch optimization: merge consecutive s_load_dword into s_load_dwordx4/x2.
+    /// Detects 4 consecutive loads from same base with offsets 0,4,8,12 → s_load_dwordx4.
+    /// Detects 2 consecutive loads from same base with offsets 0,4 → s_load_dwordx2.
+    fn optimize_smem_loads(ops: &[Op]) -> Vec<Op> {
+        let mut result = Vec::with_capacity(ops.len());
+        let mut i = 0;
+        while i < ops.len() {
+            // Try to match a group of 4 consecutive SMemLoadDword
+            if i + 3 < ops.len() {
+                if let (
+                    Op::SMemLoadDword { dst: d0, base_lo: bl0, base_hi: bh0, offset: o0 },
+                    Op::SMemLoadDword { dst: d1, base_lo: bl1, base_hi: bh1, offset: o1 },
+                    Op::SMemLoadDword { dst: d2, base_lo: bl2, base_hi: bh2, offset: o2 },
+                    Op::SMemLoadDword { dst: d3, base_lo: bl3, base_hi: bh3, offset: o3 },
+                ) = (&ops[i], &ops[i+1], &ops[i+2], &ops[i+3]) {
+                    // Check: same base, consecutive SGPRs, offsets 0/4/8/12
+                    if bl0 == bl1 && bl0 == bl2 && bl0 == bl3
+                        && bh0 == bh1 && bh0 == bh2 && bh0 == bh3
+                        && d0.0 + 1 == d1.0 && d0.0 + 2 == d2.0 && d0.0 + 3 == d3.0
+                        && *o0 == 0 && *o1 == 4 && *o2 == 8 && *o3 == 12
+                    {
+                        result.push(Op::SMemLoadDwordx4 {
+                            dst: *d0, base_lo: *bl0, base_hi: *bh0, offset: 0,
+                        });
+                        i += 4;
+                        continue;
+                    }
+                }
+            }
+            // Try to match a group of 2 consecutive SMemLoadDword
+            if i + 1 < ops.len() {
+                if let (
+                    Op::SMemLoadDword { dst: d0, base_lo: bl0, base_hi: bh0, offset: o0 },
+                    Op::SMemLoadDword { dst: d1, base_lo: bl1, base_hi: bh1, offset: o1 },
+                ) = (&ops[i], &ops[i+1]) {
+                    if bl0 == bl1 && bh0 == bh1
+                        && d0.0 + 1 == d1.0
+                        && *o0 == 0 && *o1 == 4
+                    {
+                        result.push(Op::SMemLoadDwordx2 {
+                            dst: *d0, base_lo: *bl0, base_hi: *bh0, offset: 0,
+                        });
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            // No match — pass through
+            result.push(ops[i].clone());
+            i += 1;
+        }
+        result
+    }
+
     /// Emit a single IR operation as assembly text.
     fn emit_op(&mut self, op: &Op, a: &RegAlloc) {
         // ── s_delay_alu auto-injection ──
@@ -137,15 +193,18 @@ impl AsmEmitter {
 
             if is_valu && !std::env::var("T0_SKIP_DELAY_ALU").is_ok() {
                 // Check VGPR read dependencies
-                let mut min_dep = 5u32; // > 4 means no dep
+                // Track the FARTHEST VALU dependency (largest distance).
+                // s_delay_alu VALU_DEP_N waits for the Nth previous VALU,
+                // which implicitly waits for all more recent VALUs too.
+                let mut max_dep = 0u32; // 0 means no dep
                 for v in op.vreg_uses() {
                     let phys = a.phys_v(v) as usize;
                     if phys < 256 {
                         let last = self.last_writer[phys];
                         if last > 0 {
                             let dist = self.valu_count - last;
-                            if dist >= 1 && dist <= 4 && dist < min_dep {
-                                min_dep = dist;
+                            if dist >= 1 && dist <= 4 {
+                                max_dep = max_dep.max(dist);
                             }
                         }
                     }
@@ -160,8 +219,8 @@ impl AsmEmitter {
                                 let last = self.last_writer[p];
                                 if last > 0 {
                                     let dist = self.valu_count - last;
-                                    if dist >= 1 && dist <= 4 && dist < min_dep {
-                                        min_dep = dist;
+                                    if dist >= 1 && dist <= 4 {
+                                        max_dep = max_dep.max(dist);
                                     }
                                 }
                             }
@@ -169,9 +228,9 @@ impl AsmEmitter {
                     }
                 }
 
-                if min_dep <= 4 {
+                if max_dep >= 1 && max_dep <= 4 {
                     writeln!(self.buf, "{}s_delay_alu instid0(VALU_DEP_{})",
-                        self.indent, min_dep).unwrap();
+                        self.indent, max_dep).unwrap();
                     self.delay_alu_emitted += 1;
                 }
 
@@ -518,25 +577,52 @@ impl AsmEmitter {
             }
 
             // ── WMMA ──
-            Op::Wmma { dst, a: va, b: vb, c: vc, format, .. } => {
+            // RDNA4 HWXDL silent-drop guard: ensure all 32 lanes are active
+            // before issuing WMMA/SWMMAC. When EXEC is incomplete (divergent
+            // control flow or fewer than 32 active threads), the XDL matrix
+            // pipeline suppresses VGPR write-back without raising an exception
+            // — the computation silently evaporates. Setting exec_lo to -1
+            // (all 1s) forces the WMMA to see a full wavefront, preventing this.
+            //
+            // The two-layer fix from DISCOVERY.md:
+            //   Layer 1 (work distribution): v_readfirstlane broadcasts tile index
+            //     to all lanes, ensuring uniform control flow → EXEC stays full.
+            //     Applied in tile_ir.rs via SGPR-based work claiming (TGID).
+            //   Layer 2 (safety guard, this code): s_setexeclo_b32 -1 forces
+            //     EXEC=full immediately before the XDL instruction, as a
+            //     belt-and-suspenders defense against edge-case divergence.
+            //
+            // Cost: 1 scalar cycle (s_setexeclo is SALU, zero VALU overhead).
+            // Reference: /data/rtl-sdr/swmmac/active/silent_drop/DISCOVERY.md
+            Op::Wmma { dst, a: va, b: vb, c: vc, format, ab_width, .. } => {
+                // GFX1200: s_setexeclo_b32 not supported, use s_mov_b32 exec_lo, -1
+                // GFX1100: s_setexeclo_b32 -1 is the correct instruction
+                match self.target {
+                    Target::GFX1200 => writeln!(self.buf, "{}s_mov_b32 exec_lo, -1", self.indent).unwrap(),
+                    Target::GFX1100 => writeln!(self.buf, "{}s_setexeclo_b32 -1", self.indent).unwrap(),
+                }
                 let d = a.phys_v(*dst);
                 let pa = a.phys_v(*va);
                 let pb = a.phys_v(*vb);
                 let pc = a.phys_v(*vc);
-                let instr = match format {
-                    WmmaFormat::BF16_F32 => "v_wmma_f32_16x16x16_bf16",
-                    WmmaFormat::F16_F32 => "v_wmma_f32_16x16x16_f16",
-                    WmmaFormat::BF16_BF16 => "v_wmma_bf16_16x16x16_bf16",
+                // Look up mnemonic and operand widths from wmma_db
+                let (instr, cd_vgprs) = match format {
+                    WmmaFormat::BF16_F32 => ("v_wmma_f32_16x16x16_bf16", 8),
+                    WmmaFormat::F16_F32 => ("v_wmma_f32_16x16x16_f16", 8),
+                    WmmaFormat::BF16_BF16 => ("v_wmma_bf16_16x16x16_bf16", 4),
+                    WmmaFormat::F16_F16 => ("v_wmma_f16_16x16x16_f16", 4),
+                    WmmaFormat::IU8_I32 => ("v_wmma_i32_16x16x16_iu8", 8),
+                    WmmaFormat::IU4_I32 => ("v_wmma_i32_16x16x16_iu4", 8),
+                    WmmaFormat::FP8_F32 => ("v_wmma_f32_16x16x16_fp8_fp8", 8),
+                    WmmaFormat::BF8_F32 => ("v_wmma_f32_16x16x16_bf8_bf8", 8),
+                    WmmaFormat::FP8_BF8_F32 => ("v_wmma_f32_16x16x16_fp8_bf8", 8),
+                    WmmaFormat::BF8_FP8_F32 => ("v_wmma_f32_16x16x16_bf8_fp8", 8),
                 };
-                // GFX1200 (RDNA4 wave32): A/B use 4 VGPRs, dst/C use 8 VGPRs
-                // GFX1100 (RDNA3 wave32): all operands use 8 VGPRs
-                let (a_end, b_end) = match self.target {
-                    Target::GFX1200 => (pa + 3, pb + 3),
-                    Target::GFX1100 => (pa + 7, pb + 7),
-                };
+                let a_end = pa + *ab_width - 1;
+                let b_end = pb + *ab_width - 1;
                 writeln!(self.buf, "{}{} v[{}:{}], v[{}:{}], v[{}:{}], v[{}:{}]",
                     self.indent, instr,
-                    d, d + 7, pa, a_end, pb, b_end, pc, pc + 7).unwrap();
+                    d, d + cd_vgprs - 1, pa, a_end, pb, b_end, pc, pc + cd_vgprs - 1).unwrap();
             }
 
             // ── Control flow ──
@@ -623,6 +709,10 @@ impl AsmEmitter {
                     }
                 }
                 self.waits_emitted += 1;
+            }
+            // ── Wavefront scheduling priority ──
+            Op::SSetPrio(prio) => {
+                writeln!(self.buf, "{}s_setprio {}", self.indent, prio).unwrap();
             }
             Op::ClearVcc => {
                 writeln!(self.buf, "{}s_mov_b32 vcc_lo, 0", self.indent).unwrap();
@@ -977,8 +1067,14 @@ impl AsmEmitter {
                 let vd = a.phys_v(*dst);
                 let va = a.phys_v(*addr);
                 let vs = a.phys_v(*src);
-                writeln!(self.buf, "{}global_atomic_add_u32 v{}, v[{}:{}], v{}, off glc",
-                    self.indent, vd, va, va + 1, vs).unwrap();
+                // GFX1200: glc → th:TH_ATOMIC_RETURN
+                if self.target == Target::GFX1200 {
+                    writeln!(self.buf, "{}global_atomic_add_u32 v{}, v[{}:{}], v{}, off th:TH_ATOMIC_RETURN",
+                        self.indent, vd, va, va + 1, vs).unwrap();
+                } else {
+                    writeln!(self.buf, "{}global_atomic_add_u32 v{}, v[{}:{}], v{}, off glc",
+                        self.indent, vd, va, va + 1, vs).unwrap();
+                }
             }
 
             // ── SMEM scalar load ──
@@ -1003,6 +1099,47 @@ impl AsmEmitter {
                 } else {
                     writeln!(self.buf, "{}s_load_dword s{}, s[{}:{}], {}",
                         self.indent, sd, actual_lo, actual_hi, offset).unwrap();
+                }
+            }
+
+            // ── SMEM batch loads (from optimize_smem_loads) ──
+            Op::SMemLoadDwordx2 { dst, base_lo, base_hi, offset } => {
+                let sd = a.phys_s(*dst);
+                let sb = a.phys_s(*base_lo);
+                let sbh = a.phys_s(*base_hi);
+                let (actual_lo, actual_hi) = if sb % 2 == 0 && sbh == sb + 1 {
+                    (sb, sbh)
+                } else {
+                    writeln!(self.buf, "{}s_mov_b32 s4, s{}", self.indent, sb).unwrap();
+                    writeln!(self.buf, "{}s_mov_b32 s5, s{}", self.indent, sbh).unwrap();
+                    (4u8, 5u8)
+                };
+                if *offset == 0 {
+                    writeln!(self.buf, "{}s_load_dwordx2 s[{}:{}], s[{}:{}], 0",
+                        self.indent, sd, sd + 1, actual_lo, actual_hi).unwrap();
+                } else {
+                    writeln!(self.buf, "{}s_load_dwordx2 s[{}:{}], s[{}:{}], {}",
+                        self.indent, sd, sd + 1, actual_lo, actual_hi, offset).unwrap();
+                }
+            }
+
+            Op::SMemLoadDwordx4 { dst, base_lo, base_hi, offset } => {
+                let sd = a.phys_s(*dst);
+                let sb = a.phys_s(*base_lo);
+                let sbh = a.phys_s(*base_hi);
+                let (actual_lo, actual_hi) = if sb % 2 == 0 && sbh == sb + 1 {
+                    (sb, sbh)
+                } else {
+                    writeln!(self.buf, "{}s_mov_b32 s4, s{}", self.indent, sb).unwrap();
+                    writeln!(self.buf, "{}s_mov_b32 s5, s{}", self.indent, sbh).unwrap();
+                    (4u8, 5u8)
+                };
+                if *offset == 0 {
+                    writeln!(self.buf, "{}s_load_dwordx4 s[{}:{}], s[{}:{}], 0",
+                        self.indent, sd, sd + 3, actual_lo, actual_hi).unwrap();
+                } else {
+                    writeln!(self.buf, "{}s_load_dwordx4 s[{}:{}], s[{}:{}], {}",
+                        self.indent, sd, sd + 3, actual_lo, actual_hi, offset).unwrap();
                 }
             }
 
@@ -1046,6 +1183,11 @@ impl AsmEmitter {
                 writeln!(self.buf, "{}s_getreg_b32 s2, hwreg(HW_REG_SHADER_CYCLES)  ; GPU cycle counter",
                     self.indent).unwrap();
                 writeln!(self.buf, "{}v_mov_b32 v{}, s2", self.indent, vd).unwrap();
+            }
+
+            // ── Wavefront scheduling priority ──
+            Op::SSetPrio(prio) => {
+                writeln!(self.buf, "{}s_setprio {}", self.indent, prio).unwrap();
             }
 
             // ── Raw assembly passthrough ──

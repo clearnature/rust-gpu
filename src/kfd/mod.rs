@@ -272,6 +272,14 @@ pub struct KfdDevice {
 /// All callers of KfdDevice::open() get the same Arc<KfdDevice>.
 static GLOBAL_KFD_DEVICE: std::sync::OnceLock<Arc<KfdDevice>> = std::sync::OnceLock::new();
 
+/// Global mutex serializing all CREATE_QUEUE ioctls.
+///
+/// On RDNA4 (gfx1200), the MES firmware has a race condition when handling
+/// concurrent CREATE_QUEUE calls — doorbell offset assignment can collide,
+/// causing queues to share a doorbell and produce undefined behavior.
+/// This mutex ensures only one CREATE_QUEUE ioctl is in-flight at a time.
+static QUEUE_CREATE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl KfdDevice {
     /// Open the GPU device and acquire VM.
     /// Returns a cached global singleton — KFD only allows one ACQUIRE_VM per process.
@@ -770,7 +778,15 @@ impl KfdDevice {
     /// Create an AQL compute queue with specified ring buffer size in bytes.
     /// Ring size must be power of 2. Each packet is 64 bytes.
     /// Recommended: 1<<20 (1MB, 16K pkts), 4<<20 (4MB, 64K pkts), 16<<20 (16MB, 256K pkts)
+    ///
+    /// **Thread safety**: Uses a global mutex to serialize CREATE_QUEUE ioctls.
+    /// On RDNA4 (gfx1200), the MES firmware has a race condition when handling
+    /// concurrent CREATE_QUEUE calls — the doorbell offset assignment can
+    /// collide, causing one queue to get a duplicate doorbell. Serializing
+    /// all queue creation through this mutex eliminates the race.
     pub fn create_queue_sized(self: &Arc<Self>, ring_size: u32) -> Result<AqlQueue, String> {
+        let _guard = QUEUE_CREATE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         assert!(ring_size.is_power_of_two(), "AQL ring_size must be power of 2, got {}", ring_size);
 
         // Allocate ring buffer (uncached GTT — tinygrad pattern)
@@ -913,7 +929,11 @@ impl KfdDevice {
     /// Create a PM4 compute queue (type=0)
     /// PM4 queues use raw PACKET3 commands instead of AQL packets.
     /// Doorbell is u32 byte-offset into ring buffer.
+    ///
+    /// Serialized via QUEUE_CREATE_MUTEX to avoid MES firmware race on RDNA4.
     pub fn create_pm4_queue(self: &Arc<Self>) -> Result<Pm4Queue, String> {
+        let _guard = QUEUE_CREATE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         let ring_size: u32 = 16 << 20; // 16MB ring (same as tinygrad)
         let ring_buffer = self.alloc_uncached(ring_size as usize)?;
         // Zero ring
@@ -1064,7 +1084,7 @@ impl GpuBuffer {
     pub fn write(&self, data: &[u8]) {
         assert!(data.len() <= self.size, "write overflow: {} > {}", data.len(), self.size);
         unsafe {
-            // Use volatile writes to ensure WC (write-combine) mapped memory 
+            // Use volatile writes to ensure WC (write-combine) mapped memory
             // is properly flushed to GPU. Regular memcpy may leave data in
             // CPU write-combine buffers, causing GPU to read stale data.
             let dst = self.host_ptr;
@@ -1080,8 +1100,12 @@ impl GpuBuffer {
             for i in 0..rem {
                 std::ptr::write_volatile(dst.add(base + i), *src.add(base + i));
             }
-            // Force WC flush: mfence ensures all prior stores are globally visible
+            // WC flush: mfence ensures stores reach Root Complex (CPU-visible),
+            // then readback (non-posted PCIe read) forces drain to GPU VRAM.
+            // SFENCE/MFENCE alone only guarantee CPU cache coherency domain,
+            // NOT PCIe endpoint visibility. See geisYaO blog: "SFENCE救不了你".
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            let _ = std::ptr::read_volatile(self.host_ptr);
         }
     }
 
@@ -1138,9 +1162,22 @@ impl GpuBuffer {
         buf
     }
 
-    /// Zero the buffer
+    /// Zero the buffer (volatile writes + PCIe readback drain)
     pub fn zero(&self) {
-        unsafe { std::ptr::write_bytes(self.host_ptr, 0, self.size); }
+        unsafe {
+            let p = self.host_ptr as *mut u64;
+            let n = self.size / 8;
+            for i in 0..n {
+                std::ptr::write_volatile(p.add(i), 0u64);
+            }
+            // Handle remaining bytes
+            let rem_base = n * 8;
+            for i in 0..(self.size % 8) {
+                std::ptr::write_volatile(self.host_ptr.add(rem_base + i), 0u8);
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            let _ = std::ptr::read_volatile(self.host_ptr);  // PCIe drain
+        }
     }
 
     /// Create a sub-region view of this buffer (for pool allocation).
@@ -1322,6 +1359,8 @@ impl AqlQueue {
             // value = 1 at offset 8 (CP will atomic_sub to make it 0)
             sig.write_val::<i64>(8, 1);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            // PCIe readback drain: ensure signal reaches GPU VRAM before doorbell
+            let _ = unsafe { std::ptr::read_volatile(sig.host_ptr) };
             sig.gpu_addr()
         } else {
             0
@@ -2728,7 +2767,10 @@ impl GpuKernel {
             }
             let rsrc1_ptr = kd_host_ptr.add(0x30) as *mut u32;
             let raw_rsrc1 = std::ptr::read_volatile(rsrc1_ptr);
-            let patched_rsrc1 = raw_rsrc1 | (1 << 20); // PRIV bit only
+            // Patch: set PRIV bit (20) only
+            // MEM_ORDERED (bit30) is intentionally kept — t0-gpu is bare-metal KFD
+            // that manages its own cache coherency via ACQUIRE_MEM + HDP flush.
+            let patched_rsrc1 = raw_rsrc1 | (1 << 20);
 
             // Log WGP status from RSRC1 bit 29 (the real hardware bit)
             let wgp_on = (patched_rsrc1 >> 29) & 1 == 1;
