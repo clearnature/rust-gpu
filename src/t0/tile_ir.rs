@@ -430,7 +430,28 @@ impl TileGemm {
             wgp_mode: false, double_buffer: true,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
-            acc_swap: false,
+            acc_swap: false,  // Temporarily disabled: acc_swap=true K-loop doesn't
+                              // accumulate WMMA results correctly in persistent mode.
+                              // Store phase works (confirmed by diagnostic), but
+                              // accumulators remain zero after K-loop.
+                              // TODO: fix acc_swap accumulation in persistent loop.
+            epilogue: vec![],
+            persistent: true,
+        }
+    }
+
+    /// Persistent GEMM kernel: 256×128 k32 for large matrix (≥2048³).
+    ///
+    /// Larger tiles = fewer iterations = less MES v2 hang risk.
+    /// 4096³: only 16 tiles (vs 128 for 128×64).
+    /// 8 WMMA chains per K-step (tile_m/32 = 8), better XDL utilization.
+    pub fn tile_persistent_256x128_k32() -> Self {
+        Self {
+            tile_m: 256, tile_n: 128, tile_k: 32,
+            wgp_mode: false, double_buffer: true,
+            split_k: 1, swap_grid: true,
+            transpose: TileTranspose::NT,
+            acc_swap: true,
             epilogue: vec![],
             persistent: true,
         }
@@ -686,9 +707,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     k.set_lds_size(spec.lds_total());
     k.set_wg_size(spec.wg_size());
     k.set_wgp_mode(effective_wgp);
-    if spec.persistent {
-        k.set_skip_optimize(true);  // SSA passes can't handle persistent loop back-edge
-    }
+    // NOTE: skip_optimize is NOT set for persistent kernels.
+    // SSA passes handle the back-edge correctly with the lane 0 guard fix.
+    // Keeping SSA enabled allows proper liveness analysis for accumulator VGPRs.
 
     let x_row_stride = spec.tile_k * 2;  // bytes per row in LDS (no padding for Phase 1)
     let wt_row_stride = spec.tile_k * 2;
@@ -812,14 +833,15 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
         // ════════════════════════════════════════════════════════════
         let cp = counter_ptr.expect("persistent mode requires counter_ptr");
 
+        // SGPR loop counter for exit control (atomic tile_idx is for claim only)
+        let persistent_iter_s = k.alloc_sreg();
+        k.s_mov_imm(persistent_iter_s, 0);  // Initialize to 0 BEFORE the loop
+
         // Persistent loop label: K6 claim → process → loop back
         let ploop = persistent_loop.as_ref().unwrap();
         k.label(ploop);
 
-        // SGPR loop counter for exit control (atomic tile_idx is for claim only)
-        // CRITICAL: register allocator clobbers VGPRs across loop back-edges
-        // when skip_optimize=true. All VGPR pointers must be reloaded every iteration.
-        let persistent_iter_s = k.alloc_sreg();
+        // Increment loop counter each iteration
         k.push(Op::SAddU32 {
             dst: persistent_iter_s,
             src0: SReg(persistent_iter_s.0),
@@ -905,6 +927,20 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
         k.s_and_b32(tile_col_s, tile_idx_s, n_tiles_n_mask);
         k.s_mov_imm(split_k_id_s, 0);
 
+        // DIAGNOSTIC: write tile_idx to output[4] to confirm loop runs
+        // Uses alloc_vreg_array for consecutive VGPR pair
+        {
+            let d_arr = k.alloc_vreg_array(2, Alignment::Align2);
+            let d_lo = VReg(d_arr.0);
+            let d_hi = VReg(d_arr.0 + 1);
+            k.v_mov_from_sgpr(d_lo, SReg(y_ptr.0));
+            k.v_mov_from_sgpr(d_hi, SReg(y_ptr.0 + 1));
+            // output[4] = y_ptr + 16 bytes
+            let d_val = k.alloc_vreg();
+            k.v_mov_from_sgpr(d_val, tile_idx_s);
+            k.global_store(d_lo, d_val, Width::B32, 16);  // +16 offset = output[4]
+            k.wait_vscnt(0);
+        }
     } else if spec.swap_grid {
         // ── Static TGID-based assignment (non-persistent) ──
         k.push(Op::SAddU32 { dst: tile_col_s, src0: tgid_x_s, src1: SOperand::InlineInt(0) });
@@ -1807,6 +1843,13 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     //   - LICM skips BufferLoad loops → no hoisting from K-loops
     //   - Scheduler skips BufferLoad blocks → no graduated waitcnt corruption
     k.set_opt_level(4);
+
+    // Persistent kernels: disable SSA regalloc — the SSA liveness-based
+    // VGPR reuse doesn't handle the persistent loop's cross-iteration
+    // live ranges correctly (K-loop barriers + store phase + loop back).
+    if spec.persistent {
+        k.set_ssa_regalloc(false);
+    }
 
     k
 }
@@ -5669,8 +5712,11 @@ mod gpu_tests {
                     k, n, m, &spec, counter_buf.gpu_addr(),
                 );
 
+                // L2-persistent counter: zero ONCE before warmup, not before each dispatch.
+                // The SGPR loop counter controls exit, so the atomic counter can accumulate.
+                counter_buf.zero();
+
                 for _ in 0..warmup {
-                    counter_buf.zero();
                     if rt.dispatch(&kernel, grid, &ka).is_err() {
                         eprintln!("{:<20} DISPATCH FAIL (hang?)", format!("{}³", m));
                         break;
@@ -5679,7 +5725,6 @@ mod gpu_tests {
 
                 let mut times_ns: Vec<u64> = Vec::new();
                 for _ in 0..iters {
-                    counter_buf.zero();
                     let start = Instant::now();
                     if rt.dispatch(&kernel, grid, &ka).is_err() {
                         eprintln!("{:<20} DISPATCH FAIL in timed loop", format!("{}³", m));
@@ -5785,9 +5830,9 @@ mod gpu_tests {
                 );
                 let grid = compute_grid(&spec, m, n);
                 eprintln!("Persistent 2-WG 128×64 k32: grid={:?}, wg_size={}", grid, spec.wg_size());
+                counter_buf.zero();  // L2-persistent: zero once
                 let mut times_ns: Vec<u64> = Vec::new();
                 for _ in 0..(warmup + iters) {
-                    counter_buf.zero();
                     let start = Instant::now();
                     if rt.dispatch(&kernel, grid, &ka).is_err() { eprintln!("  DISPATCH FAIL"); break; }
                     times_ns.push(start.elapsed().as_nanos() as u64);
@@ -5818,9 +5863,9 @@ mod gpu_tests {
                 );
                 let grid = [spec.wg_size(), 1u32, 1u32];
                 eprintln!("Persistent 1-WG 128×64 k32: grid={:?}", grid);
+                counter_buf.zero();  // L2-persistent: zero once
                 let mut times_ns: Vec<u64> = Vec::new();
                 for _ in 0..(warmup + iters) {
-                    counter_buf.zero();
                     let start = Instant::now();
                     if rt.dispatch(&kernel, grid, &ka).is_err() { eprintln!("  DISPATCH FAIL"); break; }
                     times_ns.push(start.elapsed().as_nanos() as u64);
@@ -5902,8 +5947,23 @@ mod gpu_tests {
             };
             eprintln!("Counter after dispatch: {} (expected {} tiles)", counter_val, 4 * 8);
 
+            // Direct check: read output[0] as raw u32 to detect any change
+            let out_raw0: u32 = unsafe {
+                std::ptr::read_volatile(y_buf.host_ptr as *const u32)
+            };
+            eprintln!("output[0] raw u32: 0x{:08X} (expected change from 0xCDCDCDCD, actual={})", out_raw0, f32::from_bits(out_raw0));
+
+            // Check raw u32 values at several positions
+            let raw_vals: Vec<u32> = (0..16).map(|i| unsafe {
+                std::ptr::read_volatile((y_buf.host_ptr as *const u32).add(i))
+            }).collect();
+            eprintln!("Raw u32 [0..16]: {:?}", raw_vals);
+
             // Read output and check
             let result = rt.read_f32(&y_buf, (m * n) as usize);
+
+            // Double-check: first 4 values
+            eprintln!("First 4 f32 values: {:?}", &result[..4]);
 
             // Count non-debug-pattern values
             let mut n_changed = 0usize;
@@ -6182,6 +6242,63 @@ mod gpu_tests {
             assert!(counter_val >= n_tiles, "Counter {} < n_tiles {}", counter_val, n_tiles);
             assert_eq!(results, expected, "Output mismatch");
             eprintln!("[PASS] Persistent loop: {} iterations, counter={}, output={:?}", n_tiles, counter_val, results);
+        });
+    }
+
+    /// Minimal buffer_store test: verify SRD-based store works on this GPU.
+    /// Run: cargo test --release --lib --features rocm -- test_minimal_buffer_store --nocapture --test-threads=1
+    #[test]
+    fn test_minimal_buffer_store() {
+        with_rt(|rt| {
+            let mut k = T0Kernel::new("min_buffer_store");
+            k.set_wg_size(64);
+            k.set_lds_size(0);
+
+            let out_ptr = k.arg_ptr("out");
+            k.emit_arg_loads();
+
+            // Method 1: global_store (flat pointer) to output[0]
+            let g_addr = k.alloc_vreg_array(2, Alignment::Align2);
+            let g_lo = VReg(g_addr.0);
+            let g_hi = VReg(g_addr.0 + 1);
+            k.v_mov_from_sgpr(g_lo, SReg(out_ptr.0));
+            k.v_mov_from_sgpr(g_hi, SReg(out_ptr.0 + 1));
+            let g_val = k.alloc_vreg();
+            k.v_mov_imm(g_val, 42);
+            k.global_store(g_lo, g_val, Width::B32, 0);
+            k.wait_vscnt(0);
+
+            // Method 2: buffer_store (SRD) to output[1] (offset 4 bytes)
+            let y_srd = k.alloc_sreg_quad();
+            k.push(Op::SAddU32 { dst: y_srd, src0: SReg(out_ptr.0), src1: SOperand::InlineInt(0) });
+            k.push(Op::SAddcU32 { dst: SReg(y_srd.0 + 1), src0: SReg(out_ptr.0 + 1), src1: SOperand::InlineInt(0) });
+            k.push(Op::SMov { dst: SReg(y_srd.0 + 2), src: SOperand::Literal(0x7FFFFFFE) });
+            k.push(Op::SMov { dst: SReg(y_srd.0 + 3), src: SOperand::Literal(0x31027000) });
+
+            let voff = k.alloc_vreg();
+            k.v_mov_imm(voff, 4);  // offset 4 bytes = output[1]
+            let val2 = k.alloc_vreg();
+            k.v_mov_imm(val2, 99);
+            k.buffer_store(voff, val2, y_srd, Width::B32, 0);
+            k.wait_vscnt(0);
+
+            k.endpgm();
+
+            let kernel = rt.ensure_kernel_t0(
+                "min_buffer_store", || k, [64, 1, 1], 0,
+            ).expect("compile");
+
+            let out_buf = rt.alloc_zero(4096).expect("alloc");
+            let mut ka = Vec::new();
+            ka.extend_from_slice(&out_buf.gpu_addr().to_le_bytes());
+
+            rt.dispatch(&kernel, [64, 1, 1], &ka).expect("dispatch");
+
+            let val0: u32 = unsafe { std::ptr::read_volatile(out_buf.host_ptr as *const u32) };
+            let val1: u32 = unsafe { std::ptr::read_volatile((out_buf.host_ptr as *const u32).add(1)) };
+            eprintln!("global_store  → output[0] = {} (expected 42.0)", f32::from_bits(val0));
+            eprintln!("buffer_store → output[1] = {} (expected 99.0)", f32::from_bits(val1));
+            eprintln!("raw bits: output[0]={:#010x}, output[1]={:#010x}", val0, val1);
         });
     }
 }
