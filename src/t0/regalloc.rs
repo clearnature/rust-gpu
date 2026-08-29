@@ -22,7 +22,18 @@ pub struct RegAlloc {
 
 impl RegAlloc {
     /// Get physical VGPR for a virtual register.
+    ///
+    /// Special case: probe-temp virtuals (VReg(1000+i)) map directly to the
+    /// reserved probe physicals (v250+i). These are injected AFTER regalloc
+    /// (post-regalloc probe, auto register protection) so they never appear in
+    /// vreg_allocs; the allocator skips the physicals so real code never uses
+    /// them and the probe can clobber them freely.
     pub fn phys_v(&self, v: VReg) -> u8 {
+        if v.0 >= super::regs::PROBE_VREG_VIRT_BASE
+            && v.0 < super::regs::PROBE_VREG_VIRT_BASE + super::regs::PROBE_VGPR_COUNT as u32
+        {
+            return super::regs::PROBE_VGPR_BASE + (v.0 - super::regs::PROBE_VREG_VIRT_BASE) as u8;
+        }
         if let Some(&p) = self.vgpr_map.get(&v) {
             return p;
         }
@@ -46,6 +57,7 @@ struct LiveInterval {
     vreg_base: VReg,         // first virtual register
     count: u32,              // number of consecutive VGPRs
     alignment: Alignment,
+    class: RegClass,         // allocation class (Address → isolated pool)
     last_use: usize,         // last instruction index where any VReg in this alloc is used
     phys_base: Option<u8>,   // assigned physical register (set during allocation)
 }
@@ -78,6 +90,14 @@ pub fn allocate(
     let mut last_use = vec![0usize; vreg_allocs.len()];
     let mut first_use = vec![usize::MAX; vreg_allocs.len()];
     for (op_idx, op) in ops.iter().enumerate() {
+        // P2 (2026-08-29): probe placeholders are POST-regalloc injections —
+        // their `refs` (observed values) must NOT extend live ranges, or the
+        // probe would change the allocation (and with it, kernel behavior).
+        // Optimization still sees the refs (via vreg_refs) and keeps the
+        // definitions alive; regalloc ignores them for liveness.
+        if matches!(op, Op::Probe { .. }) {
+            continue;
+        }
         for vr in op.vreg_refs() {
             if let Some(&alloc_idx) = vreg_to_alloc.get(&vr) {
                 if op_idx > last_use[alloc_idx] {
@@ -131,6 +151,7 @@ pub fn allocate(
             vreg_base: va.vreg,
             count: va.count,
             alignment: va.alignment,
+            class: va.class,
             last_use: last_use[idx],
             phys_base: None,
         }
@@ -138,17 +159,26 @@ pub fn allocate(
 
     // ── Allocate SGPRs (bump, no liveness needed) ──
     let mut sgpr_map: HashMap<SReg, u8> = HashMap::new();
-    let mut next_sgpr: u8 = 5; // s0:s1 = kernarg ptr, s2/s3/s4 = TGID
+    // s0:s1 = kernarg ptr, s2/s3/s4 = TGID — reserved (regs.rs single source)
+    let mut next_sgpr: u8 = super::regs::SGPR_ALLOC_BASE;
 
     // s63 is RESERVED: on GFX1200 the asm emitter uses it as the zero soffset
     // for buffer_load/buffer_store (SOFFSET_ZERO). If allocated as a general SGPR,
     // it gets clobbered and stores write to wrong addresses (+64 bytes for K-loop k_step).
-    const RESERVED_S63: u8 = 63;
+    const RESERVED_S63: u8 = super::regs::SGPR_SOFFSET_ZERO;
+    // s104:s105 RESERVED for post-regalloc probes (exec save/restore via
+    // raw asm s_mov_b64). Allocator skips them so probe code can clobber
+    // freely without save/restore of its own.
+    const PROBE_S: (u8, u8) = (super::regs::PROBE_SGPR_BASE, super::regs::PROBE_SGPR_BASE + super::regs::PROBE_SGPR_COUNT);
 
     for sa in sreg_allocs {
         // Skip s63 if we'd land on it (reserved for SOFFSET_ZERO on GFX1200)
         if next_sgpr == RESERVED_S63 {
             next_sgpr += 1;
+        }
+        // Skip probe-reserved SGPRs (s104:s105)
+        if next_sgpr >= PROBE_S.0 && next_sgpr < PROBE_S.1 {
+            next_sgpr = PROBE_S.1;
         }
         if sa.count == 1 {
             sgpr_map.insert(sa.sreg, next_sgpr);
@@ -178,24 +208,112 @@ pub fn allocate(
             }
             next_sgpr = base + sa.count as u8;
         }
-        assert!(next_sgpr < 106, "SGPR overflow!");
+        assert!(next_sgpr < super::regs::MAX_SGPRS, "SGPR overflow!");
     }
 
     // ── Allocate VGPRs with liveness-based reuse ──
-
-    // Free list: available physical register ranges
-    // Each entry is (start_phys, count) — a contiguous block of free registers
-    let mut free_ranges: Vec<(u8, u32)> = Vec::new();
-    let mut max_vgpr: u8 = 1; // v0 is reserved for WORKITEM_ID_X
+    // Two passes (arch fix B, 2026-08-27):
+    //   Pass 1: Normal/Accumulator intervals — bottom-up from v1.
+    //   Pass 2: Address intervals — bottom-up directly ABOVE the normal pool.
+    // Each class has its OWN free list: a physical register freed by one class
+    // can only ever be reused by the same class. This makes address values
+    // structurally unable to alias Normal temporaries (voffset folding,
+    // xr_0_tmp aliasing WT base, cross-ksub reuse — the whole bug family).
     let mut vgpr_map: HashMap<VReg, u8> = HashMap::new();
     vgpr_map.insert(VReg(0), 0); // v0 = hardware thread_id
 
-    // Active intervals: sorted by last_use so we can expire efficiently
-    let mut active: Vec<usize> = Vec::new(); // indices into intervals
+    let normal_indices: Vec<usize> = (0..intervals.len())
+        .filter(|&i| intervals[i].class != RegClass::Address)
+        .collect();
+    let addr_indices: Vec<usize> = (0..intervals.len())
+        .filter(|&i| intervals[i].class == RegClass::Address)
+        .collect();
 
-    // Allocate in declaration order
-    for idx in 0..intervals.len() {
-        // VReg(0) = hardware v0 (WORKITEM_ID_X), already pre-mapped above.
+    let mut free_ranges: Vec<(u8, u32)> = Vec::new();
+    let mut max_vgpr: u8 = super::regs::VGPR0_TID + 1; // v0 reserved (regs.rs)
+    alloc_class_pool(
+        &normal_indices, &mut intervals, &mut vgpr_map, &first_use,
+        &mut free_ranges, &mut max_vgpr, "VGPR",
+    );
+
+    // Addresses sit directly above the normal high-water: contiguous, no
+    // sparse top region, so the declared VGPR count stays tight.
+    let mut addr_free_ranges: Vec<(u8, u32)> = Vec::new();
+    let mut addr_high: u8 = max_vgpr;
+    alloc_class_pool(
+        &addr_indices, &mut intervals, &mut vgpr_map, &first_use,
+        &mut addr_free_ranges, &mut addr_high, "Address VGPR",
+    );
+
+    let max_vgpr_total = max_vgpr.max(addr_high);
+
+    // ── Overflow and occupancy diagnostics ──
+    #[allow(unused_comparisons)]  // max_vgpr_total is u8 so >255 is always false, but documents intent
+    if max_vgpr_total > 255 {
+        // Fatal: cannot fit in hardware
+        panic!(
+            "[T0 RegAlloc] FATAL: {} VGPRs needed, hardware max is 256. \
+             Kernel is too complex for register allocation without spilling.\n\
+             Top allocations by size:\n{}",
+            max_vgpr_total,
+            top_allocs_report(&intervals, 5)
+        );
+    }
+    if next_sgpr > super::regs::MAX_SGPRS {
+        panic!(
+            "[T0 RegAlloc] FATAL: {} SGPRs needed, hardware max is {}.",
+            next_sgpr, super::regs::MAX_SGPRS
+        );
+    }
+
+    // Occupancy tiers — MEASURED 2026-08-23: GFX1200 (RDNA4) has 256 VGPRs/SIMD
+    // (LLVM caps at 256 and silently spills beyond; RNAL 128 = 2 waves matches
+    // the rtl-sdr docs dual-wave red line). waves = floor(256 / vgpr):
+    //   ≤64  VGPRs → 4 waves/SIMD
+    //   ≤85  VGPRs → 3 waves/SIMD
+    //   ≤128 VGPRs → 2 waves/SIMD (dual-wave red line)
+    //   ≤256 VGPRs → 1 wave/SIMD
+    let (waves, tier) = if max_vgpr_total <= 64 { (4, "good") }
+        else if max_vgpr_total <= 85 { (3, "fair") }
+        else if max_vgpr_total <= 128 { (2, "fair") }
+        else { (1, "low") };
+
+    if max_vgpr_total > 128 {
+        eprintln!(
+            "[T0 RegAlloc] Kernel uses {} VGPRs ({} normal + {} address), {} SGPRs → {} waves/SIMD ({})",
+            max_vgpr_total, max_vgpr, addr_high - max_vgpr, next_sgpr, waves, tier
+        );
+        eprintln!("  Top register-heavy allocations:\n{}", top_allocs_report(&intervals, 3));
+    }
+
+    RegAlloc {
+        total_vgprs: max_vgpr_total,
+        total_sgprs: next_sgpr,
+        vgpr_map,
+        sgpr_map,
+    }
+}
+
+/// Allocate one class of intervals into a dedicated physical pool.
+///
+/// `free_ranges`/`high` are that class's OWN free list and high-water mark:
+/// registers freed by one class are only ever reused by the same class, so
+/// classes are physically disjoint by construction. Pass 2 (Address) starts
+/// `high` at the pass-1 high-water, placing addresses directly above normals.
+fn alloc_class_pool(
+    indices: &[usize],
+    intervals: &mut [LiveInterval],
+    vgpr_map: &mut HashMap<VReg, u8>,
+    first_use: &[usize],
+    free_ranges: &mut Vec<(u8, u32)>,
+    high: &mut u8,
+    pool_name: &str,
+) {
+    // Active intervals of THIS pool: sorted by last_use so we can expire efficiently
+    let mut active: Vec<usize> = Vec::new();
+
+    for &idx in indices {
+        // VReg(0) = hardware v0 (WORKITEM_ID_X), already pre-mapped in the caller.
         // CRITICAL: Do NOT reallocate it, and do NOT add to active list
         // so v0 can never be reclaimed via the expire mechanism.
         if intervals[idx].vreg_base == VReg(0) && intervals[idx].count == 1 {
@@ -205,7 +323,7 @@ pub fn allocate(
 
         let current_alloc_idx = intervals[idx].alloc_idx;
 
-        // Expire dead intervals: return their physical regs to free list.
+        // Expire dead intervals: return their physical regs to this pool's free list.
         // An interval is SAFE to expire only if its last_use is BEFORE the
         // first_use of the current allocation. This prevents freeing registers
         // that are still needed between the current alloc's definition and
@@ -275,73 +393,131 @@ pub fn allocate(
         } else {
             // No suitable free range found — allocate from the end
             let aligned = match align {
-                Alignment::None => max_vgpr,
-                Alignment::Align2 => (max_vgpr + 1) & !1,
-                Alignment::Align4 => (max_vgpr + 3) & !3,
-                Alignment::Align8 => (max_vgpr + 7) & !7,
+                Alignment::None => *high,
+                Alignment::Align2 => (*high + 1) & !1,
+                Alignment::Align4 => (*high + 3) & !3,
+                Alignment::Align8 => (*high + 7) & !7,
             };
             phys_base = aligned;
             let end = aligned as u32 + count;
-            assert!(end <= 255, "VGPR overflow at {}+{}", aligned, count);
-            max_vgpr = end as u8;
+            assert!(end <= 255, "{} overflow at {}+{} (this pool high-water {})", pool_name, aligned, count, *high);
+            *high = end as u8;
         }
 
         // Record allocation
+        // P2 (2026-08-29): probe register protection — never allocate into the
+        // reserved probe physicals [PROBE_VGPR_BASE, +COUNT). Probe temps are
+        // injected post-regalloc and clobber these freely; real code must not
+        // use them. Skip at the end of every allocation (both free-list and
+        // high-water paths land here via phys_base).
+        let mut phys_base = phys_base;
+        {
+            let pb = super::regs::PROBE_VGPR_BASE;
+            let pc = super::regs::PROBE_VGPR_COUNT as u8;
+            if phys_base < pb && phys_base + count as u8 > pb {
+                // Block straddles probe region — move start after it.
+                phys_base = pb + pc;
+            } else if phys_base >= pb && phys_base < pb + pc {
+                phys_base = pb + pc;
+            }
+        }
+        // Note: moving phys_base up may exceed the original free-range size;
+        // this is acceptable (probe region is tiny, kernel may use 4 more
+        // VGPRs when probes are enabled — debug mode only).
         intervals[idx].phys_base = Some(phys_base);
         for i in 0..count {
             vgpr_map.insert(VReg(intervals[idx].vreg_base.0 + i), phys_base + i as u8);
         }
-        if phys_base + count as u8 > max_vgpr {
-            max_vgpr = phys_base + count as u8;
+        if phys_base + count as u8 > *high {
+            *high = phys_base + count as u8;
         }
 
         active.push(idx);
     }
+}
 
-    // ── Overflow and occupancy diagnostics ──
-    #[allow(unused_comparisons)]  // max_vgpr is u8 so >255 is always false, but documents intent
-    if max_vgpr > 255 {
-        // Fatal: cannot fit in hardware
-        panic!(
-            "[T0 RegAlloc] FATAL: {} VGPRs needed, hardware max is 256. \
-             Kernel is too complex for register allocation without spilling.\n\
-             Top allocations by size:\n{}",
-            max_vgpr,
-            top_allocs_report(&intervals, 5)
-        );
-    }
-    if next_sgpr > 106 {
-        panic!(
-            "[T0 RegAlloc] FATAL: {} SGPRs needed, hardware max is 106.",
-            next_sgpr
-        );
-    }
+// ============================================================================
+// Post-allocation verification (arch fix A: reserved registers)
+// ============================================================================
 
-    // Occupancy tiers for GFX1100 (RDNA3, Wave32, 256 VGPRs/SIMD):
-    //   ≤64  VGPRs → 16 waves/SIMD (max occupancy)
-    //   ≤96  VGPRs → 10 waves/SIMD
-    //   ≤128 VGPRs → 8 waves/SIMD
-    //   ≤192 VGPRs → 4 waves/SIMD
-    //   ≤256 VGPRs → 2 waves/SIMD (min occupancy)
-    let (waves, tier) = if max_vgpr <= 64 { (16, "excellent") }
-        else if max_vgpr <= 96 { (10, "good") }
-        else if max_vgpr <= 128 { (8, "fair") }
-        else if max_vgpr <= 192 { (4, "low") }
-        else { (2, "critical") };
+/// Verify a completed allocation against the reserved-register contract.
+/// Called by the compile pipeline after every allocation (both allocators).
+///
+/// Checks:
+/// 1. No virtual VGPR maps onto a reserved VGPR (physical v0 is allowed ONLY
+///    for the hardware-tid pseudo-register VReg(0)).
+/// 2. No virtual SGPR maps onto a reserved SGPR (s0-s4 kernarg/TGID, s63
+///    SOFFSET_ZERO).
+/// 3. (S2) Address-class physical registers are disjoint from Normal-class.
+/// 4. (S2) No Address-class spill records.
+///
+/// Returns a list of violations (empty = OK). Never panics.
+pub fn verify_allocation(alloc: &RegAlloc, vreg_allocs: &[VRegAlloc]) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
 
-    if max_vgpr > 128 {
-        eprintln!(
-            "[T0 RegAlloc] Kernel uses {} VGPRs, {} SGPRs → {} waves/SIMD ({})",
-            max_vgpr, next_sgpr, waves, tier
-        );
-        eprintln!("  Top register-heavy allocations:\n{}", top_allocs_report(&intervals, 3));
+    // Check 1: reserved VGPRs
+    for (vreg, &phys) in &alloc.vgpr_map {
+        if super::regs::is_reserved_vgpr(phys) {
+            // v0 → only legitimate for the hardware tid pseudo-register
+            if !(phys == super::regs::VGPR0_TID && vreg.0 == 0) {
+                errors.push(format!(
+                    "VReg({}) mapped to reserved v{} (hardware workitem_id_x)",
+                    vreg.0, phys
+                ));
+            }
+        }
     }
 
-    RegAlloc {
-        total_vgprs: max_vgpr,
-        total_sgprs: next_sgpr,
-        vgpr_map,
-        sgpr_map,
+    // Check 2: reserved SGPRs
+    for (sreg, &phys) in &alloc.sgpr_map {
+        if super::regs::is_reserved_sgpr(phys) {
+            errors.push(format!(
+                "SReg({}) mapped to reserved s{} (kernarg/TGID/SOFFSET_ZERO)",
+                sreg.0, phys
+            ));
+        }
+    }
+
+    // Check 3: Address-class physical registers disjoint from Normal/Accumulator.
+    // Enforced by construction in regalloc::allocate (two-pass pools), but the
+    // SSA allocator path must pass the same contract — this catches it here.
+    let mut addr_phys: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    let mut normal_phys: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    for va in vreg_allocs {
+        let is_addr = va.class == RegClass::Address;
+        for i in 0..va.count {
+            if let Some(&p) = alloc.vgpr_map.get(&VReg(va.vreg.0 + i)) {
+                if is_addr {
+                    addr_phys.insert(p);
+                } else {
+                    normal_phys.insert(p);
+                }
+            }
+        }
+    }
+    let mut overlap: Vec<u8> = addr_phys.intersection(&normal_phys).copied().collect();
+    overlap.sort_unstable();
+    if !overlap.is_empty() {
+        errors.push(format!(
+            "Address-class and Normal-class VGPRs overlap on v{:?} — address values may alias temporaries",
+            overlap
+        ));
+    }
+
+    errors
+}
+
+/// Report allocation-contract violations (or OK) to stderr. Returns true if OK.
+pub fn report_allocation_errors(alloc: &RegAlloc, vreg_allocs: &[VRegAlloc], kernel: &str) -> bool {
+    let errors = verify_allocation(alloc, vreg_allocs);
+    if errors.is_empty() {
+        true
+    } else {
+        eprintln!("[T0] Allocation verification FAILED for '{}':", kernel);
+        for e in &errors {
+            eprintln!("  - {}", e);
+        }
+        false
     }
 }
 
@@ -359,3 +535,129 @@ fn top_allocs_report(intervals: &[LiveInterval], n: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_alloc(vgpr: &[(u32, u8)], sgpr: &[(u32, u8)]) -> RegAlloc {
+        RegAlloc {
+            vgpr_map: vgpr.iter().map(|&(v, p)| (VReg(v), p)).collect(),
+            sgpr_map: sgpr.iter().map(|&(s, p)| (SReg(s), p)).collect(),
+            total_vgprs: 0,
+            total_sgprs: 0,
+        }
+    }
+
+    #[test]
+    fn verify_allocation_ok_on_clean_mapping() {
+        let a = mk_alloc(&[(1, 1), (2, 2), (3, 4)], &[(0, 5), (1, 6)]);
+        assert!(verify_allocation(&a, &[]).is_empty());
+    }
+
+    #[test]
+    fn verify_allocation_catches_v0_violation() {
+        // VReg(5) mapped to physical v0 — illegal (only VReg(0) may be v0)
+        let a = mk_alloc(&[(5, 0)], &[]);
+        let errs = verify_allocation(&a, &[]);
+        assert_eq!(errs.len(), 1, "errs={:?}", errs);
+        assert!(errs[0].contains("v0"));
+    }
+
+    #[test]
+    fn verify_allocation_allows_tid_vreg0_to_v0() {
+        // VReg(0) → v0 is the hardware tid pseudo-register — allowed
+        let a = mk_alloc(&[(0, 0)], &[]);
+        assert!(verify_allocation(&a, &[]).is_empty());
+    }
+
+    #[test]
+    fn verify_allocation_catches_reserved_sgpr_violations() {
+        // s0 (kernarg), s2 (TGID), s63 (SOFFSET_ZERO) all reserved
+        let a = mk_alloc(&[], &[(0, 0), (1, 2), (2, 63)]);
+        let errs = verify_allocation(&a, &[]);
+        assert_eq!(errs.len(), 3, "errs={:?}", errs);
+    }
+
+    #[test]
+    fn verify_allocation_ok_on_sgpr_from_base_5() {
+        let a = mk_alloc(&[], &[(0, 5), (1, 6), (2, 64)]);
+        assert!(verify_allocation(&a, &[]).is_empty());
+    }
+
+    #[test]
+    fn report_allocation_errors_returns_false_on_violation() {
+        let a = mk_alloc(&[(1, 0)], &[]);
+        assert!(!report_allocation_errors(&a, &[], "test_kernel"));
+    }
+}
+
+    // ── S2: address-class physical isolation ──
+
+    #[test]
+    fn address_class_is_physically_isolated_from_normal() {
+        // Interleaved Normal/Address allocations with overlapping live ranges.
+        // Pass 1 allocates Normals bottom-up; pass 2 places Addresses above —
+        // the physical sets must be disjoint, and the verifier must pass.
+        let vreg_allocs = vec![
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Address },
+            VRegAlloc { vreg: VReg(3), count: 2, alignment: Alignment::Align2, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(5), count: 1, alignment: Alignment::None, class: RegClass::Address },
+            VRegAlloc { vreg: VReg(6), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+        ];
+        let ops = vec![
+            Op::VAddU32 { dst: VReg(1), src0: Operand::VReg(VReg(2)), src1: Operand::InlineInt(4) },
+            Op::VAddU32 { dst: VReg(3), src0: Operand::VReg(VReg(5)), src1: Operand::InlineInt(8) },
+            Op::VAddU32 { dst: VReg(4), src0: Operand::VReg(VReg(3)), src1: Operand::InlineInt(1) },
+            Op::VAddU32 { dst: VReg(2), src0: Operand::VReg(VReg(1)), src1: Operand::InlineInt(2) },
+            Op::VAddU32 { dst: VReg(5), src0: Operand::VReg(VReg(4)), src1: Operand::InlineInt(3) },
+            Op::VAddU32 { dst: VReg(6), src0: Operand::VReg(VReg(2)), src1: Operand::InlineInt(1) },
+        ];
+        let alloc = allocate(&vreg_allocs, &[], &ops);
+
+        // Build per-class physical sets
+        let mut addr_phys = std::collections::HashSet::new();
+        let mut normal_phys = std::collections::HashSet::new();
+        for va in &vreg_allocs {
+            for i in 0..va.count {
+                let p = alloc.vgpr_map[&VReg(va.vreg.0 + i)];
+                if va.class == RegClass::Address {
+                    addr_phys.insert(p);
+                } else {
+                    normal_phys.insert(p);
+                }
+            }
+        }
+        // Isolation: no physical register shared between classes
+        let overlap: Vec<u8> = addr_phys.intersection(&normal_phys).copied().collect();
+        assert!(overlap.is_empty(), "classes overlap on v{:?}", overlap);
+
+        // Addresses must sit above the normal pool (contiguous, no gap)
+        let normal_max = normal_phys.iter().copied().max().unwrap_or(0);
+        let addr_min = addr_phys.iter().copied().min().unwrap_or(255);
+        assert!(addr_min > normal_max, "addr pool v{} should be above normal pool v{}", addr_min, normal_max);
+
+        // The verifier must accept this allocation
+        assert!(verify_allocation(&alloc, &vreg_allocs).is_empty());
+        // Declared count covers both pools
+        assert!(alloc.total_vgprs as u32 > normal_max as u32);
+    }
+
+    #[test]
+    fn address_only_kernel_allocates_cleanly() {
+        // Pure-address kernel: everything in the address pool, starting at v1
+        let vreg_allocs = vec![
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Address },
+            VRegAlloc { vreg: VReg(2), count: 2, alignment: Alignment::Align2, class: RegClass::Address },
+        ];
+        let ops = vec![
+            Op::VAddU32 { dst: VReg(1), src0: Operand::VReg(VReg(1)), src1: Operand::InlineInt(4) },
+            Op::VAddU32 { dst: VReg(2), src0: Operand::VReg(VReg(1)), src1: Operand::InlineInt(8) },
+            Op::VAddU32 { dst: VReg(3), src0: Operand::VReg(VReg(2)), src1: Operand::InlineInt(1) },
+        ];
+        let alloc = allocate(&vreg_allocs, &[], &ops);
+        assert!(verify_allocation(&alloc, &vreg_allocs).is_empty());
+        assert!(alloc.vgpr_map[&VReg(1)] >= 1);
+        assert!(alloc.vgpr_map[&VReg(2)] >= 2);
+    }

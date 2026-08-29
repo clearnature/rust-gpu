@@ -49,6 +49,14 @@ pub struct T0Kernel {
     /// Opt passes must not separate instructions belonging to a group.
     coalesced_groups: Vec<CoalescedGroup>,
     next_coalesced_group_id: u32,
+    /// Post-regalloc probes (auto register protection, 2026-08-29).
+    /// probe_id → body ops. `Op::Probe(id)` placeholders in self.ops are
+    /// expanded to these bodies after register allocation, right before
+    /// emission. Bodies reference probe-temp virtuals VReg(1000+i) (mapped by
+    /// phys_v to reserved v250+i) and real virtual regs (resolved via the
+    /// final vgpr_map). Because the placeholder has no vreg_refs and the body
+    /// is injected post-regalloc, probes can never change allocation.
+    probes: Vec<Vec<Op>>,
     /// Target GPU (affects WMMA operand widths, encoding, etc.)
     target: Target,
 }
@@ -86,6 +94,7 @@ impl T0Kernel {
             skip_cse: false,
             coalesced_groups: Vec::new(),
             next_coalesced_group_id: 0,
+            probes: Vec::new(),
             target: Target::detect(),
         }
     }
@@ -112,8 +121,11 @@ impl T0Kernel {
         let sreg_id = self.next_sreg;
         self.next_sreg += 2;
         let sreg = SReg(sreg_id);
-        let offset = self.kernarg_size;
-        self.kernarg_size += 8;
+        // 8-byte alignment: u32 args before a ptr arg would otherwise put the
+        // pointer at a non-aligned offset (validate_kernargs_bytes scans 8B
+        // aligned; GPU kernarg reads assume ptr alignment).
+        let offset = (self.kernarg_size + 7) & !7;
+        self.kernarg_size = offset + 8;
         self.sreg_allocs.push(SRegAlloc {
             sreg,
             count: 2,
@@ -176,7 +188,7 @@ impl T0Kernel {
     pub fn alloc_vreg(&mut self) -> VReg {
         let v = VReg(self.next_vreg);
         self.next_vreg += 1;
-        self.vreg_allocs.push(VRegAlloc { vreg: v, count: 1, alignment: Alignment::None });
+        self.vreg_allocs.push(VRegAlloc { vreg: v, count: 1, alignment: Alignment::None, class: RegClass::Normal });
         v
     }
 
@@ -185,7 +197,24 @@ impl T0Kernel {
     pub fn alloc_vreg_array(&mut self, count: u32, align: Alignment) -> VReg {
         let v = VReg(self.next_vreg);
         self.next_vreg += count;
-        self.vreg_allocs.push(VRegAlloc { vreg: v, count, alignment: align });
+        self.vreg_allocs.push(VRegAlloc { vreg: v, count, alignment: align, class: RegClass::Normal });
+        v
+    }
+
+    /// Allocate a single virtual VGPR of the **Address** class (arch fix B):
+    /// physically isolated from Normal temporaries, never folded/aliased/spilled.
+    pub fn alloc_addr_vreg(&mut self) -> VReg {
+        let v = VReg(self.next_vreg);
+        self.next_vreg += 1;
+        self.vreg_allocs.push(VRegAlloc { vreg: v, count: 1, alignment: Alignment::None, class: RegClass::Address });
+        v
+    }
+
+    /// Allocate N consecutive **Address**-class VGPRs with alignment.
+    pub fn alloc_addr_vreg_array(&mut self, count: u32, align: Alignment) -> VReg {
+        let v = VReg(self.next_vreg);
+        self.next_vreg += count;
+        self.vreg_allocs.push(VRegAlloc { vreg: v, count, alignment: align, class: RegClass::Address });
         v
     }
 
@@ -193,7 +222,7 @@ impl T0Kernel {
     /// Returns (addr_lo, addr_hi) guaranteed to be VReg(n) and VReg(n+1).
     /// This is REQUIRED for GlobalLoad/GlobalStore which emit v[lo:lo+1].
     pub fn alloc_addr_pair(&mut self) -> (VReg, VReg) {
-        let pair = self.alloc_vreg_array(2, Alignment::Align2);
+        let pair = self.alloc_addr_vreg_array(2, Alignment::Align2);
         self.mark_coalesced_group(pair, 2);
         (pair, VReg(pair.0 + 1))
     }
@@ -264,6 +293,28 @@ impl T0Kernel {
     pub fn push(&mut self, op: Op) {
         self.ops.push(op);
     }
+
+    // ── Post-regalloc probes (auto register protection, 2026-08-29) ──
+
+    /// Register a probe body and return its id. The caller places
+    /// `Op::Probe(id)` (via `probe_placeholder`) where the body should run;
+    /// compile.rs expands it to `body` AFTER register allocation, so the probe
+    /// can never change the allocation. Body ops may reference probe-temp
+    /// virtuals `VReg(PROBE_VREG_VIRT_BASE+i)` (→ reserved v250+i) and any
+    /// real virtual regs (resolved via the final vgpr_map at emission).
+    pub fn register_probe(&mut self, body: Vec<Op>) -> u16 {
+        let id = self.probes.len() as u16;
+        self.probes.push(body);
+        id
+    }
+
+    /// Push an `Op::Probe { id }` placeholder at the current position.
+    /// No observed-vreg refs: invisible to optimization AND regalloc (the
+    /// auto-register-protection guarantee — probe builds allocate identically).
+    pub fn probe_placeholder(&mut self, id: u16) {
+        self.ops.push(Op::Probe { id });
+    }
+
 
     // ── Convenience methods for common ops ──
 
@@ -388,6 +439,10 @@ impl T0Kernel {
     pub fn s_lshr_b32(&mut self, dst: SReg, src: SReg, shift: u8) {
         self.ops.push(Op::SLshrB32 { dst, src, shift });
     }
+    /// s_lshr_b32 with SGPR shift (runtime shift amount)
+    pub fn s_lshr_b32_sgpr(&mut self, dst: SReg, src: SReg, shift_src: SReg) {
+        self.ops.push(Op::SLshrB32SgprShift { dst, src, shift_src });
+    }
 
     /// s_add_u32 with SGPR source (not immediate)
     pub fn s_add_u32_ss(&mut self, dst: SReg, src0: SReg, src1: SReg) {
@@ -472,7 +527,75 @@ impl T0Kernel {
 
     pub fn wmma_bf16_f32(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
         let ab_width = self.wmma_ab_frag_size() as u8;
-        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::BF16_F32, ab_width });
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::BF16_F32, ab_width, sparse_idx: None });
+    }
+
+    pub fn wmma_f16_f32(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        let ab_width = self.wmma_ab_frag_size() as u8;
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::F16_F32, ab_width, sparse_idx: None });
+    }
+
+    pub fn wmma_bf16_bf16(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        let ab_width = self.wmma_ab_frag_size() as u8;
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::BF16_BF16, ab_width, sparse_idx: None });
+    }
+
+    pub fn wmma_f16_f16(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        let ab_width = self.wmma_ab_frag_size() as u8;
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::F16_F16, ab_width, sparse_idx: None });
+    }
+
+    /// INT8 WMMA: A/B each use 2 VGPRs on GFX1200 (kBase=16).
+    pub fn wmma_iu8(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        // IU8: kBase=16, 32 lanes / 16 M = 2 VGPRs per operand
+        let ab_width = match self.target {
+            Target::GFX1200 => 2,
+            Target::GFX1100 => 2,
+        };
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::IU8_I32, ab_width, sparse_idx: None });
+    }
+
+    /// INT4 WMMA K=16: A/B each use 1 VGPR on GFX1200.
+    pub fn wmma_iu4(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        // IU4 K=16: kBase=16, 32 lanes / 16 M = 2... but LLVM says 1 VGPR
+        let ab_width = match self.target {
+            Target::GFX1200 => 1,
+            Target::GFX1100 => 1,
+        };
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::IU4_I32, ab_width, sparse_idx: None });
+    }
+
+    /// INT4 WMMA K=32: A/B each use 2 VGPRs on GFX1200 (K=32 per WMMA).
+    pub fn wmma_iu4_k32(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        let ab_width = match self.target {
+            Target::GFX1200 => 2,
+            Target::GFX1100 => 2,
+        };
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::IU4_I32_K32, ab_width, sparse_idx: None });
+    }
+
+    /// FP8×FP8 WMMA: A/B each use 4 VGPRs on GFX1200.
+    pub fn wmma_fp8_fp8(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        let ab_width = self.wmma_ab_frag_size() as u8;
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::FP8_F32, ab_width, sparse_idx: None });
+    }
+
+    /// BF8×BF8 WMMA: A/B each use 4 VGPRs on GFX1200.
+    pub fn wmma_bf8_bf8(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        let ab_width = self.wmma_ab_frag_size() as u8;
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::BF8_F32, ab_width, sparse_idx: None });
+    }
+
+    /// FP8×BF8 WMMA: A/B each use 4 VGPRs on GFX1200.
+    pub fn wmma_fp8_bf8(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        let ab_width = self.wmma_ab_frag_size() as u8;
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::FP8_BF8_F32, ab_width, sparse_idx: None });
+    }
+
+    /// BF8×FP8 WMMA: A/B each use 4 VGPRs on GFX1200.
+    pub fn wmma_bf8_fp8(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) {
+        let ab_width = self.wmma_ab_frag_size() as u8;
+        self.ops.push(Op::Wmma { dst, a, b, c, format: WmmaFormat::BF8_FP8_F32, ab_width, sparse_idx: None });
     }
 
     pub fn label(&mut self, name: &str) {
@@ -564,6 +687,13 @@ impl T0Kernel {
 
     pub fn endpgm(&mut self) {
         self.ops.push(Op::Endpgm);
+    }
+
+    /// s_setprio imm — Set wavefront scheduling priority for latency hiding.
+    /// Used in pingpong scheduling to alternate priority between dot and memory clusters.
+    /// imm: 0 = normal priority, 1-3 = higher priority (3 = highest).
+    pub fn s_setprio(&mut self, prio: u8) {
+        self.ops.push(Op::SSetPrio(prio));
     }
 
     pub fn raw_asm(&mut self, text: &str) {
@@ -707,6 +837,21 @@ impl T0Kernel {
     /// s_barrier: synchronize all waves in the workgroup
     pub fn s_barrier(&mut self) {
         self.ops.push(Op::SBarrier);
+    }
+
+    /// global_inv scope:SCOPE_SE: invalidate L0/L1 caches (SE scope).
+    /// Must follow s_barrier when LDS written by other waves is read next
+    /// (GFX1200: barrier orders execution, GlobalInv orders cache visibility).
+    pub fn global_inv(&mut self) {
+        self.ops.push(Op::GlobalInv);
+    }
+
+    /// s_barrier + global_inv: the complete cross-wave LDS sync pattern
+    /// (matches LLVM's SIMemoryLegalizer emission between s_barrier_wait and
+    /// ds_load). Use this instead of bare s_barrier before LDS reads.
+    pub fn barrier_sync(&mut self) {
+        self.ops.push(Op::SBarrier);
+        self.ops.push(Op::GlobalInv);
     }
 
     /// s_cbranch_scc0: branch if SCC == 0
@@ -921,7 +1066,10 @@ impl T0Kernel {
         // Run optimization passes on a copy of ops
         // Apply kernel-level optimization settings via env vars
         if let Some(level) = self.opt_level {
-            std::env::set_var("T0_OPT_LEVEL", level.to_string());
+            // env (T0_OPT_LEVEL) wins over the kernel default when explicitly set
+            if std::env::var("T0_OPT_LEVEL").is_err() {
+                std::env::set_var("T0_OPT_LEVEL", level.to_string());
+            }
         }
         if self.skip_cse {
             let current = std::env::var("T0_DISABLE_PASS").unwrap_or_default();
@@ -933,11 +1081,33 @@ impl T0Kernel {
                 }
             }
         }
+        if std::env::var("T0_DBG_RAW").is_ok() {
+            let n_before = self.ops.iter().filter(|o| matches!(o, Op::RawAsm(_))).count();
+            eprintln!("[raw] before optimize: {} RawAsm", n_before);
+        }
         let (mut optimized_ops, _stats) = if self.skip_optimize {
             (self.ops.clone(), super::opt_passes::OptStats::default())
         } else {
-            super::opt_passes::optimize(self.ops.clone(), &self.coalesced_groups)
+            // Arch fix B (2026-08-27): address-class VRegs must never be
+            // algebraically rewritten by optimization (CSE folds the lane_hi
+            // address component → K 8-15 never read, C_RAND 156 vs 168).
+            let addr_vregs: std::collections::HashSet<u32> = self.vreg_allocs.iter()
+                .filter(|va| va.class == RegClass::Address)
+                .flat_map(|va| (0..va.count).map(move |i| va.vreg.0 + i))
+                .collect();
+            super::opt_passes::optimize(self.ops.clone(), &self.coalesced_groups, &addr_vregs)
         };
+
+        if std::env::var("T0_DBG_RAW").is_ok() {
+            let n_after = optimized_ops.iter().filter(|o| matches!(o, Op::RawAsm(_))).count();
+            eprintln!("[raw] after optimize: {} RawAsm", n_after);
+        }
+        // DEBUG: count Op::Endpgm through the pipeline (T0_DUMP_ASM=1)
+        if std::env::var("T0_DUMP_ASM").is_ok() {
+            let orig_end = self.ops.iter().filter(|o| matches!(o, Op::Endpgm)).count();
+            let opt_end = optimized_ops.iter().filter(|o| matches!(o, Op::Endpgm)).count();
+            eprintln!("[DBG endpgm] orig={} optimized={} kernel='{}'", orig_end, opt_end, self.name);
+        }
 
         // SSA round-trip verification (debug builds only)
         #[cfg(debug_assertions)]
@@ -993,6 +1163,17 @@ impl T0Kernel {
         } else {
             regalloc::allocate(&filtered_allocs, &self.sreg_allocs, &optimized_ops)
         };
+
+        // Arch fix A (2026-08-27): reserved-register contract on the allocator
+        // output — no virtual register may land on v0/s0-4/s63 (hardware
+        // workitem_id_x, kernarg, TGID, SOFFSET_ZERO). Catches regalloc
+        // regressions at compile time instead of GPU hangs.
+        if !super::regalloc::report_allocation_errors(&alloc, &filtered_allocs, &self.name) {
+            return Err(format!(
+                "Reserved-register allocation violation for '{}' (see stderr)",
+                self.name
+            ));
+        }
 
         // Cross-validate SSA regalloc: check for interference violations
         if self.use_ssa_regalloc && std::env::var("T0_DUMP_ASM").is_ok() {
@@ -1067,6 +1248,53 @@ impl T0Kernel {
                 "Post-regalloc ISA verification FAILED for '{}': {}",
                 self.name, post_verify.errors.join("; ")
             ));
+        }
+
+        if std::env::var("T0_DUMP_ASM").is_ok() {
+            let end_cnt = optimized_ops.iter().filter(|o| matches!(o, Op::Endpgm)).count();
+            eprintln!("[DBG pre-emit] Endpgm count = {}", end_cnt);
+        }
+
+        // ── P2 (2026-08-29): expand post-regalloc probes ──
+        // Replace Op::Probe(id) placeholders with their bodies, injected AFTER
+        // register allocation. This is the core of the auto-register-protection
+        // architecture: the probe body (which may reference real virtual regs
+        // and clobber probe-temp physicals v250+) never participates in
+        // allocation, so a probe-enabled build produces the SAME allocation as
+        // the probe-free build. Probes therefore cannot change kernel behavior
+        // (only add the probe writes).
+        let probe_count: usize = optimized_ops.iter().filter(|o| matches!(o, Op::Probe { .. })).count();
+        if probe_count > 0 {
+            if self.probes.len() as usize > 0 {
+                let mut expanded: Vec<Op> = Vec::with_capacity(optimized_ops.len() + probe_count * 8);
+                for op in optimized_ops.into_iter() {
+                    if let Op::Probe { id, .. } = op {
+                        let body = self.probes.get(id as usize).cloned().unwrap_or_default();
+                        if std::env::var("T0_DUMP_ASM").is_ok() {
+                            eprintln!("[DBG probe] expanding probe {} ({} ops)", id, body.len());
+                        }
+                        // Auto-register-protection tolerance: observed virtuals
+                        // whose defs were DCE-removed (probe has no refs, so
+                        // optimize may kill them) — drop the referencing ops so
+                        // emission never panics on a missing physical.
+                        let live: Vec<Op> = body.into_iter().filter(|bop| {
+                            bop.vreg_refs().iter().all(|vr| {
+                                vr.0 >= crate::t0::regs::PROBE_VREG_VIRT_BASE
+                                    || alloc.vgpr_map.contains_key(vr)
+                            })
+                        }).collect();
+                        expanded.extend(live);
+                    } else {
+                        expanded.push(op);
+                    }
+                }
+                optimized_ops = expanded;
+            } else {
+                return Err(format!(
+                    "Kernel '{}' has {} Op::Probe placeholder(s) but no registered probe bodies",
+                    self.name, probe_count
+                ));
+            }
         }
 
         let mut emitter = AsmEmitter::new();
@@ -1181,6 +1409,12 @@ impl T0Kernel {
             eprintln!("── END ASM ({} lines) ──", asm_text.lines().count());
         }
 
+        // FABLE5: dump asm to file for llvm-mc verification
+        if std::env::var("T0_DUMP_ELF").is_ok() {
+            let dump_path = format!("/tmp/t0_dump_{}.s", self.name);
+            let _ = std::fs::write(&dump_path, &asm_text);
+            eprintln!("[FABLE5] Dumped asm to {}", dump_path);
+        }
         llvm_assemble(&asm_text, target, &self.name)
     }
 
@@ -1222,11 +1456,19 @@ impl T0Kernel {
 /// Assemble GCN text → .o → .hsaco via LLVM/clang + ld.lld
 fn llvm_assemble(asm_text: &str, target: Target, name: &str) -> Result<Vec<u8>, String> {
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
+    // Serialize clang/ld.lld to prevent parallel temp file races (K6 pattern: resource exclusion)
+    static COMPILE_MUTEX: Mutex<()> = Mutex::new(());
+    static COMPILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let _guard = COMPILE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let seq = COMPILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
     let temp_dir = std::env::temp_dir();
-    let asm_path = temp_dir.join(format!("t0_{}.s", name));
-    let obj_path = temp_dir.join(format!("t0_{}.o", name));
-    let co_path = temp_dir.join(format!("t0_{}.hsaco", name));
+    let asm_path = temp_dir.join(format!("t0_{}_{}_{}.s", name, pid, seq));
+    let obj_path = temp_dir.join(format!("t0_{}_{}_{}.o", name, pid, seq));
+    let co_path = temp_dir.join(format!("t0_{}_{}_{}.hsaco", name, pid, seq));
 
     // Write assembly
     fs::write(&asm_path, asm_text)
@@ -1382,6 +1624,42 @@ mod tests {
         assert!(asm.contains("v_mul_f32"));
         assert!(asm.contains("global_store_b32"));
         eprintln!("--- Scale kernel assembly ---\n{}", asm);
+    }
+
+    #[test]
+    fn test_wmma_exec_guard() {
+        // L0.1: Verify that WMMA instructions get s_setexeclo_b32 -1 guard
+        // to prevent RDNA4 HWXDL silent-drop under divergent EXEC mask.
+        // Reference: /data/rtl-sdr/swmmac/active/silent_drop/DISCOVERY.md
+        let mut k = T0Kernel::new("test_wmma_guard");
+        // Allocate 8-aligned VGPRs for WMMA operands (GFX1100: 8-wide fragments)
+        let dst = k.alloc_vreg_array(8, Alignment::Align8);
+        let a = k.alloc_vreg_array(8, Alignment::Align8);
+        let b = k.alloc_vreg_array(8, Alignment::Align8);
+        let acc = k.alloc_vreg_array(8, Alignment::Align8);
+        k.wmma_bf16_f32(dst, a, b, acc);
+        k.endpgm();
+
+        let asm = k.to_assembly(Target::GFX1100).unwrap();
+        // The EXEC guard must appear in the assembly
+        assert!(asm.contains("s_setexeclo_b32 -1"),
+            "WMMA must be preceded by s_setexeclo_b32 -1 silent-drop guard");
+        // And it must appear before the v_wmma instruction
+        let guard_pos = asm.find("s_setexeclo_b32 -1").unwrap();
+        let wmma_pos = asm.find("v_wmma_f32_16x16x16_bf16").unwrap();
+        assert!(guard_pos < wmma_pos,
+            "EXEC guard (pos={}) must appear before WMMA (pos={})", guard_pos, wmma_pos);
+        eprintln!("--- WMMA EXEC guard verified ---");
+        eprintln!("{}", &asm[guard_pos..wmma_pos + 60]);
+
+        // GFX1200: s_setexeclo_b32 not supported, must use s_mov_b32 exec_lo, -1
+        let asm1200 = k.to_assembly(Target::GFX1200).unwrap();
+        assert!(asm1200.contains("s_mov_b32 exec_lo, -1"),
+            "GFX1200 WMMA must use s_mov_b32 exec_lo, -1 guard (s_setexeclo_b32 not supported)");
+        let guard_pos_1200 = asm1200.find("s_mov_b32 exec_lo, -1").unwrap();
+        let wmma_pos_1200 = asm1200.find("v_wmma_f32_16x16x16_bf16").unwrap();
+        assert!(guard_pos_1200 < wmma_pos_1200,
+            "GFX1200 EXEC guard must appear before WMMA");
     }
 
     #[cfg(feature = "rocm")]

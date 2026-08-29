@@ -62,6 +62,27 @@ pub enum Alignment {
     Align8,
 }
 
+/// Register class: how the allocator treats this virtual register.
+///
+/// The pre-2026-08-27 allocator treated every VGPR as an interchangeable
+/// temporary, which caused a whole bug family (voffset folding, xr_0_tmp
+/// aliasing the WT base, cross-ksub base reuse). Classes give the allocator
+/// the semantics it was missing
+/// (see docs/T0_寄存器架构升级_顶层设计_2026-08-27.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RegClass {
+    /// Ordinary temporary: free reuse/folding (current behavior).
+    #[default]
+    Normal,
+    /// Address value (ds_load/global load-store voffset, LDS bases,
+    /// k_byte_off, lane_swizzle, ...). Physically isolated from Normal,
+    /// never folded, never aliased with non-address values, never spilled.
+    Address,
+    /// WMMA accumulator (C fragment): explicit for the verifier;
+    /// alignment (Align4/8) already expresses the hardware constraint.
+    Accumulator,
+}
+
 // ============================================================================
 // Data widths
 // ============================================================================
@@ -114,6 +135,39 @@ pub enum WmmaFormat {
     F16_F32,
     /// v_wmma_bf16_16x16x16_bf16: BF16 inputs, BF16 accumulator (saves VGPRs)
     BF16_BF16,
+    /// v_wmma_f16_16x16x16_f16: F16 inputs, F16 accumulator (saves VGPRs)
+    F16_F16,
+    /// v_wmma_i32_16x16x16_iu8: INT8 inputs, I32 accumulator
+    IU8_I32,
+    /// v_wmma_i32_16x16x16_iu4: INT4 inputs, I32 accumulator (K=16)
+    IU4_I32,
+    /// v_wmma_i32_16x16x32_iu4: INT4 inputs, I32 accumulator (K=32, RDNA4 only)
+    IU4_I32_K32,
+    /// v_wmma_f32_16x16x16_fp8_fp8: FP8 inputs, F32 accumulator (RDNA4 K=16)
+    FP8_F32,
+    /// v_wmma_f32_16x16x16_bf8_bf8: BF8 inputs, F32 accumulator (RDNA4 K=16)
+    BF8_F32,
+    /// v_wmma_f32_16x16x16_fp8_bf8: FP8×BF8 mixed inputs, F32 accumulator (RDNA4 K=16)
+    FP8_BF8_F32,
+    /// v_wmma_f32_16x16x16_bf8_fp8: BF8×FP8 mixed inputs, F32 accumulator (RDNA4 K=16)
+    BF8_FP8_F32,
+    // ── SWMMAC (Sparse Wave Matrix Multiply Accumulate, 2:4 structured sparsity) ──
+    // INT4 K=64: A=<2xi32>, B=<4xi32>, C/D=<8xi32>, sparse_idx=VReg
+    SMAC_I4_K64,
+    // INT8 K=32: A=<2xi32>, B=<4xi32>, C/D=<8xi32>, sparse_idx=VReg
+    SMAC_I8_K32,
+    // FP16 K=32: A=<2xf16>, B=<4xf16>, C/D=<8xf32>, sparse_idx=VReg
+    SMAC_F16_K32,
+    // BF16 K=32: A=<2xbf16>, B=<4xbf16>, C/D=<8xf32>, sparse_idx=VReg
+    SMAC_BF16_K32,
+    // FP8×FP8 K=32: A=<2xfp8>, B=<4xfp8>, C/D=<8xf32>, sparse_idx=VReg
+    SMAC_FP8_K32,
+    // BF8×BF8 K=32: A=<2xbf8>, B=<4xbf8>, C/D=<8xf32>, sparse_idx=VReg
+    SMAC_BF8_K32,
+    // FP8×BF8 K=32: A=<2xfp8>, B=<4xbf8>, C/D=<8xf32>, sparse_idx=VReg
+    SMAC_FP8_BF8_K32,
+    // BF8×FP8 K=32: A=<2xbf8>, B=<4xfp8>, C/D=<8xf32>, sparse_idx=VReg
+    SMAC_BF8_FP8_K32,
 }
 
 // ============================================================================
@@ -275,6 +329,8 @@ pub enum Op {
     SMulI32 { dst: SReg, src0: SReg, src1: SReg },
     SLshlB32 { dst: SReg, src: SReg, shift: u8 },
     SLshrB32 { dst: SReg, src: SReg, shift: u8 },
+    /// s_lshr_b32 with SGPR shift operand (runtime shift amount)
+    SLshrB32SgprShift { dst: SReg, src: SReg, shift_src: SReg },
     SMov { dst: SReg, src: SOperand },
     SCmpLtU32 { src0: SReg, src1: SReg },
     SCmpEqU32 { src0: SReg, src1: SOperand },
@@ -288,6 +344,9 @@ pub enum Op {
         c: VReg,    // first of 8 consecutive VGPRs (accumulator input)
         format: WmmaFormat,
         ab_width: u8, // 4 for GFX1200, 8 for GFX1100
+        /// SWMMAC sparse index (None = dense/no sparse, Some = sparse VGPR).
+        /// Present only for SWMMAC variants; must be None for WMMA variants.
+        sparse_idx: Option<VReg>,
     },
 
     // ── Control flow ──
@@ -398,6 +457,14 @@ pub enum Op {
     /// s_barrier: workgroup barrier — all waves in WG must reach before any proceed
     SBarrier,
 
+    /// global_inv scope:SCOPE_SE — invalidate L0/L1 caches at Shader Engine scope.
+    /// Required after s_barrier when LDS written by other waves is about to be
+    /// read: on GFX1200 the barrier only orders wave execution, not cache
+    /// visibility. LLVM emits this between s_barrier_wait and ds_load
+    /// (SIMemoryLegalizer); t0's old barrier-only pattern was missing it
+    /// (4-wave flaky LDS reads). Opcode 0x2B, 96-bit, scope bits [51:50]=01.
+    GlobalInv,
+
     // ── EXEC mask (conditional execution) ──
     /// v_cmp_lt_u32 vcc, src0, src1 — set VCC bitmask where src0 < src1 (unsigned)
     /// Used for bounds checking: v_cmp_lt_u32 vcc, global_id, n_elems
@@ -467,6 +534,10 @@ pub enum Op {
     // ── SMEM scalar load ──
     /// s_load_dword dst, s[base_lo:base_hi], offset
     SMemLoadDword { dst: SReg, base_lo: SReg, base_hi: SReg, offset: i32 },
+    /// s_load_dwordx2 s[dst:dst+1], s[base_lo:base_hi], offset (64-bit batch)
+    SMemLoadDwordx2 { dst: SReg, base_lo: SReg, base_hi: SReg, offset: i32 },
+    /// s_load_dwordx4 s[dst:dst+3], s[base_lo:base_hi], offset (128-bit batch)
+    SMemLoadDwordx4 { dst: SReg, base_lo: SReg, base_hi: SReg, offset: i32 },
 
     // ── Wave reduction (max) ──
     /// Wave32 max reduction via ds_swizzle XOR patterns
@@ -480,6 +551,30 @@ pub enum Op {
 
     // ── Raw assembly passthrough (escape hatch) ──
     RawAsm(String),
+
+    // ── Post-regalloc probe placeholder (auto register protection) ──
+    /// Marker for a probe to be injected AFTER register allocation. The probe
+    /// body lives in T0Kernel::probes[id]; compile expands this op into the
+    /// body ops right before emission. Probe bodies reference probe-temp
+    /// virtuals (VReg(1000+i), mapped by phys_v to reserved v250+i) and real
+    /// virtual regs (resolved via the final vgpr_map).
+    ///
+    /// `id` only — NO observed-vreg refs: the placeholder is invisible to both
+    /// optimization and regalloc, so a probe-enabled build produces the SAME
+    /// optimized IR and the SAME allocation as the probe-free build (the core
+    /// auto-register-protection guarantee). Observed values whose virtual def
+    /// was DCE-removed simply dump as 0 (expansion resolves physicals, missing
+    /// ones → zero-fill); to observe a value, keep its def alive with a real
+    /// side effect or insert the probe before its last use.
+    Probe { id: u16 },
+
+    // ── Wavefront scheduling priority ──
+    /// s_setprio imm — Set wavefront scheduling priority for latency hiding.
+    /// Used in pingpong scheduling to alternate priority between dot and memory clusters.
+    /// imm: 0 = normal priority, 1-3 = higher priority (3 = highest).
+    /// On RDNA3/4, affects how the hardware scheduler prioritizes this wavefront
+    /// relative to other wavefronts on the same CU.
+    SSetPrio(u8),
 }
 
 // Helper: extract VRegs from an Operand
@@ -587,6 +682,7 @@ impl Op {
             // Scalar ALU (no VGPRs)
             Op::SAddU32 { .. } | Op::SAddcU32 { .. } | Op::SSubU32 { .. } | Op::SAndB32 { .. } |
             Op::SMulI32 { .. } | Op::SLshlB32 { .. } | Op::SLshrB32 { .. } |
+            Op::SLshrB32SgprShift { .. } |
             Op::SMov { .. } | Op::SCmpLtU32 { .. } |
             Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } => vec![],
 
@@ -607,7 +703,7 @@ impl Op {
             // Sync (no VGPRs)
             Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)
             | Op::WaitKmcnt(_) | Op::ClearVcc
-            | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } => vec![],
+            | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } => vec![],
             Op::Endpgm => vec![],
 
             // Hardware
@@ -647,7 +743,7 @@ impl Op {
                 vec![*dst, VReg(dst.0 + 1), VReg(dst.0 + 2), VReg(dst.0 + 3), *vaddr]
             }
 
-            Op::SBarrier => vec![],
+            Op::SBarrier | Op::GlobalInv => vec![],
 
             // Comparisons
             Op::VCmpLtU32 { src0, src1 } |
@@ -704,8 +800,28 @@ impl Op {
             Op::WaveReduceAddF32 { val, tmp } => vec![*val, *tmp],
             Op::WaveReduceMaxF32 { val, tmp } => vec![*val, *tmp],
 
-            // Raw asm (unknown, assume none)
-            Op::RawAsm(_) => vec![],
+            // s_setprio: scalar-only, no VReg refs
+            Op::SSetPrio(_) => vec![],
+
+            // Raw asm: parse {vN} placeholders as VReg refs (scheduler sees deps).
+            Op::RawAsm(text) => {
+                let mut refs = Vec::new();
+                let b = text.as_bytes();
+                let mut i = 0;
+                while i + 2 < b.len() {
+                    if b[i] == b'{' && b[i+1] == b'v' {
+                        let mut j = i + 2;
+                        let mut num = 0i64; let mut has = false;
+                        while j < b.len() && b[j].is_ascii_digit() { num = num * 10 + (b[j] - b'0') as i64; has = true; j += 1; }
+                        if has && j < b.len() && b[j] == b'}' { refs.push(VReg(num as u32)); i = j + 1; continue; }
+                    }
+                    i += 1;
+                }
+                refs
+            },
+            // Probe placeholder: observed refs stay alive (kept live through
+            // optimization + regalloc). Body injected post-regalloc.
+            Op::Probe { .. } => vec![],
         }
     }
 
@@ -828,7 +944,7 @@ impl Op {
 
             // ── Scalar ALU: no VGPRs ──
             Op::SAddU32 { .. } | Op::SAddcU32 { .. } | Op::SSubU32 { .. } | Op::SAndB32 { .. } |
-            Op::SMulI32 { .. } | Op::SLshlB32 { .. } | Op::SLshrB32 { .. } |
+            Op::SMulI32 { .. } | Op::SLshlB32 { .. } | Op::SLshrB32 { .. } | Op::SLshrB32SgprShift { .. } |
             Op::SMov { .. } | Op::SCmpLtU32 { .. } |
             Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } => vec![],
 
@@ -847,8 +963,8 @@ impl Op {
             Op::BranchScc0(_) | Op::BranchVccz(_) |
             Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)
             | Op::WaitKmcnt(_) |
-            Op::ClearVcc | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } |
-            Op::Endpgm | Op::SBarrier => vec![],
+            Op::ClearVcc | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } |
+            Op::Endpgm | Op::SBarrier | Op::GlobalInv => vec![],
 
             // ── Hardware ──
             Op::CaptureTgid { .. } => vec![],
@@ -923,8 +1039,22 @@ impl Op {
             // ── Performance counters ──
             Op::ReadShaderCycles { .. } => vec![],
 
-            // ── Raw asm ──
-            Op::RawAsm(_) => vec![],
+            // s_setprio: scalar-only, no VReg uses
+            Op::SSetPrio(_) => vec![],
+
+            // Raw asm: first {vN} is a def (v_add dst) so DCE keeps it live.
+            Op::RawAsm(text) => {
+                if let Some(start) = text.find("{v") {
+                    let rest = &text[start+2..];
+                    let end = rest.find('}').unwrap_or(0);
+                    if end > 0 {
+                        if let Ok(n) = rest[..end].trim().parse::<u32>() { return vec![VReg(n)]; }
+                    }
+                }
+                vec![]
+            },
+            // Probe placeholder: no VReg defs (body injected post-regalloc).
+            Op::Probe { .. } => vec![],
         }
     }
 
@@ -935,11 +1065,11 @@ impl Op {
             Op::SAddU32 { dst, .. } | Op::SAddcU32 { dst, .. } |
             Op::SSubU32 { dst, .. } | Op::SAndB32 { dst, .. } |
             Op::SMulI32 { dst, .. } | Op::SLshlB32 { dst, .. } |
-            Op::SLshrB32 { dst, .. } | Op::SMov { dst, .. } => vec![*dst],
+            Op::SLshrB32 { dst, .. } | Op::SLshrB32SgprShift { dst, .. } | Op::SMov { dst, .. } => vec![*dst],
             Op::SaveExec { dst, .. } => vec![*dst],
             Op::CaptureTgid { dst, .. } => vec![*dst],
             Op::VReadfirstlane { dst, .. } => vec![*dst],
-            Op::SMemLoadDword { dst, .. } => vec![*dst],
+            Op::SMemLoadDword { dst, .. } | Op::SMemLoadDwordx2 { dst, .. } | Op::SMemLoadDwordx4 { dst, .. } => vec![*dst],
             // ScalarLoad defines dst..dst+N depending on width
             Op::ScalarLoad { dst, width, .. } => {
                 let n = width.vreg_count(); // reuse count logic
@@ -975,6 +1105,7 @@ impl Op {
             }
             Op::SMulI32 { src0, src1, .. } => vec![*src0, *src1],
             Op::SLshlB32 { src, .. } | Op::SLshrB32 { src, .. } => vec![*src],
+            Op::SLshrB32SgprShift { src, shift_src, .. } => vec![*src, *shift_src],
             Op::SMov { src, .. } => {
                 if let SOperand::SReg(s) = src { vec![*s] } else { vec![] }
             }
@@ -994,7 +1125,7 @@ impl Op {
             Op::SMovToVcc { src } => vec![*src],
             // ScalarLoad uses base pair
             Op::ScalarLoad { base, .. } => vec![SReg(base.0), SReg(base.0 + 1)],
-            Op::SMemLoadDword { base_lo, base_hi, .. } => vec![*base_lo, *base_hi],
+            Op::SMemLoadDword { base_lo, base_hi, .. } | Op::SMemLoadDwordx2 { base_lo, base_hi, .. } | Op::SMemLoadDwordx4 { base_lo, base_hi, .. } => vec![*base_lo, *base_hi],
             _ => vec![],
         }
     }
@@ -1022,12 +1153,15 @@ impl Op {
             // Control flow and sync
             Op::Label(_) | Op::BranchScc1(_) | Op::BranchScc0(_) |
             Op::Branch(_) | Op::BranchVccz(_) |
-            Op::Barrier | Op::SBarrier |
+            Op::Barrier | Op::SBarrier | Op::GlobalInv |
             Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
             Op::WaitKmcnt(_) |
             Op::ClearVcc | Op::SMovToVcc { .. } |
             Op::SaveExec { .. } | Op::RestoreExec { .. } | Op::XorExec { .. } |
             Op::Endpgm | Op::RawAsm(_) |
+            // Probe placeholder: must be preserved (has side effect: writes
+            // probe buffer post-regalloc). Not removed by DCE/optimization.
+            Op::Probe { .. } |
             // VCC-writing comparisons (affect cndmask, branches)
             Op::VCmpLtU32 { .. } | Op::VCmpGeU32 { .. } |
             Op::VCmpGtF32Imm0 { .. } | Op::VCmpGtU32Imm { .. } |
@@ -1035,10 +1169,10 @@ impl Op {
             // SCC-writing comparisons
             Op::SCmpLtU32 { .. } | Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } |
             // Scalar ops (affect SCC, manage state)
-            Op::CaptureTgid { .. } | Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } |
+            Op::CaptureTgid { .. } | Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } |
             Op::SAddU32 { .. } | Op::SAddcU32 { .. } | Op::SSubU32 { .. } |
             Op::SAndB32 { .. } | Op::SMulI32 { .. } | Op::SLshlB32 { .. } |
-            Op::SLshrB32 { .. } | Op::SMov { .. } |
+            Op::SLshrB32 { .. } | Op::SLshrB32SgprShift { .. } | Op::SMov { .. } |
             Op::VReadfirstlane { .. } |
             // WMMA (complex multi-register side effects)
             Op::Wmma { .. } |
@@ -1052,13 +1186,111 @@ impl Op {
             // VCC-reading ops (depend on implicit VCC state)
             Op::VCndmaskB32 { .. } |
             // bf16 pack (multi-instruction expansion, should not be removed)
-            Op::CvtPkBf16F32 { .. }
+            Op::CvtPkBf16F32 { .. } |
+            // s_setprio: hardware scheduling priority (must not be removed)
+            Op::SSetPrio(_)
         )
     }
 
     /// Is this a pure VALU instruction with no side effects?
     pub fn is_pure_valu(&self) -> bool {
         !self.vreg_defs().is_empty() && !self.has_side_effects()
+    }
+
+    // ── Interface-driven metadata (trait-like classification) ──
+    //
+    // These methods provide a stable semantic API for opt_passes, ssa_ir,
+    // and the instruction scheduler. When a new Op variant is added, only
+    // these methods need updating — the passes themselves stay unchanged.
+
+    /// Is this a memory operation (load, store, or atomic)?
+    pub fn is_memory_op(&self) -> bool {
+        matches!(self,
+            Op::GlobalLoad { .. } | Op::GlobalStore { .. } |
+            Op::BufferLoad { .. } | Op::BufferStore { .. } |
+            Op::LdsLoad { .. } | Op::LdsStore { .. } |
+            Op::ScalarLoad { .. } |
+            Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } |
+            Op::DsStoreB16 { .. } | Op::DsStoreB32 { .. } |
+            Op::DsStoreB64 { .. } | Op::DsStoreB128 { .. } |
+            Op::DsLoadB32 { .. } | Op::DsLoadB64 { .. } | Op::DsLoadB128 { .. } |
+            Op::DsLoadU16 { .. } | Op::DsLoadU16D16 { .. } | Op::DsLoadU16D16Hi { .. } |
+            Op::GlobalAtomicAddF32 { .. } | Op::GlobalAtomicAddU32Rtn { .. }
+        )
+    }
+
+    /// Is this a memory load (reads from memory)?
+    pub fn is_load(&self) -> bool {
+        matches!(self,
+            Op::GlobalLoad { .. } | Op::BufferLoad { .. } | Op::LdsLoad { .. } |
+            Op::ScalarLoad { .. } |
+            Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } |
+            Op::DsLoadB32 { .. } | Op::DsLoadB64 { .. } | Op::DsLoadB128 { .. } |
+            Op::DsLoadU16 { .. } | Op::DsLoadU16D16 { .. } | Op::DsLoadU16D16Hi { .. } |
+            Op::GlobalAtomicAddU32Rtn { .. }  // returns old value
+        )
+    }
+
+    /// Is this a memory store (writes to memory)?
+    pub fn is_store(&self) -> bool {
+        matches!(self,
+            Op::GlobalStore { .. } | Op::BufferStore { .. } | Op::LdsStore { .. } |
+            Op::DsStoreB16 { .. } | Op::DsStoreB32 { .. } |
+            Op::DsStoreB64 { .. } | Op::DsStoreB128 { .. } |
+            Op::GlobalAtomicAddF32 { .. }  // fire-and-forget atomic write
+        )
+    }
+
+    /// Is this a barrier or synchronization instruction?
+    pub fn is_barrier(&self) -> bool {
+        matches!(self, Op::Barrier | Op::SBarrier | Op::GlobalInv)
+    }
+
+    /// Is this a waitcnt instruction?
+    pub fn is_wait(&self) -> bool {
+        matches!(self,
+            Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) | Op::WaitKmcnt(_)
+        )
+    }
+
+    /// Is this a control flow instruction (branch, label, endpgm)?
+    pub fn is_control_flow(&self) -> bool {
+        matches!(self,
+            Op::Label(_) | Op::Branch(_) |
+            Op::BranchScc0(_) | Op::BranchScc1(_) | Op::BranchVccz(_) |
+            Op::Endpgm
+        )
+    }
+
+    /// Is this a branch instruction (excludes labels, which are markers)?
+    pub fn is_branch(&self) -> bool {
+        matches!(self,
+            Op::Branch(_) | Op::BranchScc0(_) | Op::BranchScc1(_) | Op::BranchVccz(_)
+        )
+    }
+
+    /// Is this a WMMA (matrix) instruction?
+    pub fn is_wmma(&self) -> bool {
+        matches!(self, Op::Wmma { .. })
+    }
+
+    /// Does this op access LDS (Local Data Share)?
+    pub fn is_lds_op(&self) -> bool {
+        matches!(self,
+            Op::LdsLoad { .. } | Op::LdsStore { .. } |
+            Op::DsStoreB16 { .. } | Op::DsStoreB32 { .. } |
+            Op::DsStoreB64 { .. } | Op::DsStoreB128 { .. } |
+            Op::DsLoadB32 { .. } | Op::DsLoadB64 { .. } | Op::DsLoadB128 { .. } |
+            Op::DsLoadU16 { .. } | Op::DsLoadU16D16 { .. } | Op::DsLoadU16D16Hi { .. } |
+            Op::DsSwizzle { .. }
+        )
+    }
+
+    /// Should this op prevent loop unrolling / software pipelining?
+    /// Returns true for barriers, WMMA, nested control flow.
+    pub fn is_unsafe_for_loop_opt(&self) -> bool {
+        self.is_barrier() || self.is_wmma() || self.is_branch()
+            || matches!(self, Op::Label(_) | Op::Endpgm)
     }
 
     // ── Implicit state (VCC / SCC) dependency tracking ──
@@ -1103,7 +1335,7 @@ impl Op {
             // Scalar arithmetic → SCC (carry/borrow)
             Op::SAddU32 { .. } | Op::SSubU32 { .. } | Op::SAddcU32 { .. } |
             Op::SAndB32 { .. } | Op::SMulI32 { .. } |
-            Op::SLshlB32 { .. } | Op::SLshrB32 { .. } |
+            Op::SLshlB32 { .. } | Op::SLshrB32 { .. } | Op::SLshrB32SgprShift { .. } |
             // Scalar comparisons → SCC
             Op::SCmpLtU32 { .. } | Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. }
         )
@@ -1160,6 +1392,7 @@ pub struct VRegAlloc {
     pub vreg: VReg,
     pub count: u32,        // number of consecutive registers (1, 2, 4, 8)
     pub alignment: Alignment,
+    pub class: RegClass,
 }
 
 #[derive(Clone, Debug)]
@@ -1167,4 +1400,110 @@ pub struct SRegAlloc {
     pub sreg: SReg,
     pub count: u32,
     pub alignment: Alignment,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_memory_op() {
+        assert!(Op::GlobalLoad { dst: VReg(0), addr: VReg(1), width: Width::B32, offset: 0 }.is_memory_op());
+        assert!(Op::GlobalStore { addr: VReg(0), src: VReg(1), width: Width::B32, offset: 0 }.is_memory_op());
+        assert!(Op::BufferLoad { dst: VReg(0), voffset: VReg(1), srsrc: SReg(0), width: Width::B128, offset: 0, soffset: SOFFSET_ZERO }.is_memory_op());
+        assert!(Op::BufferStore { voffset: VReg(0), src: VReg(1), srsrc: SReg(0), width: Width::B32, offset: 0, soffset: SOFFSET_ZERO }.is_memory_op());
+        assert!(Op::LdsLoad { dst: VReg(0), addr: VReg(1), width: Width::B32, offset: 0 }.is_memory_op());
+        assert!(Op::LdsStore { addr: VReg(0), src: VReg(1), width: Width::B32, offset: 0 }.is_memory_op());
+        assert!(Op::DsLoadB128 { dst: VReg(0), vaddr: VReg(1), offset: 0 }.is_memory_op());
+        assert!(Op::DsStoreB128 { vaddr: VReg(0), src: VReg(1), offset: 0 }.is_memory_op());
+        assert!(Op::GlobalAtomicAddF32 { addr: VReg(0), src: VReg(1), offset: 0 }.is_memory_op());
+        assert!(Op::GlobalAtomicAddU32Rtn { dst: VReg(0), addr: VReg(1), src: VReg(2) }.is_memory_op());
+        // Non-memory ops
+        assert!(!Op::VAddF32 { dst: VReg(0), src0: Operand::VReg(VReg(1)), src1: Operand::VReg(VReg(2)) }.is_memory_op());
+        assert!(!Op::Wmma { dst: VReg(0), a: VReg(8), b: VReg(16), c: VReg(0), format: WmmaFormat::F16_F32, ab_width: 4, sparse_idx: None }.is_memory_op());
+    }
+
+    #[test]
+    fn test_is_load_store() {
+        assert!(Op::GlobalLoad { dst: VReg(0), addr: VReg(1), width: Width::B32, offset: 0 }.is_load());
+        assert!(!Op::GlobalLoad { dst: VReg(0), addr: VReg(1), width: Width::B32, offset: 0 }.is_store());
+
+        assert!(Op::GlobalStore { addr: VReg(0), src: VReg(1), width: Width::B32, offset: 0 }.is_store());
+        assert!(!Op::GlobalStore { addr: VReg(0), src: VReg(1), width: Width::B32, offset: 0 }.is_load());
+
+        // Atomic rtn is both load (returns value) and memory
+        assert!(Op::GlobalAtomicAddU32Rtn { dst: VReg(0), addr: VReg(1), src: VReg(2) }.is_load());
+        // Atomic f32 nortn is store (fire-and-forget)
+        assert!(Op::GlobalAtomicAddF32 { addr: VReg(0), src: VReg(1), offset: 0 }.is_store());
+    }
+
+    #[test]
+    fn test_is_barrier_wait() {
+        assert!(Op::Barrier.is_barrier());
+        assert!(Op::SBarrier.is_barrier());
+        assert!(!Op::WaitVmcnt(0).is_barrier());
+        assert!(Op::WaitVmcnt(0).is_wait());
+        assert!(Op::WaitLgkmcnt(0).is_wait());
+        assert!(Op::WaitVscnt(0).is_wait());
+        assert!(Op::WaitKmcnt(0).is_wait());
+        assert!(!Op::Barrier.is_wait());
+    }
+
+    #[test]
+    fn test_is_control_flow() {
+        assert!(Op::Label("x".into()).is_control_flow());
+        assert!(Op::Branch("x".into()).is_control_flow());
+        assert!(Op::BranchScc1("x".into()).is_control_flow());
+        assert!(Op::BranchScc0("x".into()).is_control_flow());
+        assert!(Op::BranchVccz("x".into()).is_control_flow());
+        assert!(Op::Endpgm.is_control_flow());
+        assert!(!Op::Barrier.is_control_flow());
+        // is_branch excludes labels
+        assert!(Op::Branch("x".into()).is_branch());
+        assert!(!Op::Label("x".into()).is_branch());
+    }
+
+    #[test]
+    fn test_is_wmma() {
+        assert!(Op::Wmma { dst: VReg(0), a: VReg(8), b: VReg(16), c: VReg(0), format: WmmaFormat::F16_F32, ab_width: 4, sparse_idx: None }.is_wmma());
+        assert!(!Op::VAddF32 { dst: VReg(0), src0: Operand::VReg(VReg(1)), src1: Operand::VReg(VReg(2)) }.is_wmma());
+    }
+
+    #[test]
+    fn test_is_lds_op() {
+        assert!(Op::LdsLoad { dst: VReg(0), addr: VReg(1), width: Width::B32, offset: 0 }.is_lds_op());
+        assert!(Op::LdsStore { addr: VReg(0), src: VReg(1), width: Width::B32, offset: 0 }.is_lds_op());
+        assert!(Op::DsLoadB128 { dst: VReg(0), vaddr: VReg(1), offset: 0 }.is_lds_op());
+        assert!(Op::DsSwizzle { dst: VReg(0), src: VReg(1), offset: 0x401F }.is_lds_op());
+        assert!(!Op::GlobalLoad { dst: VReg(0), addr: VReg(1), width: Width::B32, offset: 0 }.is_lds_op());
+    }
+
+    #[test]
+    fn test_is_unsafe_for_loop_opt() {
+        assert!(Op::Barrier.is_unsafe_for_loop_opt());
+        assert!(Op::SBarrier.is_unsafe_for_loop_opt());
+        assert!(Op::Wmma { dst: VReg(0), a: VReg(8), b: VReg(16), c: VReg(0), format: WmmaFormat::F16_F32, ab_width: 4, sparse_idx: None }.is_unsafe_for_loop_opt());
+        assert!(Op::Branch("x".into()).is_unsafe_for_loop_opt());
+        assert!(Op::Endpgm.is_unsafe_for_loop_opt());
+        assert!(!Op::VAddF32 { dst: VReg(0), src0: Operand::VReg(VReg(1)), src1: Operand::VReg(VReg(2)) }.is_unsafe_for_loop_opt());
+    }
+
+    #[test]
+    fn test_implicit_state() {
+        // VCC writers
+        assert!(Op::VCmpLtU32 { src0: Operand::VReg(VReg(0)), src1: Operand::VReg(VReg(1)) }.writes_vcc());
+        assert!(Op::VAddCo { dst: VReg(0), src0: VReg(1), src1: VReg(2) }.writes_vcc());
+        assert!(Op::ClearVcc.writes_vcc());
+        // VCC readers
+        assert!(Op::VCndmaskB32 { dst: VReg(0), src_false: Operand::VReg(VReg(1)), src_true: Operand::VReg(VReg(2)) }.reads_vcc());
+        assert!(Op::VAddCoCi { dst: VReg(0), src: VReg(1) }.reads_vcc());
+        // SCC writers
+        assert!(Op::SCmpLtU32 { src0: SReg(0), src1: SReg(1) }.writes_scc());
+        assert!(Op::SAddU32 { dst: SReg(0), src0: SReg(1), src1: SOperand::SReg(SReg(2)) }.writes_scc());
+        // SCC readers
+        assert!(Op::SAddcU32 { dst: SReg(0), src0: SReg(1), src1: SOperand::SReg(SReg(2)) }.reads_scc());
+        assert!(Op::BranchScc1("x".into()).reads_scc());
+        // Pure ALU should not touch implicit state
+        assert!(!Op::VAddF32 { dst: VReg(0), src0: Operand::VReg(VReg(1)), src1: Operand::VReg(VReg(2)) }.touches_implicit_state());
+    }
 }
