@@ -175,3 +175,15 @@ T0_NO_KSUB_ADDRWAIT=1 C_DISPATCH=aql C_K=32 C_GRID=128 C_RAND=1 target/debug/exa
 - 修复前：Y56=[99,99,99,99]（哨兵，行 56-127 未写），FULLCHECK=4568
 - 修复后：Y56=[-174,58,30,-167]（已写），FULLCHECK=6059（行分配基本覆盖但值仍错）
 - **待对齐**：1456 行 s_wave_x_off（A 片段读偏移，现用 rows_per_wave=8）与 Y 行（32）匹配；3416 行 lane_half*8 双重偏移核对
+
+### 5.10 readfirstlane 垃圾根因定位（2026-08-31）
+
+**问题**：persistent atomic 认领的 readfirstlane 返回 0x3F800000 垃圾（wave-id readfirstlane 正常）。
+
+**最小重现**（mini kernel，64 lane + atomicAdd counter + readfirstlane）：
+- P=0（无 VGPR 压力）也返回 0x3F800000——**与 VGPR 压力无关**（推翻原注释"高 VGPR 压力交互"假设）
+- **根因：GlobalAtomicAddU32Rtn 返回值未等待（缺 wait_vmcnt）**——v_ret 读到旧值（1.0f 位模式残留）
+- 修复：原子后 `wait_vmcnt(0)` → readfirstlane 从 0x3F800000 → **0（正确）**
+
+**意义**：persistent 多 WG atomic 认领的主要障碍（readfirstlane 垃圾）根因已定位并可修；
+剩余障碍：MES 调度 ≥4WG 限制、2-WG LDS 隔离（需单独评估）。
