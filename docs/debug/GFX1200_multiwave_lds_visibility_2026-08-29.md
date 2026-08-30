@@ -187,3 +187,19 @@ T0_NO_KSUB_ADDRWAIT=1 C_DISPATCH=aql C_K=32 C_GRID=128 C_RAND=1 target/debug/exa
 
 **意义**：persistent 多 WG atomic 认领的主要障碍（readfirstlane 垃圾）根因已定位并可修；
 剩余障碍：MES 调度 ≥4WG 限制、2-WG LDS 隔离（需单独评估）。
+
+### 5.11 128×128 VGPR 溢出根因（架构缺陷，非硬件限制）
+
+**根因**：`tile_128x128_k32` acc 全量驻留寄存器（2 行块 × 8 列块 × 8 VGPR = 128 VGPR/lane）
++ frag_a 双缓冲（double_buffer=true）+ wgp 地址开销 → 虚拟 VReg > 256 → regalloc panic。
+
+**实验**：acc_swap=true + double_buffer=false → **255/256（只差 1 个 VGPR）**——方向有效。
+
+**对比 ROCm 成熟实现**：
+- **triton**：128×128 fp32 acc = 64KB 寄存器——用 subtiling（按 N 拆分 tmem_load）+ 延迟物化降压力
+- **composable_kernel**：gfx1200 128×128 WaveTile 16×16 用显式 **reg_spill**（溢出到 LDS）
+- **vLLM PR#52056**：RDNA 上 128×128 fp32 acc 占一半寄存器——需分段
+- **8-wave 方案**：wg_size=256（8 wave × 每 wave 16 行）→ acc 减半（64 VGPR）
+
+**结论**：128×128 可行（CK 有 gfx1200 实现）——需 acc 分段/reg_spill/8-wave 架构改造；
+当前 acc_swap+关双缓冲已到 255/256，再省 1+ VGPR（frag_b 逐列复用或 8-wave）即过。

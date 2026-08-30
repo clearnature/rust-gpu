@@ -286,6 +286,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+
             epilogue: vec![],
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
