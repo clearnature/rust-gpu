@@ -203,3 +203,19 @@ T0_NO_KSUB_ADDRWAIT=1 C_DISPATCH=aql C_K=32 C_GRID=128 C_RAND=1 target/debug/exa
 
 **结论**：128×128 可行（CK 有 gfx1200 实现）——需 acc 分段/reg_spill/8-wave 架构改造；
 当前 acc_swap+关双缓冲已到 255/256，再省 1+ VGPR（frag_b 逐列复用或 8-wave）即过。
+
+### 5.12 128×128 修复进展（2026-08-31 第二轮：8-wave 实验 + 4-wave 差 1 分析）
+
+**方向 1（frag_b 逐列复用）验证结论**：128×128 已 `use_streaming`（n_col_tiles=8>4 → frag_b 只 8 VGPR ping-pong）——frag_b 逐列对 128×128 **无增量**；瓶颈是 acc（128 VGPR 全量驻留）+ 固定开销。
+
+**方向 2（8-wave）实验**：TileGemm 加 `waves_per_wg: Option<u32>` 字段（n_waves override），
+tile_128x128_* 设 Some(8)（wg_size=256，每 wave 16 行，acc 数学减半 128→64 VGPR）：
+- ✅ **编译通过**（VGPR 降到 256 内）——x_batch_loads 自动适配 wg_size，1291 行 wave_off 改用 wave_row_span
+- ❌ **GPU hang**（test_lower_gemm_128x128_swap_correctness 5s timeout）——wavepart 的
+  x_rows_per_pass/stride/LDS 布局等适配未全（8-wave 每 wave 16 行 X vs 4-wave 32 行的差异）
+
+**方向 A（4-wave 省 1）实验**：acc_swap=true + double_buffer=false → **255/256（差 1）**；
+wgp_mode=false 无帮助；frag_b_shared（pong）省 4 VGPR 但 ping-pong 结构耦合深（需改函数内流水逻辑）。
+
+**结论**：128×128 编译的最近路径是"省 1 个普通 VGPR"（4-wave，正确性已验证）或"修 8-wave hang"
+（wavepart 适配）。均已回退实验配置，字段/等价改动保留。下一步：VReg 分配统计精确定位可省的 1 个。

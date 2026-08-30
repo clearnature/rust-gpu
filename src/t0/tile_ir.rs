@@ -133,6 +133,10 @@ pub struct TileGemm {
     pub epilogue: Vec<EpilogueOp>,
     /// Persistent kernel mode: single workgroup processes all N-tiles in a loop.
     pub persistent: bool,
+    /// Waves per workgroup override (None = tile_m/32). 8-wave (wg_size=256)
+    /// halves per-wave acc VGPR for 128×128 tiles (AMD ROCm 8-wave pattern:
+    /// register budget per wave halves, hardware scheduler hides latency).
+    pub waves_per_wg: Option<u32>,
     /// WMMA data format: controls which matrix multiply instruction is emitted.
     /// Default BF16_F32 (bf16 inputs, f32 accumulator). Other formats support
     /// FP16, INT8, INT4, FP8, BF8 — see WmmaFormat enum.
@@ -153,6 +157,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -167,6 +172,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -181,6 +187,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -195,6 +202,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -209,6 +217,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -223,6 +232,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -239,6 +249,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -253,6 +264,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -269,6 +281,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -287,7 +300,9 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
 
+
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -304,6 +319,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -320,6 +336,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: true,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -337,6 +354,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: true,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -355,6 +373,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -373,6 +392,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -392,6 +412,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -409,6 +430,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -432,6 +454,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -446,6 +469,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -460,6 +484,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -474,6 +499,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -488,6 +514,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -502,6 +529,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: false,
         }
@@ -524,6 +552,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: true,
         }
@@ -547,6 +576,7 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: false,  // GPU hung even with wait_kmcnt(0) — deeper LDS addr debug needed instead of wait_lgkmcnt(0) in emit_acc_swap
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: true,
         }
@@ -565,13 +595,14 @@ impl TileGemm {
             transpose: TileTranspose::NT,
             acc_swap: true,
             epilogue: vec![],
+            waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
             persistent: true,
         }
     }
 
-    /// Number of waves per workgroup = tile_m / 32
-    pub fn n_waves(&self) -> u32 { self.tile_m / 32 }
+    /// Number of waves per workgroup = tile_m / 32 (or waves_per_wg override)
+    pub fn n_waves(&self) -> u32 { self.waves_per_wg.unwrap_or(self.tile_m / 32) }
 
     /// Workgroup size in threads
     pub fn wg_size(&self) -> u32 { self.n_waves() * 32 }
@@ -1305,7 +1336,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
         k.v_and_b32_imm(lane_t, tid, 31);
         let wave_off = k.alloc_vreg();
         k.push(Op::VAddU32 { dst: wave_off, src0: Operand::VReg(wave_id), src1: Operand::InlineInt(0) });
-        k.v_lshlrev_b32(wave_off, 5, wave_off); // wave_id * 32
+        // P2 (2026-08-31): 8-wave (waves_per_wg=8, wg_size=256) 时每 wave 16 行 —
+        // 用 wave_row_span 而非硬编码 32 (4-wave 时 wave_row_span=32 不变)。
+        k.v_lshlrev_b32(wave_off, wave_row_span.trailing_zeros() as u8, wave_off);
         k.v_lshrrev_b32(x_row_in_tile, x_cpr_shift, lane_t);
         k.v_add_u32(x_row_in_tile, x_row_in_tile, wave_off);
     } else {
