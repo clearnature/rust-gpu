@@ -575,7 +575,15 @@ impl AsmEmitter {
             Op::SAddU32 { dst, src0, src1 } => {
                 let sd = a.phys_s(*dst);
                 let s0 = a.phys_s(*src0);
-                writeln!(self.buf, "{}s_add_u32 s{}, s{}, {}", self.indent, sd, s0, soperand_str(src1, a)).unwrap();
+                // 2026-08-30: RDNA4 手册（§7 指令表）32 位标量加只有 S_ADD_CO_*
+                // 变体（写 SCC，D=S0+S1, SCC=carry/overflow）。s_add_u32 依赖汇编器
+                // 兼容映射；显式用 s_add_co_u32 与 LLVM gfx1200（s_add_co_i32）对齐，
+                // 确保后续 SAddcU32（64 位链）的进位依赖正确。
+                if self.target == Target::GFX1200 {
+                    writeln!(self.buf, "{}s_add_co_u32 s{}, s{}, {}", self.indent, sd, s0, soperand_str(src1, a)).unwrap();
+                } else {
+                    writeln!(self.buf, "{}s_add_u32 s{}, s{}, {}", self.indent, sd, s0, soperand_str(src1, a)).unwrap();
+                }
             }
             Op::SAddcU32 { dst, src0, src1 } => {
                 let sd = a.phys_s(*dst);
