@@ -44,6 +44,29 @@ struct TargetCaps {
     scalar_add: &'static str,
     /// 内存等待指令形式（RDNA4 拆分 loadcnt/dscnt/kmcnt/storecnt）
     waitcnt: WaitcntForm,
+    /// VOP3 inline 常数 0 编码 bug（RDNA4 汇编器误编码 → 用 s63 零寄存器）
+    vop3_inline_zero_bug: bool,
+    /// MUBUF soffset 必须 SGPR（RDNA4 不能立即数 → 保留 s63 零寄存器）
+    soffset_sgpr_only: bool,
+    /// s_delay_alu 可用性（RDNA4 禁用——指令导致 VCC 进位链错误）
+    delay_alu_ok: bool,
+    /// VMEM 指令形式（RDNA4 flat_* 无 off；RDNA3 global_* 带 off）
+    vmem: VmemForm,
+    /// EXEC 全置 1 指令（RDNA4 无 s_setexeclo → s_mov exec_lo, -1）
+    exec_set: &'static str,
+    /// 原子指令带 th 字段（RDNA4 新增 traveling-helper）
+    atomic_th: bool,
+    /// ComputeGlobalIdX 单 WG workaround（RDNA4 旧实现读 s2 垃圾 → 用 v0）
+    /// TODO(ttmp): 修复后应从 ttmp9 读 TGID.x 计算 global_id（多 WG 正确）
+    tgid_single_wg: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum VmemForm {
+    /// RDNA4：flat_load/flat_store（无 off 关键字）
+    Flat,
+    /// RDNA3：global_load/global_store（带 off）
+    Global,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -76,6 +99,13 @@ static GFX1200_CAPS: TargetCaps = TargetCaps {
     barrier: BarrierForm::SignalWait,
     scalar_add: "s_add_co_u32",
     waitcnt: WaitcntForm::Split,
+    vop3_inline_zero_bug: true,
+    soffset_sgpr_only: true,
+    delay_alu_ok: false,
+    vmem: VmemForm::Flat,
+    exec_set: "s_mov_b32 exec_lo, -1",
+    atomic_th: true,
+    tgid_single_wg: true,
 };
 
 /// GFX1100 (RDNA3)——LLVM gfx1100 代码生成对照。
@@ -84,6 +114,13 @@ static GFX1100_CAPS: TargetCaps = TargetCaps {
     barrier: BarrierForm::SBarrier,
     scalar_add: "s_add_u32",
     waitcnt: WaitcntForm::Unified,
+    vop3_inline_zero_bug: false,
+    soffset_sgpr_only: false,
+    delay_alu_ok: true,
+    vmem: VmemForm::Global,
+    exec_set: "s_setexeclo_b32 -1",
+    atomic_th: false,
+    tgid_single_wg: false,
 };
 
 impl AsmEmitter {
@@ -116,7 +153,7 @@ impl AsmEmitter {
     /// GFX1200 workaround: return literal constant as VGPR reference (avoiding VOP3 encoding bug).
     /// On non-GFX1200 targets, returns the literal value as a string.
     fn gfx12_lit(&self, val: i64) -> String {
-        if self.target == Target::GFX1200 && val == 0 {
+        if self.caps().vop3_inline_zero_bug && val == 0 {
             "s63".to_string()
         } else {
             format!("{}", val)
@@ -148,7 +185,7 @@ impl AsmEmitter {
 
         // GFX1200: MUBUF soffset must be an SGPR, not an immediate literal.
         // Reserve s63 as a dedicated zero register for buffer instructions.
-        if target == Target::GFX1200 {
+        if self.caps().soffset_sgpr_only {
             writeln!(self.buf, "  s_mov_b32 s63, 0").unwrap();
         }
 
@@ -173,8 +210,9 @@ impl AsmEmitter {
         writeln!(self.buf, "  .amdhsa_user_sgpr_kernarg_segment_ptr 1").unwrap();
         let vgpr_count = alloc.total_vgprs;
         writeln!(self.buf, "  .amdhsa_next_free_vgpr {}", vgpr_count).unwrap();
-        // GFX1200: s63 is reserved as zero register for MUBUF soffset
-        let sgpr_count = if target == Target::GFX1200 {
+        // GFX1200: s63 is reserved as zero register for MUBUF soffset (caps.soffset_sgpr_only)
+        // GFX1200 保留 s63（soffset 零寄存器）→ 声明至少 64 个 SGPR
+        let sgpr_count = if self.caps().soffset_sgpr_only {
             alloc.total_sgprs.max(64)
         } else {
             alloc.total_sgprs
@@ -282,7 +320,7 @@ impl AsmEmitter {
             // can cause stale VCC reads → wrong addresses → flat_load returns 0.
             // ISA manual confirms s_delay_alu is optional (performance only).
             if is_valu && !std::env::var("T0_SKIP_DELAY_ALU").is_ok()
-                && self.target != Target::GFX1200 {
+                && self.caps().delay_alu_ok {
                 // Check VGPR read dependencies
                 // Track the FARTHEST VALU dependency (largest distance).
                 // s_delay_alu VALU_DEP_N waits for the Nth previous VALU,
@@ -359,24 +397,23 @@ impl AsmEmitter {
                 // GFX1200: use flat_load (FLAT format) instead of global_load (VGLOBAL format).
                 // global_load on GFX1200 reads stale data from L2 cache.
                 // flat_load bypasses L2 and reads correct data.
-                let instr = if self.target == Target::GFX1200 {
-                    match width {
+                let instr = match self.caps().vmem {
+                    VmemForm::Flat => match width {
                         Width::B16 => "flat_load_u16",
                         Width::B32 => "flat_load_b32",
                         Width::B64 => "flat_load_b64",
                         Width::B128 => "flat_load_b128",
-                    }
-                } else {
-                    match width {
+                    },
+                    VmemForm::Global => match width {
                         Width::B16 => "global_load_u16",
                         Width::B32 => "global_load_b32",
                         Width::B64 => "global_load_b64",
                         Width::B128 => "global_load_b128",
-                    }
+                    },
                 };
                 let dst_str = vreg_range_str(vd, width.vreg_count());
                 let addr_str = format!("v[{}:{}]", va, va + 1);
-                if self.target == Target::GFX1200 {
+                if self.caps().vmem == VmemForm::Flat {
                     // flat_load doesn't use 'off' keyword
                     writeln!(self.buf, "{}{} {}, {}", self.indent, instr, dst_str, addr_str).unwrap();
                 } else if *offset == 0 {
@@ -400,7 +437,7 @@ impl AsmEmitter {
                 let dst_str = vreg_range_str(vd, width.vreg_count());
                 // GFX1200: MUBUF soffset must be SGPR, not immediate literal
                 let soff_str = if *soffset == SOFFSET_ZERO {
-                    if self.target == Target::GFX1200 {
+                    if self.caps().soffset_sgpr_only {
                         "s63".to_string()
                     } else {
                         "0".to_string()
@@ -431,7 +468,7 @@ impl AsmEmitter {
                 let src_str = vreg_range_str(vs, width.vreg_count());
                 // GFX1200: MUBUF soffset must be SGPR, not immediate literal
                 let soff_str = if *soffset == SOFFSET_ZERO {
-                    if self.target == Target::GFX1200 {
+                    if self.caps().soffset_sgpr_only {
                         "s63".to_string()
                     } else {
                         "0".to_string()
@@ -453,24 +490,23 @@ impl AsmEmitter {
                 let va = a.phys_v(*addr);
                 let vs = a.phys_v(*src);
                 // GFX1200: use flat_store (FLAT format) for consistency with flat_load.
-                let instr = if self.target == Target::GFX1200 {
-                    match width {
+                let instr = match self.caps().vmem {
+                    VmemForm::Flat => match width {
                         Width::B16 => "flat_store_b16",
                         Width::B32 => "flat_store_b32",
                         Width::B64 => "flat_store_b64",
                         Width::B128 => "flat_store_b128",
-                    }
-                } else {
-                    match width {
+                    },
+                    VmemForm::Global => match width {
                         Width::B16 => "global_store_b16",
                         Width::B32 => "global_store_b32",
                         Width::B64 => "global_store_b64",
                         Width::B128 => "global_store_b128",
-                    }
+                    },
                 };
                 let src_str = vreg_range_str(vs, width.vreg_count());
                 let addr_str = format!("v[{}:{}]", va, va + 1);
-                if self.target == Target::GFX1200 {
+                if self.caps().vmem == VmemForm::Flat {
                     // flat_store doesn't use 'off' keyword
                     writeln!(self.buf, "{}{} {}, {}", self.indent, instr, addr_str, src_str).unwrap();
                 } else if *offset == 0 {
@@ -572,7 +608,7 @@ impl AsmEmitter {
             }
             Op::VMov { dst, src } => {
                 let vd = a.phys_v(*dst);
-                if self.target == Target::GFX1200 {
+                if self.caps().vop3_inline_zero_bug {
                     match src {
                         Operand::InlineInt(0) | Operand::InlineFloat(0.0) => {
                             writeln!(self.buf, "{}v_mov_b32 v{}, s63", self.indent, vd).unwrap();
@@ -734,9 +770,11 @@ impl AsmEmitter {
             Op::Wmma { dst, a: va, b: vb, c: vc, format, ab_width, .. } => {
                 // GFX1200: s_setexeclo_b32 not supported, use s_mov_b32 exec_lo, -1
                 // GFX1100: s_setexeclo_b32 -1 is the correct instruction
-                match self.target {
-                    Target::GFX1200 => writeln!(self.buf, "{}s_mov_b32 exec_lo, -1", self.indent).unwrap(),
-                    Target::GFX1100 => writeln!(self.buf, "{}s_setexeclo_b32 -1", self.indent).unwrap(),
+                // RDNA4：无 s_setexeclo → s_mov exec_lo, -1；RDNA3 用 s_setexeclo_b32
+                if self.caps().exec_set == "s_mov_b32 exec_lo, -1" {
+                    writeln!(self.buf, "{}s_mov_b32 exec_lo, -1", self.indent).unwrap();
+                } else {
+                    writeln!(self.buf, "{}s_setexeclo_b32 -1", self.indent).unwrap();
                 }
                 let d = a.phys_v(*dst);
                 let pa = a.phys_v(*va);
@@ -825,12 +863,8 @@ impl AsmEmitter {
             Op::WaitLgkmcnt(n) => {
                 if self.outstanding_lgkmcnt > 0 || *n > 0 {
                     let actual = (*n as u32).min(self.outstanding_lgkmcnt);
-                    match self.target {
-                        Target::GFX1200 =>
-                            writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap(),
-                        Target::GFX1100 =>
-                            writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap(),
-                    }
+                    // 两 Target 相同（LDS/标量等待统一 s_waitcnt lgkmcnt）
+                    writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
                     self.outstanding_lgkmcnt = actual;
                     self.waits_emitted += 1;
                 } else {
@@ -921,7 +955,7 @@ impl AsmEmitter {
                 let vd = a.phys_v(*dst);
                 // s2 = TGID.x (hardware), v0 = WORKITEM_ID_X (hardware)
                 // Compute: dst = TGID.x * wg_size + v0
-                if self.target == Target::GFX1200 {
+                if self.caps().tgid_single_wg {
                     // GFX1200: TGID.x may be unreliable (bug P2).
                     // CaptureTgid already hardcoded wg_id=0, so skip the multiplication.
                     // Just use v0 directly as the global ID.
@@ -1192,16 +1226,10 @@ impl AsmEmitter {
             }
             Op::SaveExec { dst } => {
                 let sd = a.phys_s(*dst);
-                if self.target == Target::GFX1200 {
-                    // GFX1200: VCC must be re-established by v_cmp_gt_u32 before
-                    // SaveExec (64-bit address add clobbers VCC). The re-compare
-                    // path is emitted by tile_ssa_lower for masked loads/stores.
-                    writeln!(self.buf, "{}s_and_saveexec_b32 s{}, vcc_lo  // GFX1200: VCC from re-compare",
-                        self.indent, sd).unwrap();
-                } else {
-                    writeln!(self.buf, "{}s_and_saveexec_b32 s{}, vcc_lo",
-                        self.indent, sd).unwrap();
-                }
+                // GFX1200: VCC must be re-established by v_cmp_gt_u32 before SaveExec
+                // (64-bit address add clobbers VCC); re-compare emitted by tile_ssa_lower.
+                writeln!(self.buf, "{}s_and_saveexec_b32 s{}, vcc_lo",
+                    self.indent, sd).unwrap();
             }
             Op::RestoreExec { src } => {
                 let ss = a.phys_s(*src);
@@ -1275,7 +1303,7 @@ impl AsmEmitter {
                 // TH_ATOMIC_RETURN was TIMING-DEPENDENT / returns garbage — use glc.
                 // (Verified: memory write works with th:TH_ATOMIC_RETURN but the
                 //  returned value read back as random garbage → claim logic broke.)
-                if self.target == Target::GFX1200 {
+                if self.caps().atomic_th {
                     writeln!(self.buf, "{}global_atomic_add_u32 v{}, v[{}:{}], v{}, off th:TH_ATOMIC_RETURN",
                         self.indent, vd, va, va + 1, vs).unwrap();
                 } else {
@@ -1488,7 +1516,7 @@ fn operand_str(op: &Operand, a: &RegAlloc) -> String {
 /// On GFX1200, inline constant 0 in VOP3 is misinterpreted.
 /// Use s63 (SGPR zero register) instead.
 fn operand_str_gfx12(op: &Operand, a: &RegAlloc, target: Target) -> String {
-    if target == Target::GFX1200 {
+    if target == Target::GFX1200 { // vop3_inline_zero_bug（GFX1200 汇编器误编码 inline 0）
         match op {
             Operand::InlineInt(0) | Operand::InlineFloat(0.0) => "s63".to_string(),
             _ => operand_str(op, a),
