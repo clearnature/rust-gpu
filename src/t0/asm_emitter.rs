@@ -821,17 +821,29 @@ impl AsmEmitter {
             // ── Hardware register access ──
             Op::CaptureTgid { dst, axis } => {
                 let sd = a.phys_s(*dst);
-                let hw_sreg = 2 + axis;  // s2=TGID.x, s3=TGID.y, s4=TGID.z
-                // GFX1200 (RDNA4) 平台缺陷适配（勿删）：
-                //   P2 — 2-WG 网格下 MES 不写 TGID：s2/s3 读回垃圾
-                //   （探针实测 s2=0xFFFFFFFF；2026-08-30 复测 0x100000004）。
-                //   多 WG 在 GFX1200 上整体不可用（P1: ≥4 WG 死锁），
-                //   本栈采用 1-WG/persistent 策略 → 硬编码 wg_id=0 与之一致。
-                // 详见 docs/mes/AMD_BUG_REPORT_GFX1200.md P1/P2。
-                if self.target == Target::GFX1200 && (*axis == 0 || *axis == 1) {
-                    writeln!(self.buf, "{}s_mov_b32 s{}, 0  ; capture TGID.{}(GFX1200: hardcoded 0, MES P2 defect)",
-                        self.indent, sd, match axis { 0 => "x", _ => "y" }).unwrap();
+                if self.target == Target::GFX1200 {
+                    // RDNA4 (gfx1200) ABI：workgroup_id 由 MES 写入 ttmp，不在 s2/s3！
+                    // LLVM 权威映射（clang -mcpu=gfx1200 workgroup_id 探针）：
+                    //   x → ttmp9
+                    //   y → ttmp7 低 16 位
+                    //   z → ttmp7 高 16 位
+                    // 旧实现读 s2/s3/s4（GCN 老位置）→ 得到未初始化垃圾（曾误判为
+                    // "MES TGID 失效"平台缺陷，实为本实现寄存器位置错误）。
+                    match axis {
+                        0 => writeln!(self.buf, "{}s_mov_b32 s{}, ttmp9  ; workgroup_id_x", self.indent, sd).unwrap(),
+                        1 => {
+                            writeln!(self.buf, "{}s_mov_b32 s{}, ttmp7  ; workgroup_id_y (low16)", self.indent, sd).unwrap();
+                            writeln!(self.buf, "{}s_and_b32 s{}, s{}, 0xffff", self.indent, sd, sd).unwrap();
+                        }
+                        2 => {
+                            writeln!(self.buf, "{}s_mov_b32 s{}, ttmp7  ; workgroup_id_z (high16)", self.indent, sd).unwrap();
+                            writeln!(self.buf, "{}s_lshr_b32 s{}, s{}, 16", self.indent, sd, sd).unwrap();
+                        }
+                        _ => {} // axis 受 program_id() 约束 (assert axis <= 2)，不可达
+                    }
                 } else {
+                    // 老架构（GCN/RDNA1-3）：system sgpr 紧跟 kernarg（user_sgpr=2 → s2/s3/s4）
+                    let hw_sreg = 2 + axis;  // s2=TGID.x, s3=TGID.y, s4=TGID.z
                     writeln!(self.buf, "{}s_mov_b32 s{}, s{}  ; capture TGID.{}",
                         self.indent, sd, hw_sreg,
                         match axis { 0 => "x", 1 => "y", _ => "z" }).unwrap();
