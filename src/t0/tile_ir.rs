@@ -828,7 +828,15 @@ pub fn tile_auto_select(m: u32, k: u32, n: u32, transpose: TileTranspose) -> Til
         1  // K is already short, no split needed
     };
     
-    if desired_sk > 1 && k >= spec.tile_k * 2 {
+    // 2026-09-01: split_k 自动选择禁用（正确性优先）——见 docs/debug/GFX1200_memviol_hang_2026-09-01.md：
+    //   1. split_k>1 kernel 数值错误：build_kernargs 传 y_split_stride=0，所有
+    //      partition 写同一 y 区域（只保留最后 partition 的 k 段）——benchmark
+    //      不验证所以未暴露。
+    //   2. 64x64 k64 sk>1 kernel 偶发 SQ MEMVIOL 卡（vs_gemm_gen/tile_ir_benchmark
+    //      ——type 2 detail 0x00180000——时序竞态）。
+    // 机制保留：调用者可显式设 spec.split_k；tile_auto_select 恒用 sk=1。
+    let enable_auto_split_k = false;
+    if enable_auto_split_k && desired_sk > 1 && k >= spec.tile_k * 2 {
         let max_sk = k / spec.tile_k;
         let mut sk = desired_sk.min(max_sk);
         while sk > 1 && k % (spec.tile_k * sk) != 0 {
