@@ -870,13 +870,16 @@ impl AsmEmitter {
                     // 注意：不能同时发 s_wait_kmcnt（标量计数悬空时死锁，实测 GPU hang）。
                     match self.caps().waitcnt {
                         WaitcntForm::Split => {
-                            // 2026-08-30 深查结论：s_wait_dscnt 在 T0 生成的 ELF 上下文无条件死锁
-                            // （无 ds 操作/有 ds、operand 0/63、soffset_sgpr_only 开关均 hang；
-                            //  LLVM 编译的同指令 kernel 在 T0 runtime 正常）——差异在 T0 ELF
-                            //  的元数据/指令序列，next_free_sgpr 已排除。保持 s_waitcnt
-                            //  lgkmcnt（RDNA4 S_WAITCNT operand 忽略 = S_WAIT_IDLE 全等，
-                            //  正确但性能损失）。TODO: 逐字段对齐 T0 ELF 与 LLVM ELF 后
-                            //  改用 s_wait_dscnt。
+                            // 深查终局（2026-08-30）：
+                            //  1) GFX1200 的 s_wait_dscnt 需先有内存操作激活 dscnt 计数
+                            //     （kernel 首条内存等待即 s_wait_dscnt → 死锁；LLVM kernel
+                            //     的 s_load 先序天然激活——对照实验证实）。
+                            //  2) 即使激活，T0 真实 kernel（tile_ir）下 s_wait_dscnt 0
+                            //     欠等待（ds 操作未被等待 → 数值全错）——T0 的 ds 指令/
+                            //     wait 语义与 GFX12 dscnt 计数机制不匹配。
+                            //  → 保持 s_waitcnt lgkmcnt（RDNA4 operand 忽略 = S_WAIT_IDLE
+                            //    全等，正确但性能损失）。TODO: 修 ds 指令编码/计数对齐后
+                            //    再试 s_wait_dscnt。
                             writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
                         }
                         WaitcntForm::Unified => {
