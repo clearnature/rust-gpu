@@ -530,6 +530,10 @@ impl AqlQueue {
                     timeout_ns / 1_000_000_000, read_idx, target, write_idx, pending
                 );
                 eprintln!("{}", msg);
+                // T0_DBG_TRAP=1: 读队列快照确认例外（MEMVIOL 等）——定位卡因。
+                if std::env::var("T0_DBG_TRAP").is_ok() {
+                    crate::kfd::ioctl::snapshot_queue_exceptions(&self.device);
+                }
                 // Return Err instead of exit(99) so tests can continue
                 // and GPU resources can potentially be reclaimed by KFD driver.
                 return Err(msg);

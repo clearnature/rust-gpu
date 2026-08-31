@@ -15,6 +15,7 @@ use std::sync::Mutex;
 
 #[cfg(feature = "rocm")]
 use crate::kfd::{KfdDevice, AqlQueue, GpuBuffer, GpuKernel, KernelLoadConfig, DispatchPool};
+use crate::kfd::ioctl::{AMDKFD_IOC_DBG_TRAP, KFD_IOC_DBG_TRAP_ENABLE, KFD_DBG_TRAP_MASK_DBG_MEMORY_VIOLATION};
 
 
 // =============================================================================
@@ -44,17 +45,25 @@ impl BufferPool {
     }
 
     /// Allocate a VRAM buffer. Checks cache first, falls back to device alloc.
+    ///
+    /// **Direction 1 (buffer-reuse fix)**: a reused buffer is returned in a
+    /// *clean* state — zeroed before hand-out — so no stale contents from a
+    /// previous user can leak into the next dispatch (e.g. stale kernarg-style
+    /// pointers or L2-stale VRAM data on GFX1200). Fresh allocations from the
+    /// device are untouched (upload_bf16/alloc_zero overwrite them fully).
     pub fn alloc(&self, n_bytes: usize) -> Result<GpuBuffer, String> {
         let aligned = ((n_bytes + 4095) / 4096) * 4096;
         let mut cache = self.cache.lock().unwrap();
         if let Some(bufs) = cache.get_mut(&aligned) {
             if let Some(buf) = bufs.pop() {
                 self.cached_bytes.fetch_sub(aligned, std::sync::atomic::Ordering::Relaxed);
+                // Clean state on reuse: wipe stale contents before the new owner sees it.
+                buf.zero();
                 return Ok(buf);
             }
         }
         drop(cache);
-        self.device.alloc_vram(n_bytes)
+        self.device.alloc_uncached(n_bytes)
     }
 
     /// Return a buffer to the pool instead of freeing it.
@@ -107,10 +116,38 @@ pub struct GpuRuntime {
 
 #[cfg(feature = "rocm")]
 impl GpuRuntime {
+    /// T0_DBG_TRAP=1: 在队列创建前启用 KFD 调试 trap（MEMVIOL 例外）。
+    /// 用独立 /dev/kfd fd（进程级调试——无需 runtime 的 device）。
+    fn dbg_trap_enable_if_requested() {
+        if std::env::var("T0_DBG_TRAP").is_err() { return; }
+        #[repr(C)]
+        struct Enable { exception_mask: u64, rinfo_ptr: u64, rinfo_size: u32, dbg_fd: u32 }
+        #[repr(C)]
+        struct Args { pid: u32, op: u32, data: Enable }
+        unsafe {
+            let kfd = libc::open(b"/dev/kfd\0".as_ptr() as *const i8, libc::O_RDWR);
+            let nullfd = libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_RDWR);
+            if kfd >= 0 && nullfd >= 0 {
+                let mut args = Args {
+                    pid: std::process::id(), op: KFD_IOC_DBG_TRAP_ENABLE,
+                    data: Enable { exception_mask: KFD_DBG_TRAP_MASK_DBG_MEMORY_VIOLATION,
+                        rinfo_ptr: 0, rinfo_size: 0, dbg_fd: nullfd as u32 },
+                };
+                let r = libc::ioctl(kfd, AMDKFD_IOC_DBG_TRAP as libc::c_ulong, &mut args);
+                eprintln!("[DBG] KFD debug trap ENABLE ret={r}");
+                libc::close(kfd);
+                libc::close(nullfd);
+            }
+        }
+    }
+
     /// Create a new GpuRuntime.
     ///
     /// Opens the first KFD GPU device, creates a queue and dispatch pool.
     pub fn new() -> Result<Arc<Self>, String> {
+        // T0_DBG_TRAP=1: 调试钩子——在队列创建前启用 KFD 调试 trap（MEMVIOL 例外），
+        // 卡时由 wait_read_ptr 超时路径读队列快照（exception_status）。
+        Self::dbg_trap_enable_if_requested();
         let device = KfdDevice::open()?;
         let queue = device.create_queue()?;
         let pool = DispatchPool::new(&device, 64)?; // 64 kernarg slots
@@ -151,7 +188,7 @@ impl GpuRuntime {
         self.poisoned.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn mark_poisoned(&self) {
+    pub fn mark_poisoned(&self) {
         self.poisoned.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!("[KFD] ⚠️  Queue POISONED — all subsequent dispatches will fail fast");
     }
@@ -271,6 +308,15 @@ impl GpuRuntime {
             return Err("[KFD] Queue poisoned after GPU hang — refusing dispatch to prevent system hang".into());
         }
 
+        // 2026-08-30: kernarg 对齐断言——builder 输出长度必须与 kernel 声明一致。
+        // 若 ka < kernarg_size，pool 写入后 kernel 会读到 zeroed 尾部（M=0 等参数错）；
+        // 若 ka > kernarg_size，多余字节被忽略（无害但说明 builder/kernel 声明漂移）。
+        // 这是"kernel 声明 ↔ builder ↔ validator"三处分离的第一道防线（Phase 4 轻量版）。
+        assert_eq!(kernargs.len() as u32, kernel.kernarg_size,
+            "[KFD] kernarg mismatch: builder produced {}B, kernel declares {}B. \
+             Builder and kernel arg layout drifted — fix the builder or kernel declaration.",
+            kernargs.len(), kernel.kernarg_size);
+
         // Pre-dispatch: validate GPU VA pointers in kernargs
         // Kernarg layout typically contains 8-byte GPU addresses followed by 4-byte scalars.
         // Valid KFD VRAM range: 0x1_0000_0000 .. ~0x10_0000_0000 (based on next_va init)
@@ -280,8 +326,26 @@ impl GpuRuntime {
 
         let slot = self.next_slot();
         let ka_buf = self.pool.write_kernargs(slot, kernargs);
+
+        // Debug: dump kernarg contents for first dispatch
+        if std::env::var("T0_DEBUG_DISPATCH").is_ok() && slot < 3 {
+            eprintln!("[DISPATCH] slot={} ka_gpu=0x{:X} kernargs({}B):",
+                slot, ka_buf.gpu_addr(), kernargs.len());
+            for i in 0..kernargs.len().min(28)/8 {
+                let ptr = u64::from_le_bytes(kernargs[i*8..i*8+8].try_into().unwrap());
+                eprintln!("[DISPATCH]   arg[{}]=0x{:016X}", i, ptr);
+            }
+            // Also dump n (u32 at offset 24)
+            if kernargs.len() >= 28 {
+                let n = u32::from_le_bytes(kernargs[24..28].try_into().unwrap());
+                eprintln!("[DISPATCH]   n={}", n);
+            }
+            // Dump raw kernarg bytes
+            eprintln!("[DISPATCH]   raw: {:02X?}", &kernargs[..kernargs.len().min(28)]);
+        }
+
         self.queue.submit(kernel, grid, ka_buf);
-        self.queue.wait_idle().map_err(|e| {
+        self.queue.synchronize().map_err(|e| {
             self.mark_poisoned();
             e
         })
@@ -404,7 +468,7 @@ impl GpuRuntime {
 
         // Allocate bf16 buffer (2 bytes per element, padded to 256)
         let bf16_bytes = ((n_elems * 2) + 255) & !255;
-        let bf16_buf = self.device.alloc_vram(bf16_bytes)?;
+        let bf16_buf = self.device.alloc_uncached(bf16_bytes)?;
 
         // Dispatch f32→bf16 conversion
         let epl = ((n_elems + 255) / 256) as u32;
@@ -434,6 +498,9 @@ impl GpuRuntime {
     // ── Buffer allocation convenience ──
 
     /// Allocate a VRAM buffer of `n_bytes` bytes (from buffer pool).
+    ///
+    /// The pool (Direction 1) returns reused buffers in a clean state (zeroed
+    /// on hand-out), so stale contents can never leak into the next dispatch.
     pub fn alloc(&self, n_bytes: usize) -> Result<GpuBuffer, String> {
         self.buffer_pool.alloc(n_bytes)
     }
