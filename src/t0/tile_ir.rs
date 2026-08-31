@@ -4307,6 +4307,11 @@ pub fn build_kernargs_m_with_counter(
         ka.extend_from_slice(&counter_addr.to_le_bytes()); // arg 8: counter ptr
         ka.extend_from_slice(&n_tiles_n_shift.to_le_bytes()); // arg 9: log2(n_tiles_n)
         ka.extend_from_slice(&tiles_per_wg.to_le_bytes());   // arg 10: ceil(total/n_wgs)
+        // 2026-09-01: 对齐到 8 字节——kernel 的 arg_ptr(counter) 在 offset 48
+        // （align8），n_tiles/tiles_per_wg 到 56/60，kernel 声明 kernarg_size=64
+        // （60 向上对齐 8）。builder 必须补齐到 64，否则 dispatch 的 kernarg
+        // 断言（builder==kernel 声明）误报漂移。
+        ka.extend_from_slice(&0u32.to_le_bytes());   // padding: 60 → 64
     }
     ka
 }
@@ -4651,21 +4656,31 @@ mod compile_tests {
 mod gpu_tests {
     use super::*;
     use crate::ignis::gpu_context::GpuRuntime;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex};
 
     struct SyncRt(Arc<GpuRuntime>);
     unsafe impl Sync for SyncRt {}
     unsafe impl Send for SyncRt {}
-    static GPU_RT: OnceLock<SyncRt> = OnceLock::new();
+    static GPU_RT: Mutex<Option<SyncRt>> = Mutex::new(None);
 
     fn with_rt<F, R>(f: F) -> R
     where F: FnOnce(&GpuRuntime) -> R {
-        let rt = GPU_RT.get_or_init(|| {
-            SyncRt(GpuRuntime::new().expect("Failed to create GpuRuntime"))
-        });
-        let _ = rt.0.wait_idle();
-        let result = f(&rt.0);
-        let _ = rt.0.wait_idle();
+        // 2026-09-01: poisoned 重建——GPU 卡（SQ MEMVIOL/超时）后队列 poisoned，
+        // 重建 runtime（新 KFD 队列）防连锁失败（此前 gpu_tests 全集 19 失败
+        // 大多是"首个卡点 → 队列 poisoned → 后续测试全部快速失败"的连锁）。
+        let mut guard = GPU_RT.lock().unwrap_or_else(|e| e.into_inner());
+        let rebuild = match guard.as_ref() {
+            Some(rt) => rt.0.is_poisoned(),
+            None => true,
+        };
+        if rebuild {
+            eprintln!("[with_rt] rebuilding GpuRuntime (was_poisoned={})", guard.is_some());
+            *guard = Some(SyncRt(GpuRuntime::new().expect("Failed to create GpuRuntime")));
+        }
+        let rt = &guard.as_ref().unwrap().0;
+        let _ = rt.wait_idle();
+        let result = f(rt);
+        let _ = rt.wait_idle();
         result
     }
 
