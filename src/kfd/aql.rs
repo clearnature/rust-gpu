@@ -498,7 +498,6 @@ impl AqlQueue {
     /// Fallback: wait by polling read pointer.
     /// Returns Err on timeout (5s) instead of exit(99) to allow graceful recovery.
     fn wait_read_ptr(&self, target: u64) -> Result<(), String> {
-        let timeout_ns: u64 = 5_000_000_000;  // 5s: fast fail to prevent system hang
         let start = std::time::Instant::now();
         let mut last_log_s = 0u64;
         loop {
@@ -518,12 +517,19 @@ impl AqlQueue {
                     write_idx.wrapping_sub(read_idx)
                 );
             }
+            // 2026-08-31 动态超时：5s + 每 pending dispatch 5s。
+            // 单个同步 dispatch（pending=1）→ 10s 快速失败（真 hang 保护）；
+            // 10 个并发 async 大 dispatch（pending=10）→ ~55s（4096³ 2048-WG
+            // async benchmark 实测需 ~15s，5s 硬编码会误报 GPU hung → 队列
+            // poisoned → 连锁失败。GPU 实际正常，仅处理慢）。
+            let write_idx = unsafe { std::ptr::read_volatile(self.write_ptr_host) };
+            let pending = write_idx.wrapping_sub(read_idx);
+            let timeout_ns: u64 = 5_000_000_000 + pending.saturating_mul(5_000_000_000);
             if elapsed.as_nanos() as u64 > timeout_ns {
-                let write_idx = unsafe { std::ptr::read_volatile(self.write_ptr_host) };
                 let msg = format!(
-                    "[KFD] wait_read_ptr TIMEOUT (5s): GPU hung! \
+                    "[KFD] wait_read_ptr TIMEOUT ({}s): GPU hung! \
                      read={}, target={}, write={}, pending={}",
-                    read_idx, target, write_idx, write_idx.wrapping_sub(read_idx)
+                    timeout_ns / 1_000_000_000, read_idx, target, write_idx, pending
                 );
                 eprintln!("{}", msg);
                 // Return Err instead of exit(99) so tests can continue
