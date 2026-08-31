@@ -6743,10 +6743,16 @@ mod gpu_tests {
             // Do NOT use tile_auto_select which may pick split_k=8 — misleading numbers.
             let mut spec_plain = TileGemm::tile_128x128_k32();
             spec_plain.split_k = 1; // no split-K for fair comparison
+            // 2026-08-31: 全局 tile_128x128_k32() 为会话实验配置（acc_swap=true,
+            // double_buffer=false）→ LDS=81920B（80KB）> CU 64KB，GPU 无法调度
+            // → 真卡（warmup 第一个 dispatch 即 60s 不完成，journalctl 无中断）。
+            // 此处显式恢复合规配置（acc_swap=false → LDS=16KB），保留全局实验配置。
+            spec_plain.acc_swap = false;
 
             let mut spec_fused = TileGemm::tile_128x128_k32()
                 .with_epilogue(vec![EpilogueOp::ReLU]);
             spec_fused.split_k = 1;
+            spec_fused.acc_swap = false;
 
             // ── Compile both ──
             let kernel_plain = rt.ensure_kernel_t0(
