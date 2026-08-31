@@ -863,8 +863,26 @@ impl AsmEmitter {
             Op::WaitLgkmcnt(n) => {
                 if self.outstanding_lgkmcnt > 0 || *n > 0 {
                     let actual = (*n as u32).min(self.outstanding_lgkmcnt);
-                    // 两 Target 相同（LDS/标量等待统一 s_waitcnt lgkmcnt）
-                    writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
+                    // RDNA4：S_WAITCNT 的 operand 被忽略（手册：等效 S_WAIT_IDLE，
+                    // "should not be used in modern code"）——统一 s_waitcnt lgkmcnt
+                    // 会退化为全等（等待一切）。T0 的 wait_lgkmcnt 场景均为
+                    // ds_store/ds_load 后的 LDS 等待 → 用拆分形式 s_wait_dscnt。
+                    // 注意：不能同时发 s_wait_kmcnt（标量计数悬空时死锁，实测 GPU hang）。
+                    match self.caps().waitcnt {
+                        WaitcntForm::Split => {
+                            // 2026-08-30 实测：GFX12 上 s_wait_dscnt（含固定 0）导致
+                            // GPU hang（dscnt 初始/operand 语义与 T0 预期不符，可能
+                            // dscnt 计数初始非零且无 ds 操作推进 → 等待永不满足）。
+                            // 回退到 s_waitcnt lgkmcnt：RDNA4 手册 S_WAITCNT operand
+                            // 被忽略（等效 S_WAIT_IDLE 全等）——正确但性能损失
+                            // （LDS/标量等待退化为全等）。TODO: 深查 GFX12 dscnt
+                            // 初始值语义后改用 s_wait_dscnt。
+                            writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
+                        }
+                        WaitcntForm::Unified => {
+                            writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
+                        }
+                    }
                     self.outstanding_lgkmcnt = actual;
                     self.waits_emitted += 1;
                 } else {
