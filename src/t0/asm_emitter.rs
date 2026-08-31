@@ -911,6 +911,10 @@ impl AsmEmitter {
             }
             Op::WaitKmcnt(n) => {
                 // Scalar memory wait: RDNA4 s_wait_kmcnt；RDNA3 s_waitcnt lgkmcnt
+                // 2026-08-30 探针实证：s_wait_kmcnt 需先有 s_load 激活 kmcnt 计数
+                // （无 s_load 时首条 s_wait_kmcnt 0 → GPU hang）。T0 的 WaitKmcnt
+                // 均在 s_load 后（prologue/标量加载后）→ 天然满足；禁止在无
+                // s_load 的位置插入 WaitKmcnt。
                 match self.caps().waitcnt {
                     WaitcntForm::Split => {
                         writeln!(self.buf, "{}s_wait_kmcnt {}", self.indent, n).unwrap();
