@@ -822,10 +822,14 @@ impl AsmEmitter {
             Op::CaptureTgid { dst, axis } => {
                 let sd = a.phys_s(*dst);
                 let hw_sreg = 2 + axis;  // s2=TGID.x, s3=TGID.y, s4=TGID.z
-                // GFX1200: MES firmware may set TGID.x incorrectly (bug P2).
-                // Hardcode wg_id = 0 for single-WG dispatch workaround.
+                // GFX1200 (RDNA4) 平台缺陷适配（勿删）：
+                //   P2 — 2-WG 网格下 MES 不写 TGID：s2/s3 读回垃圾
+                //   （探针实测 s2=0xFFFFFFFF；2026-08-30 复测 0x100000004）。
+                //   多 WG 在 GFX1200 上整体不可用（P1: ≥4 WG 死锁），
+                //   本栈采用 1-WG/persistent 策略 → 硬编码 wg_id=0 与之一致。
+                // 详见 docs/mes/AMD_BUG_REPORT_GFX1200.md P1/P2。
                 if self.target == Target::GFX1200 && (*axis == 0 || *axis == 1) {
-                    writeln!(self.buf, "{}s_mov_b32 s{}, 0  ; capture TGID.{}(GFX1200: hardcoded 0)",
+                    writeln!(self.buf, "{}s_mov_b32 s{}, 0  ; capture TGID.{}(GFX1200: hardcoded 0, MES P2 defect)",
                         self.indent, sd, match axis { 0 => "x", _ => "y" }).unwrap();
                 } else {
                     writeln!(self.buf, "{}s_mov_b32 s{}, s{}  ; capture TGID.{}",
