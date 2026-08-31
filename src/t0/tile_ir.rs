@@ -247,7 +247,7 @@ impl TileGemm {
             wgp_mode: false, double_buffer: true,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
-            acc_swap: false,
+            acc_swap: true, // 2026-08-30: acc_swap=false 时普通池 high-water=247 + Address 池叠加 → 255+1 溢出（rocm 边界测试/bench 编译即崩）。acc_swap=true 降 acc 驻留 → 编译通过（ELF 17440B, LDS 57344B < 64KB）
             epilogue: vec![],
             waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
@@ -295,12 +295,10 @@ impl TileGemm {
     pub fn tile_128x128_k32() -> Self {
         Self {
             tile_m: 128, tile_n: 128, tile_k: 32,
-            wgp_mode: true, double_buffer: true,
+            wgp_mode: true, double_buffer: false, // P2 EXP: 4-wave 省1 基线
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
-            acc_swap: false,
-
-
+            acc_swap: true, // P2 EXP: 4-wave 省1 基线
             epilogue: vec![],
             waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
@@ -410,7 +408,7 @@ impl TileGemm {
             wgp_mode: false, double_buffer: true,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
-            acc_swap: false,
+            acc_swap: true, // 2026-08-30: acc_swap=false 时普通池 VGPR high-water=255 → regalloc panic（k64 任何路径编译即崩）。acc_swap=true 降 acc 驻留（frag_a_count=1）→ 编译通过（ELF 22328B）
             epilogue: vec![],
             waves_per_wg: None,
             wmma_format: WmmaFormat::BF16_F32,
@@ -4105,7 +4103,9 @@ mod tests {
         //     .expect("compile failed for k48");
 
         // ── k64 configs (VGPR exploration) ──
-        // 128×128 k64: may spill (GMEM=64 VGPRs)
+        // 128×128 k64: acc_swap=true（2026-08-30 修复：acc_swap=false 时普通池
+        // VGPR high-water=255 → regalloc panic，k64 任何路径编译即崩）。
+        // 注意：LDS=128KB 超 CU 模式 64KB 限制 —— k64 仅适合 WGP 模式。
         let spec64 = TileGemm::tile_128x128_k64();
         eprintln!("\n[tile_ir] compiling 128x128 k64: {} (LDS={})", spec64.name(), spec64.lds_total());
         let kernel64 = lower_gemm(&spec64);
@@ -8112,12 +8112,12 @@ mod persistent_tests {
     fn test_persistent_grid_single_workgroup() {
         let spec = TileGemm::tile_persistent_decode();
         let grid = compute_grid(&spec, 1, 32768);
-        // K6 persistent mode: 2 WGs for MES v2 compatibility
+        // P3 (2026-08-30): 1-WG static slice — exactly ONE workgroup
         assert_eq!(grid[1], 1, "grid.y should be 1");
         assert_eq!(grid[2], 1, "grid.z should be 1");
-        // Grid = 2 * wg_size (not oversubscribed — persistent loop handles re-entry)
-        assert_eq!(grid[0], 2 * spec.wg_size(),
-            "grid.x should be 2 * wg_size = {}", 2 * spec.wg_size());
+        // Grid = wg_size (not oversubscribed — persistent loop handles re-entry)
+        assert_eq!(grid[0], spec.wg_size(),
+            "grid.x should be 1 * wg_size = {}", spec.wg_size());
     }
 
     #[test]
@@ -8159,7 +8159,13 @@ mod persistent_tests {
         let k = lower_gemm(&spec);
         let asm = k.to_assembly(Target::detect()).expect("to_assembly");
         assert!(asm.contains("s_endpgm"), "Missing s_endpgm");
-        assert!(asm.contains("global_atomic"), "Missing global_atomic for K6 pattern");
+        // P3 (2026-08-30): current persistent kernel is the 1-WG static slice
+        // (tile_idx = iter loop, see compute_grid + lower_gemm persistent block) —
+        // NOT the old K6 atomic-claiming scheme (readfirstlane returns garbage
+        // under high VGPR pressure on GFX1200). Assert the static-slice markers:
+        // the persistent loop label and the tile_idx ≥ total_tiles early exit.
+        assert!(asm.contains(".Lpersistent_loop_"), "Missing persistent loop label");
+        assert!(asm.contains("s_cbranch_scc1"), "Missing persistent early-exit branch");
 
         // Verify ELF
         let elf = k.compile(Target::detect()).expect("compile");
@@ -8174,7 +8180,10 @@ mod persistent_tests {
     fn test_persistent_128x64_grid() {
         let spec = TileGemm::tile_persistent_128x64_k32();
         let grid = compute_grid(&spec, 4096, 4096);
-        assert_eq!(grid[0], 2 * 128, "grid.x = 2 WG × 128 threads = 256");
+        // P3 (2026-08-30): 1-WG static slice — exactly ONE workgroup of
+        // wg_size threads; the kernel loops over all tiles internally
+        // (2 WGs share LDS and interfere on GFX1200 → all-zero Y).
+        assert_eq!(grid[0], spec.wg_size(), "grid.x = 1 WG × {} threads", spec.wg_size());
         assert_eq!(grid[1], 1);
         assert_eq!(grid[2], 1);
     }

@@ -99,6 +99,9 @@ pub fn allocate(
             continue;
         }
         for vr in op.vreg_refs() {
+            if std::env::var("T0_TRACE_VREG").map(|v| v == vr.0.to_string()).unwrap_or(false) {
+                eprintln!("[TRACE] v{} used by op[{}] = {:?}", vr.0, op_idx, op);
+            }
             if let Some(&alloc_idx) = vreg_to_alloc.get(&vr) {
                 if op_idx > last_use[alloc_idx] {
                     last_use[alloc_idx] = op_idx;
@@ -135,11 +138,62 @@ pub fn allocate(
     }
 
     // Extend last-use for VRegs used inside loops
+    //
+    // P3 PRECISION (2026-08-30): the naive rule (any VReg used inside the loop
+    // gets last_use = loop_end) over-estimates liveness for iteration-local
+    // temps — every iteration re-defines them, so they never need to survive
+    // across the loop boundary. persistent 128x64/256x128 k32 hit this: the
+    // persistent loop wraps the ENTIRE GEMM body + Y store, and every
+    // iteration-local temp (y_base/y_addr/row_bytes/K-OOB mask, …) was pinned
+    // to loop_end, driving the normal pool to high-water 255+1 → panic.
+    //
+    // Precise rule: skip the extension ONLY for registers that are
+    //   (a) first used INSIDE the loop (defined per iteration), AND
+    //   (b) have a pure definition inside the loop (an op whose dst is this
+    //       VReg and whose uses do NOT include it — i.e. a full rewrite, not a
+    //       read-modify-write like k_byte_off += step), AND
+    //   (c) are NOT WMMA operands (a/b/c/dst). WMMA frag_a/frag_b/acc carry
+    //       values across ksub iterations (streaming prefetch, accumulator
+    //       accumulation), so they must stay extended even though they have
+    //       in-loop definitions.
+    //
+    // Everything else keeps the conservative extension (cross-iteration
+    // liveness: loop-carried values, loop-invariant bases allocated outside,
+    // read-modify-write accumulators).
+    let mut loop_pure_def = vec![false; vreg_allocs.len()];
+    let mut loop_wmma_op = vec![false; vreg_allocs.len()];
+    for &(loop_start, loop_end) in &loop_ranges {
+        for (op_idx, op) in ops.iter().enumerate().take(loop_end + 1).skip(loop_start) {
+            let defs = op.vreg_defs();
+            let uses = op.vreg_uses();
+            let def_set: std::collections::HashSet<VReg> = defs.iter().cloned().collect();
+            let use_set: std::collections::HashSet<VReg> = uses.iter().cloned().collect();
+            if matches!(op, Op::Wmma { .. }) {
+                for vr in defs.iter().chain(uses.iter()) {
+                    if let Some(&ai) = vreg_to_alloc.get(vr) {
+                        loop_wmma_op[ai] = true;
+                    }
+                }
+            }
+            for vr in &defs {
+                if let Some(&ai) = vreg_to_alloc.get(vr) {
+                    if !use_set.contains(vr) {
+                        loop_pure_def[ai] = true;
+                    }
+                }
+            }
+        }
+    }
     for &(loop_start, loop_end) in &loop_ranges {
         for alloc_idx in 0..vreg_allocs.len() {
             // If this alloc is used anywhere inside the loop, extend to loop_end
             if last_use[alloc_idx] >= loop_start && last_use[alloc_idx] <= loop_end {
-                last_use[alloc_idx] = loop_end;
+                let iteration_local = first_use[alloc_idx] >= loop_start
+                    && loop_pure_def[alloc_idx]
+                    && !loop_wmma_op[alloc_idx];
+                if !iteration_local {
+                    last_use[alloc_idx] = loop_end;
+                }
             }
         }
     }
@@ -400,6 +454,9 @@ fn alloc_class_pool(
             };
             phys_base = aligned;
             let end = aligned as u32 + count;
+            if std::env::var("T0_DUMP_ALLOC").is_ok() {
+                eprintln!("[ALLOC] {} vreg={:?} count={} phys={}+{} high_after={} last_use={}", pool_name, intervals[idx].vreg_base, count, aligned, count, end, intervals[idx].last_use);
+            }
             assert!(end <= 255, "{} overflow at {}+{} (this pool high-water {})", pool_name, aligned, count, *high);
             *high = end as u8;
         }
