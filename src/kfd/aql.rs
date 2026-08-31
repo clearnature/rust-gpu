@@ -517,14 +517,12 @@ impl AqlQueue {
                     write_idx.wrapping_sub(read_idx)
                 );
             }
-            // 2026-08-31 动态超时（放宽版，正确性优先）：30s + 每 pending dispatch 30s。
-            // 原始 5s 硬编码对 async 并发大 dispatch（4096³ 2048-WG × 10 需 ~5.5s）
-            // 稳定误报 GPU hung → 队列 poisoned → 连锁失败；GPU 实际正常仅处理慢。
-            // pending=1（同步单 dispatch）→ 60s；10 并发 async → ~330s 给足时间。
-            // 代价：真 hang 时检测变慢（60s-330s），但避免误报优先。
+            // 2026-08-31 动态超时（再次放宽，正确性优先）：60s + 每 pending dispatch 60s。
+            // 用户指引：全部视为超时误报处理，正确性优先通过。pending=1 → 120s；
+            // 10 并发 async → ~660s。代价：真卡时检测很慢，但避免误报优先。
             let write_idx = unsafe { std::ptr::read_volatile(self.write_ptr_host) };
             let pending = write_idx.wrapping_sub(read_idx);
-            let timeout_ns: u64 = 30_000_000_000 + pending.saturating_mul(30_000_000_000);
+            let timeout_ns: u64 = 60_000_000_000 + pending.saturating_mul(60_000_000_000);
             if elapsed.as_nanos() as u64 > timeout_ns {
                 let msg = format!(
                     "[KFD] wait_read_ptr TIMEOUT ({}s): GPU hung! \
