@@ -5906,20 +5906,22 @@ mod gpu_tests {
     /// Auto-select test: verify tile_auto_select picks reasonable configs
     #[test]
     fn test_tile_auto_select() {
-        // Small M → 32×64
+        // 2026-09-01: 期望对齐 autotuner 结果（2026-03-31）——小/中矩阵统一 64×64
+        // （此前测试期望 32×64/128×64 为旧 autotuner 配置，已漂移）。
+        // Small M → 64×64 (autotuner: 64×64 对小矩阵最优——OOB 掩码处理 tile>M)
         let s = tile_auto_select(32, 256, 64, TileTranspose::NT);
-        assert_eq!(s.tile_m, 32);
+        assert_eq!(s.tile_m, 64);
         assert_eq!(s.tile_n, 64);
 
-        // Medium M → 128×64
+        // Medium M → 64×64 k64
         let s = tile_auto_select(128, 256, 64, TileTranspose::NT);
-        assert_eq!(s.tile_m, 128);
+        assert_eq!(s.tile_m, 64);
         assert_eq!(s.tile_n, 64);
 
-        // Large M → 128×64 CU mode (WGP available but CU mode preferred for perf)
+        // Medium 512³ → 64×64 k64 CU mode
         let s = tile_auto_select(512, 512, 512, TileTranspose::NT);
-        assert_eq!(s.tile_m, 128);
-        assert_eq!(s.tile_k, 16);
+        assert_eq!(s.tile_m, 64);
+        assert_eq!(s.tile_k, 64);
         assert!(!s.wgp_mode);
 
         // NN-mode preserved
