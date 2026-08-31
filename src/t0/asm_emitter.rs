@@ -29,9 +29,73 @@ pub struct AsmEmitter {
     gfx12_vcc_from_cmp: bool,       // VCC is fresh from comparison, safe for direct save_exec
 }
 
+/// GFX12 vs GFX11 指令形式差异（RDNA4 ABI/ISA 核对，LLVM gfx1100/gfx1200 对照实证）。
+///
+/// 渐进式抽象（2026-08-30）：先迁移最关键的 4 项（TGID 源 / barrier 形式 /
+/// 标量加助记符 / waitcnt 形式），其余 if target 分支（VOP3 inline 常数、
+/// MUBUF soffset、EXEC 设置、atomic th、VMEM 形式）标注 TODO 后续迁移。
+/// 每加一个 Target 只需新增一个表项，不再叠 if。
+struct TargetCaps {
+    /// workgroup_id 读取位置（RDNA4 架构化 SGPR 迁移到 ttmp）
+    tgid: TgidForm,
+    /// 波前同步指令形式（RDNA4 拆分为 signal/wait）
+    barrier: BarrierForm,
+    /// 32 位标量加助记符（RDNA4 仅 S_ADD_CO_* 写 SCC）
+    scalar_add: &'static str,
+    /// 内存等待指令形式（RDNA4 拆分 loadcnt/dscnt/kmcnt/storecnt）
+    waitcnt: WaitcntForm,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TgidForm {
+    /// 老架构（GCN/RDNA1-3）：s2/s3/s4 = workgroup_id x/y/z
+    SystemSgpr,
+    /// RDNA4（Architected SGPR）：x→ttmp9；y→ttmp7 低 16 位；z→ttmp7 高 16 位
+    Ttmp,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BarrierForm {
+    /// RDNA3：s_barrier
+    SBarrier,
+    /// RDNA4：s_barrier_signal + s_barrier_wait
+    SignalWait,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum WaitcntForm {
+    /// RDNA3：统一 s_waitcnt vmcnt/lgkmcnt
+    Unified,
+    /// RDNA4：拆分 s_wait_loadcnt / s_wait_dscnt / s_wait_kmcnt / s_wait_storecnt
+    Split,
+}
+
+/// GFX1200 (RDNA4)——LLVM gfx1200 代码生成 + RDNA4 ISA 手册实证。
+static GFX1200_CAPS: TargetCaps = TargetCaps {
+    tgid: TgidForm::Ttmp,
+    barrier: BarrierForm::SignalWait,
+    scalar_add: "s_add_co_u32",
+    waitcnt: WaitcntForm::Split,
+};
+
+/// GFX1100 (RDNA3)——LLVM gfx1100 代码生成对照。
+static GFX1100_CAPS: TargetCaps = TargetCaps {
+    tgid: TgidForm::SystemSgpr,
+    barrier: BarrierForm::SBarrier,
+    scalar_add: "s_add_u32",
+    waitcnt: WaitcntForm::Unified,
+};
+
 impl AsmEmitter {
-    pub fn new() -> Self {
-        Self {
+    /// Target 能力表（GFX12/GFX11 指令形式差异，渐进式迁移中）。
+    fn caps(&self) -> &'static TargetCaps {
+        match self.target {
+            Target::GFX1200 => &GFX1200_CAPS,
+            Target::GFX1100 => &GFX1100_CAPS,
+        }
+    }
+
+    pub fn new() -> Self {        Self {
             buf: String::with_capacity(8192),
             indent: "  ",
             target: Target::detect(),
@@ -575,15 +639,9 @@ impl AsmEmitter {
             Op::SAddU32 { dst, src0, src1 } => {
                 let sd = a.phys_s(*dst);
                 let s0 = a.phys_s(*src0);
-                // 2026-08-30: RDNA4 手册（§7 指令表）32 位标量加只有 S_ADD_CO_*
-                // 变体（写 SCC，D=S0+S1, SCC=carry/overflow）。s_add_u32 依赖汇编器
-                // 兼容映射；显式用 s_add_co_u32 与 LLVM gfx1200（s_add_co_i32）对齐，
-                // 确保后续 SAddcU32（64 位链）的进位依赖正确。
-                if self.target == Target::GFX1200 {
-                    writeln!(self.buf, "{}s_add_co_u32 s{}, s{}, {}", self.indent, sd, s0, soperand_str(src1, a)).unwrap();
-                } else {
-                    writeln!(self.buf, "{}s_add_u32 s{}, s{}, {}", self.indent, sd, s0, soperand_str(src1, a)).unwrap();
-                }
+                // RDNA4 手册（§7）：32 位标量加仅 S_ADD_CO_* 变体（写 SCC）；
+                // RDNA3 用 s_add_u32。显式区分确保 64 位链（SAddcU32）进位依赖正确。
+                writeln!(self.buf, "{}{} s{}, s{}, {}", self.indent, self.caps().scalar_add, sd, s0, soperand_str(src1, a)).unwrap();
             }
             Op::SAddcU32 { dst, src0, src1 } => {
                 let sd = a.phys_s(*dst);
@@ -737,12 +795,13 @@ impl AsmEmitter {
 
             // ── Synchronization ──
             Op::Barrier => {
-                match self.target {
-                    Target::GFX1200 => {
+                // RDNA4 拆分 barrier（s_barrier_signal/wait）；RDNA3 用 s_barrier
+                match self.caps().barrier {
+                    BarrierForm::SignalWait => {
                         writeln!(self.buf, "{}s_barrier_signal -1", self.indent).unwrap();
                         writeln!(self.buf, "{}s_barrier_wait -1", self.indent).unwrap();
                     }
-                    Target::GFX1100 => {
+                    BarrierForm::SBarrier => {
                         writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
                     }
                 }
@@ -829,32 +888,31 @@ impl AsmEmitter {
             // ── Hardware register access ──
             Op::CaptureTgid { dst, axis } => {
                 let sd = a.phys_s(*dst);
-                if self.target == Target::GFX1200 {
-                    // RDNA4 (gfx1200) ABI：workgroup_id 由 MES 写入 ttmp，不在 s2/s3！
-                    // LLVM 权威映射（clang -mcpu=gfx1200 workgroup_id 探针）：
-                    //   x → ttmp9
-                    //   y → ttmp7 低 16 位
-                    //   z → ttmp7 高 16 位
-                    // 旧实现读 s2/s3/s4（GCN 老位置）→ 得到未初始化垃圾（曾误判为
-                    // "MES TGID 失效"平台缺陷，实为本实现寄存器位置错误）。
-                    match axis {
-                        0 => writeln!(self.buf, "{}s_mov_b32 s{}, ttmp9  ; workgroup_id_x", self.indent, sd).unwrap(),
-                        1 => {
-                            writeln!(self.buf, "{}s_mov_b32 s{}, ttmp7  ; workgroup_id_y (low16)", self.indent, sd).unwrap();
-                            writeln!(self.buf, "{}s_and_b32 s{}, s{}, 0xffff", self.indent, sd, sd).unwrap();
+                match self.caps().tgid {
+                    TgidForm::Ttmp => {
+                        // RDNA4 (gfx1200) ABI：workgroup_id 由 MES 写入 ttmp（Architected
+                        // SGPR），不在 s2/s3。LLVM 权威映射（clang -mcpu=gfx1200 探针）：
+                        //   x → ttmp9；y → ttmp7 低 16 位；z → ttmp7 高 16 位
+                        match axis {
+                            0 => writeln!(self.buf, "{}s_mov_b32 s{}, ttmp9  ; workgroup_id_x", self.indent, sd).unwrap(),
+                            1 => {
+                                writeln!(self.buf, "{}s_mov_b32 s{}, ttmp7  ; workgroup_id_y (low16)", self.indent, sd).unwrap();
+                                writeln!(self.buf, "{}s_and_b32 s{}, s{}, 0xffff", self.indent, sd, sd).unwrap();
+                            }
+                            2 => {
+                                writeln!(self.buf, "{}s_mov_b32 s{}, ttmp7  ; workgroup_id_z (high16)", self.indent, sd).unwrap();
+                                writeln!(self.buf, "{}s_lshr_b32 s{}, s{}, 16", self.indent, sd, sd).unwrap();
+                            }
+                            _ => {} // axis 受 program_id() 约束 (assert axis <= 2)，不可达
                         }
-                        2 => {
-                            writeln!(self.buf, "{}s_mov_b32 s{}, ttmp7  ; workgroup_id_z (high16)", self.indent, sd).unwrap();
-                            writeln!(self.buf, "{}s_lshr_b32 s{}, s{}, 16", self.indent, sd, sd).unwrap();
-                        }
-                        _ => {} // axis 受 program_id() 约束 (assert axis <= 2)，不可达
                     }
-                } else {
-                    // 老架构（GCN/RDNA1-3）：system sgpr 紧跟 kernarg（user_sgpr=2 → s2/s3/s4）
-                    let hw_sreg = 2 + axis;  // s2=TGID.x, s3=TGID.y, s4=TGID.z
-                    writeln!(self.buf, "{}s_mov_b32 s{}, s{}  ; capture TGID.{}",
-                        self.indent, sd, hw_sreg,
-                        match axis { 0 => "x", 1 => "y", _ => "z" }).unwrap();
+                    TgidForm::SystemSgpr => {
+                        // 老架构（GCN/RDNA1-3）：system sgpr 紧跟 kernarg（user_sgpr=2 → s2/s3/s4）
+                        let hw_sreg = 2 + axis;  // s2=TGID.x, s3=TGID.y, s4=TGID.z
+                        writeln!(self.buf, "{}s_mov_b32 s{}, s{}  ; capture TGID.{}",
+                            self.indent, sd, hw_sreg,
+                            match axis { 0 => "x", 1 => "y", _ => "z" }).unwrap();
+                    }
                 }
             }
 
@@ -1086,12 +1144,13 @@ impl AsmEmitter {
                     self.indent, vd, va, offset).unwrap();
             }
             Op::SBarrier => {
-                match self.target {
-                    Target::GFX1200 => {
+                // RDNA4 拆分 barrier；RDNA3 用 s_barrier（与 Op::Barrier 同形式）
+                match self.caps().barrier {
+                    BarrierForm::SignalWait => {
                         writeln!(self.buf, "{}s_barrier_signal -1", self.indent).unwrap();
                         writeln!(self.buf, "{}s_barrier_wait -1", self.indent).unwrap();
                     }
-                    Target::GFX1100 => {
+                    BarrierForm::SBarrier => {
                         writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
                     }
                 }
