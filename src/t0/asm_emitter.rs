@@ -870,13 +870,13 @@ impl AsmEmitter {
                     // 注意：不能同时发 s_wait_kmcnt（标量计数悬空时死锁，实测 GPU hang）。
                     match self.caps().waitcnt {
                         WaitcntForm::Split => {
-                            // 2026-08-30 实测：GFX12 上 s_wait_dscnt（含固定 0）导致
-                            // GPU hang（dscnt 初始/operand 语义与 T0 预期不符，可能
-                            // dscnt 计数初始非零且无 ds 操作推进 → 等待永不满足）。
-                            // 回退到 s_waitcnt lgkmcnt：RDNA4 手册 S_WAITCNT operand
-                            // 被忽略（等效 S_WAIT_IDLE 全等）——正确但性能损失
-                            // （LDS/标量等待退化为全等）。TODO: 深查 GFX12 dscnt
-                            // 初始值语义后改用 s_wait_dscnt。
+                            // 2026-08-30 深查结论：s_wait_dscnt 在 T0 生成的 ELF 上下文无条件死锁
+                            // （无 ds 操作/有 ds、operand 0/63、soffset_sgpr_only 开关均 hang；
+                            //  LLVM 编译的同指令 kernel 在 T0 runtime 正常）——差异在 T0 ELF
+                            //  的元数据/指令序列，next_free_sgpr 已排除。保持 s_waitcnt
+                            //  lgkmcnt（RDNA4 S_WAITCNT operand 忽略 = S_WAIT_IDLE 全等，
+                            //  正确但性能损失）。TODO: 逐字段对齐 T0 ELF 与 LLVM ELF 后
+                            //  改用 s_wait_dscnt。
                             writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
                         }
                         WaitcntForm::Unified => {
