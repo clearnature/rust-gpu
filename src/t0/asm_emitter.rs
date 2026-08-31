@@ -870,17 +870,14 @@ impl AsmEmitter {
                     // 注意：不能同时发 s_wait_kmcnt（标量计数悬空时死锁，实测 GPU hang）。
                     match self.caps().waitcnt {
                         WaitcntForm::Split => {
-                            // 深查终局（2026-08-30）：
-                            //  1) GFX1200 的 s_wait_dscnt 需先有内存操作激活 dscnt 计数
-                            //     （kernel 首条内存等待即 s_wait_dscnt → 死锁；LLVM kernel
-                            //     的 s_load 先序天然激活——对照实验证实）。
-                            //  2) 即使激活，T0 真实 kernel（tile_ir）下 s_wait_dscnt 0
-                            //     欠等待（ds 操作未被等待 → 数值全错）——T0 的 ds 指令/
-                            //     wait 语义与 GFX12 dscnt 计数机制不匹配。
-                            //  → 保持 s_waitcnt lgkmcnt（RDNA4 operand 忽略 = S_WAIT_IDLE
-                            //    全等，正确但性能损失）。TODO: 修 ds 指令编码/计数对齐后
-                            //    再试 s_wait_dscnt。
-                            writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
+                            // 根因（2026-08-30 实证）：GFX1200 的 dscnt 计数需先经 s_wait_kmcnt
+                            // 激活——T0 之前的 s_waitcnt lgkmcnt（RDNA4 operand 忽略 =
+                            // S_WAIT_IDLE）不等/不激活 dscnt → 后续 ds 操作未被等待（欠等待，
+                            // 数值全错）。先 s_wait_kmcnt（激活 + 等标量内存）再 s_wait_dscnt
+                            // （等 LDS）→ 精确等待，比 S_WAIT_IDLE 全等性能更好。
+                            // 顺序关键：dscnt 在 kmcnt 前会死锁（dscnt 未激活即等待）。
+                            writeln!(self.buf, "{}s_wait_kmcnt {}", self.indent, actual).unwrap();
+                            writeln!(self.buf, "{}s_wait_dscnt {}", self.indent, actual).unwrap();
                         }
                         WaitcntForm::Unified => {
                             writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
