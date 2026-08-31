@@ -809,10 +809,11 @@ impl AsmEmitter {
             Op::WaitVmcnt(n) => {
                 if self.outstanding_vmcnt > 0 || *n > 0 {
                     let actual = (*n as u32).min(self.outstanding_vmcnt);
-                    match self.target {
-                        Target::GFX1200 =>
+                    // RDNA4：VMEM 加载等待拆分为 s_wait_loadcnt；RDNA3 用统一 s_waitcnt vmcnt
+                    match self.caps().waitcnt {
+                        WaitcntForm::Split =>
                             writeln!(self.buf, "{}s_wait_loadcnt {}", self.indent, actual).unwrap(),
-                        Target::GFX1100 =>
+                        WaitcntForm::Unified =>
                             writeln!(self.buf, "{}s_waitcnt vmcnt({})", self.indent, actual).unwrap(),
                     }
                     self.outstanding_vmcnt = actual;
@@ -842,11 +843,11 @@ impl AsmEmitter {
                     // GFX11 exposes VSCNT via the split s_waitcnt_vscnt (VINTRP space);
                     // GFX12 removed it — the unified s_waitcnt simm16 encodes
                     // storecnt, and the dedicated form is s_wait_storecnt.
-                    match self.target {
-                        Target::GFX1200 => {
+                    match self.caps().waitcnt {
+                        WaitcntForm::Split => {
                             writeln!(self.buf, "{}s_wait_storecnt {:#x}", self.indent, actual).unwrap();
                         }
-                        Target::GFX1100 => {
+                        WaitcntForm::Unified => {
                             writeln!(self.buf, "{}s_waitcnt_vscnt null, {:#x}", self.indent, actual).unwrap();
                         }
                     }
@@ -857,12 +858,12 @@ impl AsmEmitter {
                 }
             }
             Op::WaitKmcnt(n) => {
-                // Scalar memory wait: s_wait_kmcnt on GFX1200, s_waitcnt lgkmcnt on GFX11
-                match self.target {
-                    Target::GFX1200 => {
+                // Scalar memory wait: RDNA4 s_wait_kmcnt；RDNA3 s_waitcnt lgkmcnt
+                match self.caps().waitcnt {
+                    WaitcntForm::Split => {
                         writeln!(self.buf, "{}s_wait_kmcnt {}", self.indent, n).unwrap();
                     }
-                    Target::GFX1100 => {
+                    WaitcntForm::Unified => {
                         writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, n).unwrap();
                     }
                 }
@@ -1004,9 +1005,10 @@ impl AsmEmitter {
             Op::WaveReduceAddF32 { val, tmp } => {
                 let vv = a.phys_v(*val);
                 let vt = a.phys_v(*tmp);
-                let ds_wait = match self.target {
-                    Target::GFX1200 => "s_wait_dscnt 0",
-                    Target::GFX1100 => "s_waitcnt lgkmcnt(0)",
+                // RDNA4：DS 等待用 s_wait_dscnt；RDNA3 用统一 s_waitcnt lgkmcnt
+                let ds_wait = match self.caps().waitcnt {
+                    WaitcntForm::Split => "s_wait_dscnt 0",
+                    WaitcntForm::Unified => "s_waitcnt lgkmcnt(0)",
                 };
                 for (offset, label) in &[
                     (0x401Fu16, "xor16"), (0x201F, "xor8"),
@@ -1022,9 +1024,10 @@ impl AsmEmitter {
             Op::WaveReduceMaxF32 { val, tmp } => {
                 let vv = a.phys_v(*val);
                 let vt = a.phys_v(*tmp);
-                let ds_wait = match self.target {
-                    Target::GFX1200 => "s_wait_dscnt 0",
-                    Target::GFX1100 => "s_waitcnt lgkmcnt(0)",
+                // RDNA4：DS 等待用 s_wait_dscnt；RDNA3 用统一 s_waitcnt lgkmcnt
+                let ds_wait = match self.caps().waitcnt {
+                    WaitcntForm::Split => "s_wait_dscnt 0",
+                    WaitcntForm::Unified => "s_waitcnt lgkmcnt(0)",
                 };
                 for (offset, label) in &[
                     (0x401Fu16, "xor16"), (0x201F, "xor8"),
