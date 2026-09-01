@@ -15,3 +15,9 @@ PROJECT_MEMORY.md
 doublecheck-*.md
 # 误创建的编译产物
 1
+# 会话调试示例（dump/探针——非交付物）
+examples/dump_*.rs
+examples/lds_check.rs
+examples/pm4_add.rs
+examples/wave_reduce_probe.rs
+reasonix.toml
