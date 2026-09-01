@@ -132,9 +132,19 @@ impl KernelDescriptor {
         // IEEE_MODE (bit 23): 1 = IEEE 754-2008 compliant NaN handling
         let dx10_clamp = 1_u32;
         let ieee_mode = 1_u32;
-        
-        let rsrc1 = vgprs | (sgprs << 6) | (float_mode << 12) | (dx10_clamp << 21) | (ieee_mode << 23);
-        
+
+        let mut rsrc1 = vgprs | (sgprs << 6) | (float_mode << 12) | (dx10_clamp << 21) | (ieee_mode << 23);
+
+        // GFX1200 (RDNA4) specific bits in COMPUTE_PGM_RSRC1:
+        //   bit 30: ENABLE_MEM_ORDERED_MODE — enables relaxed memory ordering for better perf
+        //   bit 31: FORWARD_PROGRESS — guarantees forward progress (required for some barriers)
+        // LLVM sets both bits by default on gfx1200. Verified via llvm-mc:
+        //   WGP=0 → RSRC1=0xC00C0003, WGP=1 → RSRC1=0xE00C0003
+        if config.target_gfx.starts_with("gfx12") {
+            rsrc1 |= 1 << 30; // ENABLE_MEM_ORDERED_MODE (GFX10+)
+            rsrc1 |= 1 << 31; // FORWARD_PROGRESS
+        }
+
         // COMPUTE_PGM_RSRC2 encoding:
         // [0]     = ENABLE_PRIVATE_SEGMENT
         // [5:1]   = USER_SGPR (number of user SGPRs) = 2 for kernarg ptr only
@@ -1435,14 +1445,264 @@ mod tests {
     fn test_simple_code_object() {
         let mut asm = Rdna3Assembler::new();
         asm.endpgm();
-        
+
         let config = KernelConfig::default();
         let co = AmdGpuCodeObject::from_assembler(&asm, config);
         let bytes = co.to_bytes();
-        
+
         // Verify ELF magic
         assert_eq!(&bytes[0..4], &[0x7f, b'E', b'L', b'F']);
-        
+
         println!("Code object size: {} bytes", bytes.len());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // L1.7 ELF Code Object Audit
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Build a minimal GFX1200 code object for audit testing
+    fn build_gfx1200_co() -> Vec<u8> {
+        let mut asm = Rdna3Assembler::new();
+        asm.set_target("gfx1200");
+        asm.endpgm();
+        let mut config = KernelConfig::default();
+        config.target_gfx = "gfx1200".to_string();
+        config.kernarg_size = 64;
+        config.lds_size = 0;
+        config.vgpr_count = 32;
+        config.sgpr_count = 16;
+        let co = AmdGpuCodeObject::from_assembler(&asm, config);
+        co.to_bytes()
+    }
+
+    /// Build a minimal GFX1100 code object for audit testing
+    fn build_gfx1100_co() -> Vec<u8> {
+        let mut asm = Rdna3Assembler::new();
+        asm.set_target("gfx1100");
+        asm.endpgm();
+        let mut config = KernelConfig::default();
+        config.target_gfx = "gfx1100".to_string();
+        let co = AmdGpuCodeObject::from_assembler(&asm, config);
+        co.to_bytes()
+    }
+
+    #[test]
+    fn test_elf_magic_and_class() {
+        let bytes = build_gfx1200_co();
+        // e_ident[0..4] = 0x7f 'E' 'L' 'F'
+        assert_eq!(bytes[0], 0x7f, "ELF magic byte 0");
+        assert_eq!(bytes[1], b'E', "ELF magic byte 1");
+        assert_eq!(bytes[2], b'L', "ELF magic byte 2");
+        assert_eq!(bytes[3], b'F', "ELF magic byte 3");
+        // e_ident[4] = ELFCLASS64 = 2
+        assert_eq!(bytes[4], 2, "ELF class must be ELFCLASS64");
+        // e_ident[5] = ELFDATA2LSB = 1
+        assert_eq!(bytes[5], 1, "ELF data must be little-endian");
+        // e_ident[6] = EV_CURRENT = 1
+        assert_eq!(bytes[6], 1, "ELF version must be EV_CURRENT");
+        // e_ident[7] = ELFOSABI_AMDGPU_HSA = 64 (0x40)
+        assert_eq!(bytes[7], 64, "OSABI must be ELFOSABI_AMDGPU_HSA (0x40)");
+        // e_ident[8] = ELFABIVERSION_AMDGPU_HSA_V5 = 4
+        assert_eq!(bytes[8], 4, "ABIVERSION must be AMDGPU_HSA_V5 (4)");
+    }
+
+    #[test]
+    fn test_elf_machine_and_type() {
+        let bytes = build_gfx1200_co();
+        let e_type = u16::from_le_bytes([bytes[16], bytes[17]]);
+        let e_machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+        // e_type = ET_DYN = 3 (required for HIP code objects)
+        assert_eq!(e_type, 3, "e_type must be ET_DYN (3)");
+        // e_machine = EM_AMDGPU = 224 (0xE0)
+        assert_eq!(e_machine, 224, "e_machine must be EM_AMDGPU (224)");
+    }
+
+    #[test]
+    fn test_elf_gfx1200_flags() {
+        let bytes = build_gfx1200_co();
+        let e_flags = u32::from_le_bytes([bytes[48], bytes[49], bytes[50], bytes[51]]);
+        // GFX1200 e_flags = 0x048
+        assert_eq!(e_flags, 0x048, "GFX1200 e_flags must be 0x048");
+    }
+
+    #[test]
+    fn test_elf_gfx1100_flags() {
+        let bytes = build_gfx1100_co();
+        let e_flags = u32::from_le_bytes([bytes[48], bytes[49], bytes[50], bytes[51]]);
+        // GFX1100 e_flags = 0x041
+        assert_eq!(e_flags, 0x041, "GFX1100 e_flags must be 0x041");
+    }
+
+    #[test]
+    fn test_elf_header_sizes() {
+        let bytes = build_gfx1200_co();
+        let e_ehsize = u16::from_le_bytes([bytes[52], bytes[53]]);
+        let e_phentsize = u16::from_le_bytes([bytes[54], bytes[55]]);
+        let e_phnum = u16::from_le_bytes([bytes[56], bytes[57]]);
+        let e_shentsize = u16::from_le_bytes([bytes[58], bytes[59]]);
+        let e_shnum = u16::from_le_bytes([bytes[60], bytes[61]]);
+        assert_eq!(e_ehsize, 64, "ELF header size = 64");
+        assert_eq!(e_phentsize, 56, "Program header size = 56");
+        assert_eq!(e_phnum, 2, "2 program headers (PT_LOAD + PT_NOTE)");
+        assert_eq!(e_shentsize, 64, "Section header size = 64");
+        assert_eq!(e_shnum, 7, "7 section headers");
+    }
+
+    #[test]
+    fn test_kernel_descriptor_rsrc1_gfx1200() {
+        let config = KernelConfig {
+            vgpr_count: 32,
+            sgpr_count: 16,
+            scratch_size: 0,
+            target_gfx: "gfx1200".to_string(),
+            ..Default::default()
+        };
+        let kd = KernelDescriptor::for_gfx11(&config, 128);
+
+        // COMPUTE_PGM_RSRC1 for GFX1200 (Wave32):
+        //   VGPR granularity 8: (32+7)/8 - 1 = 3
+        //   SGPR = 0 (GFX10+ always 0)
+        //   FLOAT_MODE = 0xCF
+        //   DX10_CLAMP = 1, IEEE_MODE = 1
+        let rsrc1 = kd.compute_pgm_rsrc1;
+        let vgprs = rsrc1 & 0x3F;
+        assert_eq!(vgprs, 3, "VGPR count: (32+7)/8-1 = 3");
+        // SGPR field must be 0 on GFX10+
+        let sgprs = (rsrc1 >> 6) & 0xF;
+        assert_eq!(sgprs, 0, "SGPR field must be 0 on GFX10+");
+        // FLOAT_MODE bits [19:12] = 0xCF
+        let float_mode = (rsrc1 >> 12) & 0xFF;
+        assert_eq!(float_mode, 0xCF, "FLOAT_MODE = 0xCF");
+        // IEEE_MODE bit 23 = 1
+        let ieee = (rsrc1 >> 23) & 1;
+        assert_eq!(ieee, 1, "IEEE_MODE must be 1");
+        // GFX1200-specific: bit 30 = ENABLE_MEM_ORDERED_MODE
+        assert_eq!((rsrc1 >> 30) & 1, 1, "GFX1200: MEM_ORDERED_MODE bit 30 must be set");
+        // GFX1200-specific: bit 31 = FORWARD_PROGRESS
+        assert_eq!((rsrc1 >> 31) & 1, 1, "GFX1200: FORWARD_PROGRESS bit 31 must be set");
+    }
+
+    #[test]
+    fn test_kernel_descriptor_rsrc1_gfx1100_no_mem_ordered() {
+        let config = KernelConfig {
+            vgpr_count: 32,
+            target_gfx: "gfx1100".to_string(),
+            ..Default::default()
+        };
+        let kd = KernelDescriptor::for_gfx11(&config, 128);
+        let rsrc1 = kd.compute_pgm_rsrc1;
+        // GFX1100 must NOT set bits 30-31
+        assert_eq!((rsrc1 >> 30) & 1, 0, "GFX1100: bit 30 must NOT be set");
+        assert_eq!((rsrc1 >> 31) & 1, 0, "GFX1100: bit 31 must NOT be set");
+    }
+
+    #[test]
+    fn test_kernel_descriptor_rsrc2() {
+        let config = KernelConfig {
+            kernarg_size: 64,
+            workgroup_size_x: 256,
+            workgroup_size_y: 1,
+            workgroup_size_z: 1,
+            scratch_size: 0,
+            ..Default::default()
+        };
+        let kd = KernelDescriptor::for_gfx11(&config, 128);
+        let rsrc2 = kd.compute_pgm_rsrc2;
+
+        // COMPUTE_PGM_RSRC2:
+        //   bit 0: ENABLE_PRIVATE_SEGMENT = 0 (scratch_size = 0)
+        assert_eq!(rsrc2 & 1, 0, "PRIVATE_SEGMENT disabled when scratch=0");
+        //   bits [5:1]: USER_SGPR = 2 (kernarg ptr)
+        assert_eq!((rsrc2 >> 1) & 0x1F, 2, "USER_SGPR = 2");
+        //   bit 7: TGID_X_EN = 1
+        assert_eq!((rsrc2 >> 7) & 1, 1, "TGID_X_EN = 1");
+        //   bit 8: TGID_Y_EN = 1
+        assert_eq!((rsrc2 >> 8) & 1, 1, "TGID_Y_EN = 1");
+        //   bit 9: TGID_Z_EN = 1
+        assert_eq!((rsrc2 >> 9) & 1, 1, "TGID_Z_EN = 1");
+        //   LDS_SIZE bits [15:10] = 0 on GFX11+
+        assert_eq!((rsrc2 >> 10) & 0x3F, 0, "LDS_SIZE=0 on GFX11 (CP reads from descriptor)");
+    }
+
+    #[test]
+    fn test_kernel_descriptor_code_properties() {
+        let config = KernelConfig::default();
+        let kd = KernelDescriptor::for_gfx11(&config, 128);
+        let props = kd.kernel_code_properties;
+
+        // KERNEL_CODE_PROPERTIES:
+        //   bit 3: ENABLE_SGPR_KERNARG_SEGMENT_PTR = 1
+        assert_eq!((props >> 3) & 1, 1, "KERNARG_SEGMENT_PTR enabled");
+        //   bits [9:7]: ENABLE_VGPR_WORKITEM_ID = 1 (X only)
+        assert_eq!((props >> 7) & 7, 1, "WORKITEM_ID = 1 (X only)");
+        //   bit 10: ENABLE_WAVEFRONT_SIZE32 = 1
+        assert_eq!((props >> 10) & 1, 1, "WAVEFRONT_SIZE32 = 1");
+    }
+
+    #[test]
+    fn test_kernel_descriptor_entry_alignment() {
+        let config = KernelConfig::default();
+        let kd = KernelDescriptor::for_gfx11(&config, 128);
+
+        // kernel_code_entry_byte_offset must be 64 (descriptor size)
+        // NOTE: KernelDescriptor is repr(C, packed), so copy field to local
+        let entry_offset = kd.kernel_code_entry_byte_offset;
+        assert_eq!(entry_offset, 64,
+            "Code entry must be 64 bytes after descriptor");
+    }
+
+    #[test]
+    fn test_note_metadata_target_gfx1200() {
+        let mut asm = Rdna3Assembler::new();
+        asm.set_target("gfx1200");
+        asm.endpgm();
+        let mut config = KernelConfig::default();
+        config.target_gfx = "gfx1200".to_string();
+        config.name = "test_kernel".to_string();
+        let co = AmdGpuCodeObject::from_assembler(&asm, config);
+        let bytes = co.to_bytes();
+
+        // Search for "amdgcn-amd-amdhsa--gfx1200" in the note descriptor
+        let needle = b"amdgcn-amd-amdhsa--gfx1200";
+        let found = bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(found, "Note descriptor must contain target: amdgcn-amd-amdhsa--gfx1200");
+    }
+
+    #[test]
+    fn test_note_metadata_wavefront_size() {
+        let config = KernelConfig {
+            name: "wf_test".to_string(),
+            ..Default::default()
+        };
+        let mut asm = Rdna3Assembler::new();
+        asm.endpgm();
+        let co = AmdGpuCodeObject::from_assembler(&asm, config);
+        let bytes = co.to_bytes();
+
+        // Search for wavefront_size = 32 in the MSGPACK metadata
+        // The value 0x20 (32) appears after ".wavefront_size" marker
+        let needle = b".wavefront_size";
+        let pos = bytes.windows(needle.len())
+            .position(|w| w == needle)
+            .expect("Note must contain .wavefront_size");
+        // Next byte after the key should contain 0x20 (MSGPACK fixint 32)
+        assert_eq!(bytes[pos + needle.len()], 0x20,
+            "wavefront_size must be 32 (0x20)");
+    }
+
+    #[test]
+    fn test_elf_section_alignment() {
+        let bytes = build_gfx1200_co();
+
+        // .text section alignment (section header 1, sh_addralign at offset 48)
+        // First section header starts at e_shoff
+        let e_shoff = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+        let shdr_size = 64;
+        // .text is section 1, sh_addralign is at shdr offset 48
+        let text_shdr_offset = e_shoff + shdr_size; // skip NULL shdr
+        let text_align = u64::from_le_bytes(
+            bytes[text_shdr_offset + 48..text_shdr_offset + 56].try_into().unwrap()
+        );
+        assert_eq!(text_align, 256, ".text alignment must be 256");
     }
 }

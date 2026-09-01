@@ -11,11 +11,24 @@ repository = "https://github.com/GeisYaO/t0-gpu"
 
 [features]
 default = []
-rocm = []  # Enable KFD runtime (requires /dev/kfd)
+rocm = []                          # Enable KFD runtime (requires /dev/kfd)
+monitor = ["dep:ratatui", "dep:crossterm", "dep:tokio"]  # GPU monitoring TUI
 
 [dependencies]
-# No external dependencies — pure Rust
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+libc = "0.2"
+
+[[bin]]
+name = "t0"
+path = "src/bin/t0.rs"
 
 [[bin]]
 name = "isa_probe"
 path = "src/bin/isa_probe.rs"
+
+[[bin]]
+name = "gpu_monitor"
+path = "src/bin/gpu_monitor.rs"
+required-features = ["monitor"]

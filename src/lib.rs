@@ -33,6 +33,12 @@ pub mod prelude;
 // ── ISA 编码器 ──
 pub mod rdna3_asm;
 
+// ── ISA 反汇编器 ──
+pub mod rdna3_disasm;
+
+// ── WMMA Intrinsic Database ──
+pub mod wmma_db;
+
 // ── Code Object (ELF) 生成器 ──
 pub mod rdna3_code_object;
 
@@ -43,3 +49,6 @@ pub mod kfd;
 // ── Ignis — GPU-native autodiff framework ──
 #[cfg(feature = "rocm")]
 pub mod ignis;
+
+// ── 通用 GPU 运行时 (跨厂商) ──
+pub mod universal;
