@@ -17,7 +17,7 @@ fn main() -> Result<(), String> {
     eprintln!("\n[1/5] Compiling kernel with T0...");
     let sched = GFX1100Schedule {};
     let kernel_ir = math::elementwise_binary(&sched, math::BinaryOp::Add);
-    let elf = kernel_ir.compile(Target::GFX1100)?;
+    let elf = kernel_ir.compile(Target::detect())?;  // 2026-09-01: GFX1100 硬编码在 GFX1200 上不兼容——改用 detect
     eprintln!("  ✓ Compiled 'vector_add' kernel: {} bytes ELF", elf.len());
 
     // ── Step 2: Open KFD device ──
