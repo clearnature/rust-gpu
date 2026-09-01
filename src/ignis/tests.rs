@@ -109,6 +109,11 @@ mod ignis_tests {
         Tape::stop_recording();
 
         let c_data = c.to_f32_vec();
+        eprintln!("[DEBUG] c_data = {:?}", c_data);
+        // PROBE: write constant to c buffer to verify store works
+        unsafe { std::ptr::write_volatile(c.buffer().host_ptr as *mut f32, 99.0); }
+        let probe = f32::from_le_bytes(c.buffer().read_bytes(0, 4).try_into().unwrap());
+        eprintln!("[PROBE] wrote 99.0 to c[0], readback={}", probe);
         assert!((c_data[0] - 5.0).abs() < 1e-5);
         assert!((c_data[1] - 7.0).abs() < 1e-5);
         assert!((c_data[2] - 9.0).abs() < 1e-5);
@@ -643,7 +648,123 @@ mod ignis_tests {
         assert!((out[2] - 43.0).abs() < 1e-5, "[2] {} != 43", out[2]); // 4*10+3
         assert!((out[3] - 54.0).abs() < 1e-5, "[3] {} != 54", out[3]); // 5*10+4
     }
+
+    /// Test: hand-written kernel with simple bounds check (v_cmp_lt_u32 directly)
+    #[test]
+    fn test_literal0_offset() {
+        let rt = setup();
+        let device = &rt.device;
+
+        let a_data = [1.0f32, 2.0, 3.0];
+        let b_data = [4.0f32, 5.0, 6.0];
+        let expected = [5.0f32, 7.0, 9.0];
+        let n: u32 = 3;
+
+        let a_buf = device.alloc_uncached(4096).unwrap();
+        a_buf.write(&a_data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        let b_buf = device.alloc_uncached(4096).unwrap();
+        b_buf.write(&b_data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        let out_buf = device.alloc_uncached(4096).unwrap();
+        out_buf.zero();
+
+        let mut ka = [0u8; 28];
+        ka[0..8].copy_from_slice(&a_buf.gpu_addr().to_le_bytes());
+        ka[8..16].copy_from_slice(&b_buf.gpu_addr().to_le_bytes());
+        ka[16..24].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
+        ka[24..28].copy_from_slice(&n.to_le_bytes());
+
+        // Simple bounds check kernel (v_cmp_lt_u32 directly, no v_cndmask)
+        let hsaco = std::fs::read("/tmp/test_simple_bounds.hsaco")
+            .expect("test_simple_bounds.hsaco not found");
+        let config = crate::kfd::KernelLoadConfig { workgroup_size: [32, 1, 1], lds_size: 0 };
+        let kernel = crate::kfd::GpuKernel::load(device, &hsaco, &config).unwrap();
+        rt.dispatch(&kernel, [32, 1, 1], &ka).unwrap();
+
+        let r0 = f32::from_le_bytes(out_buf.read_bytes(0, 4).try_into().unwrap());
+        let r1 = f32::from_le_bytes(out_buf.read_bytes(4, 4).try_into().unwrap());
+        let r2 = f32::from_le_bytes(out_buf.read_bytes(8, 4).try_into().unwrap());
+        eprintln!("[SIMPLE_BOUNDS] result=[{},{},{}] expected=[{},{},{}]", r0, r1, r2, expected[0], expected[1], expected[2]);
+        assert!((r0 - expected[0]).abs() < 0.01, "expected {} got {}", expected[0], r0);
+    }
+
+    /// Test: hand-written relu kernel with direct bounds check
+    #[test]
+    fn test_relu_direct() {
+        let rt = setup();
+        let device = &rt.device;
+
+        let a_data = [1.0f32, 1.0, 1.0, 1.0];
+        let n: u32 = 4;
+
+        let a_buf = device.alloc_uncached(4096).unwrap();
+        a_buf.write(&a_data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        let out_buf = device.alloc_uncached(4096).unwrap();
+        out_buf.zero();
+
+        let mut ka = [0u8; 20];
+        ka[0..8].copy_from_slice(&a_buf.gpu_addr().to_le_bytes());
+        ka[8..16].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
+        ka[16..20].copy_from_slice(&n.to_le_bytes());
+
+        let hsaco = std::fs::read("/tmp/test_relu_direct.hsaco")
+            .expect("test_relu_direct.hsaco not found");
+        let config = crate::kfd::KernelLoadConfig { workgroup_size: [32, 1, 1], lds_size: 0 };
+        let kernel = crate::kfd::GpuKernel::load(device, &hsaco, &config).unwrap();
+        rt.dispatch(&kernel, [32, 1, 1], &ka).unwrap();
+
+        let r0 = f32::from_le_bytes(out_buf.read_bytes(0, 4).try_into().unwrap());
+        let r1 = f32::from_le_bytes(out_buf.read_bytes(4, 4).try_into().unwrap());
+        let r2 = f32::from_le_bytes(out_buf.read_bytes(8, 4).try_into().unwrap());
+        let r3 = f32::from_le_bytes(out_buf.read_bytes(12, 4).try_into().unwrap());
+        eprintln!("[RELU_DIRECT] result=[{},{},{},{}] expected=[1,1,1,1]", r0, r1, r2, r3);
+        assert!((r0 - 1.0).abs() < 0.01, "lane 0: expected 1.0 got {}", r0);
+        assert!((r1 - 1.0).abs() < 0.01, "lane 1: expected 1.0 got {}", r1);
+        assert!((r2 - 1.0).abs() < 0.01, "lane 2: expected 1.0 got {}", r2);
+        assert!((r3 - 1.0).abs() < 0.01, "lane 3: expected 1.0 got {}", r3);
+    }
+
+    /// Test: load T0-compiled relu HSACO and dispatch with manual kernarg (bypass T0 dispatch)
+    #[test]
+    fn test_relu_hsaco_manual() {
+        let rt = setup();
+        let device = &rt.device;
+
+        let a_data = [1.0f32, 1.0, 1.0, 1.0];
+        let n: u32 = 4;
+
+        let a_buf = device.alloc_uncached(4096).unwrap();
+        a_buf.write(&a_data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        let out_buf = device.alloc_uncached(4096).unwrap();
+        out_buf.zero();
+
+        // Load the T0-compiled HSACO (same as relu kernel)
+        let hsaco = std::fs::read("/tmp/t0_relu6.hsaco")
+            .expect("T0 relu HSACO not found. Run test_relu_backward with T0_DUMP_HSACO first.");
+        let config = crate::kfd::KernelLoadConfig { workgroup_size: [32, 1, 1], lds_size: 0 };
+        let kernel = crate::kfd::GpuKernel::load(device, &hsaco, &config).unwrap();
+
+        // Same kernarg layout as mimic test
+        let mut ka = [0u8; 20];
+        ka[0..8].copy_from_slice(&a_buf.gpu_addr().to_le_bytes());
+        ka[8..16].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
+        ka[16..20].copy_from_slice(&n.to_le_bytes());
+
+        rt.dispatch(&kernel, [32, 1, 1], &ka).unwrap();
+
+        let r0 = f32::from_le_bytes(out_buf.read_bytes(0, 4).try_into().unwrap());
+        let r1 = f32::from_le_bytes(out_buf.read_bytes(4, 4).try_into().unwrap());
+        let r2 = f32::from_le_bytes(out_buf.read_bytes(8, 4).try_into().unwrap());
+        let r3 = f32::from_le_bytes(out_buf.read_bytes(12, 4).try_into().unwrap());
+        eprintln!("[RELU_HSACO_MANUAL] result=[{},{},{},{}] expected=[1,1,1,1]", r0, r1, r2, r3);
+        assert!((r0 - 1.0).abs() < 0.01, "lane 0: expected 1.0 got {}", r0);
+        assert!((r1 - 1.0).abs() < 0.01, "lane 1: expected 1.0 got {}", r1);
+        assert!((r2 - 1.0).abs() < 0.01, "lane 2: expected 1.0 got {}", r2);
+        assert!((r3 - 1.0).abs() < 0.01, "lane 3: expected 1.0 got {}", r3);
+    }
 }
+
+
+
 
 // ════════════════════════════════════════════════
 //  Non-GPU tests (always available)

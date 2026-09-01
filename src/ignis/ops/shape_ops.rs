@@ -210,7 +210,7 @@ pub fn relu(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
             let n_arg = kb.arg_u32("n");
 
             let pid = kb.program_id(0);
-            let bs = kb.const_u32(256);
+            let bs = kb.const_u32(32);
             let base = pid.mul(&mut kb, bs);
             let tid = kb.arange(0, 256);
             let off = tid.add(&mut kb, base);
@@ -220,12 +220,22 @@ pub fn relu(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
             kb.store_checked(out_ptr, off, result, n_arg);
 
             let compiled = kb.compile(Target::detect())?;
+            // GFX1200 debug: dump HSACO for disassembly comparison
+            if std::env::var("T0_DUMP_HSACO").is_ok() {
+                let path = std::env::var("T0_DUMP_HSACO").unwrap();
+                std::fs::write(&path, &compiled.elf).unwrap();
+                eprintln!("[T0_DUMP_HSACO] wrote {} bytes to {}", compiled.elf.len(), path);
+            }
             runtime.compile_dsl(compiled)?
         }
     };
 
     let out_buf = runtime.alloc_f32(n)?;
-    let grid_x = ((n as u32 + 255) / 256) * 256;
+    // grid_size is in workitems. Must be >= workgroup_size to ensure all threads execute.
+    // Original: (n + 255) / 256 — this computes workGROUP count, not workITEM count.
+    // Fix: round up n to next multiple of wg_size.
+    let wg_size = 256u32; // must match BlockKernel::new WG size
+    let grid_x = ((n as u32 + wg_size - 1) / wg_size) * wg_size;
     let ka = crate::kernargs![
         a.gpu_addr() => u64,
         out_buf.gpu_addr() => u64,

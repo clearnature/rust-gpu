@@ -72,7 +72,7 @@ impl Tensor {
         // Pad allocation to 512 bytes (128 f32s) min — vectorized kernels
         // (adamw_1d, frobenius_norm_partial) use dwordx4 loads without bounds checks.
         let alloc_bytes = ((n * 4).max(512) + 511) & !511;
-        let buf = runtime.device.alloc_vram(alloc_bytes)?;
+        let buf = runtime.device.alloc_uncached(alloc_bytes)?;
         buf.zero(); // zero-fill first to ensure padding is clean
         buf.write(unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, n * 4)
@@ -118,7 +118,7 @@ impl Tensor {
         label: &str,
     ) -> Result<Self, String> {
         let n: usize = shape.iter().product();
-        let buf = runtime.device.alloc_vram(n * 4)?;
+        let buf = runtime.device.alloc_uncached(n * 4)?;
         buf.zero();
         Ok(Tensor {
             id: next_tensor_id(),

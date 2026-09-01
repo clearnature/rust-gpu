@@ -39,16 +39,17 @@ pub fn add(a: &Tensor, b: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, S
         } else {
             use crate::t0::block_dsl::BlockKernel;
             use crate::t0::ir::Target;
-            let mut kb = BlockKernel::new("bdsl_add_f32", 256);
+            let wg_size: u32 = 32;
+            let mut kb = BlockKernel::new("bdsl_add_f32", wg_size);
             let a_ptr = kb.arg_ptr("a");
             let b_ptr = kb.arg_ptr("b");
             let out_ptr = kb.arg_ptr("out");
             let n_arg = kb.arg_u32("n");
 
             let pid = kb.program_id(0);
-            let bs = kb.const_u32(256);
+            let bs = kb.const_u32(wg_size);
             let base = pid.mul(&mut kb, bs);
-            let tid = kb.arange(0, 256);
+            let tid = kb.arange(0, wg_size);
             let off = tid.add(&mut kb, base);
 
             let va = kb.load_checked(a_ptr, off, n_arg);
@@ -61,8 +62,9 @@ pub fn add(a: &Tensor, b: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, S
         }
     };
 
-    // Dispatch: grid = ceil(n / 256) * 256
-    let grid_x = ((n as u32 + 255) / 256) * 256;
+    // Dispatch: grid = ceil(n / wg_size) * wg_size
+    let wg_size = 32u32;
+    let grid_x = ((n as u32 + wg_size - 1) / wg_size) * wg_size;
     let ka = crate::kernargs![
         a.gpu_addr() => u64,
         b.gpu_addr() => u64,
@@ -261,13 +263,25 @@ pub fn sum(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
             }
         };
 
-        let grid_x = n_wgs * wg_size;
-        let ka = crate::kernargs![
-            a.gpu_addr() => u64,
-            partial_buf.gpu_addr() => u64,
-            n as u32 => u32
-        ];
-        runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)?;
+        // GFX1200 MES firmware bug (P2): TGID.x is always 0xFFFFFFFF, so
+        // multi-WG dispatch cannot use program_id(0) for per-WG indexing.
+        // Workaround: dispatch one single-WG block at a time, advancing the
+        // input pointer by 256 elements per dispatch. The kernel itself uses
+        // hardcoded wg_id=0 (see asm_emitter CaptureTgid), which is correct
+        // for single-WG grids.
+        let elem_bytes = std::mem::size_of::<f32>() as u64;
+        for wg_idx in 0..n_wgs {
+            let elems_done = wg_idx * wg_size;
+            let n_rem = (n as u32).saturating_sub(elems_done);
+            let in_addr = a.gpu_addr() + (elems_done as u64) * elem_bytes;
+            let out_addr = partial_buf.gpu_addr() + (wg_idx as u64) * elem_bytes;
+            let ka = crate::kernargs![
+                in_addr => u64,
+                out_addr => u64,
+                n_rem => u32
+            ];
+            runtime.dispatch(&kernel, [wg_size, 1, 1], &ka)?;
+        }
 
         // CPU final sum of partial results (n_wgs values — typically a few hundred)
         let partial_data = runtime.read_f32(&partial_buf, n_wgs as usize);

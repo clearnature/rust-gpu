@@ -80,6 +80,8 @@ impl TransformerLayer {
     }
 
     /// Simple forward (no OCPA — standard matmul attention for testing).
+    ///
+    /// Uses fused RMSNorm+GEMV for FFN down projection when M=1 (decode).
     pub fn forward_simple(&self, x: &Tensor) -> Result<Tensor, String> {
         let device = &self.runtime.device;
 
@@ -93,17 +95,35 @@ impl TransformerLayer {
         let attn_out = ops::bf16_matmul::matmul(&q, &self.wo.weight, device)?;
         let x2 = ops::add::add(x, &attn_out, device)?;
 
-        // FFN sub-layer
-        let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
-        let gate = self.w_gate.forward(&h2)?;
-        let up = self.w_up.forward(&h2)?;
-        let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
-        let ffn_out = self.w_down.forward(&silu_out)?;
-
-        ops::add::add(&x2, &ffn_out, device)
+        // FFN sub-layer — fused residual+RMSNorm+down projection for decode
+        let m = x2.shape()[0];
+        if m == 1 {
+            // Decode: fuse residual_add + RMSNorm + SiLU_gate + down projection
+            // Step 1: RMSNorm + gate projection (fused)
+            let gate = ops::fused_rmsnorm_gemm::fused_rmsnorm_gemm(
+                &x2, &self.ffn_norm_gamma, &self.w_gate.weight, 1e-5,
+            )?;
+            // Step 2: RMSNorm + up projection (fused, reuses same RMSNorm)
+            let up = ops::fused_rmsnorm_gemm::fused_rmsnorm_gemm(
+                &x2, &self.ffn_norm_gamma, &self.w_up.weight, 1e-5,
+            )?;
+            let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
+            let ffn_out = self.w_down.forward(&silu_out)?;
+            ops::add::add(&x2, &ffn_out, device)
+        } else {
+            // Prefill: separate rmsnorm + matmul
+            let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
+            let gate = self.w_gate.forward(&h2)?;
+            let up = self.w_up.forward(&h2)?;
+            let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
+            let ffn_out = self.w_down.forward(&silu_out)?;
+            ops::add::add(&x2, &ffn_out, device)
+        }
     }
 
     /// Full forward with OCPA attention.
+    ///
+    /// Uses fused RMSNorm+GEMV for FFN sub-layer when M=1 (decode).
     pub fn forward_ocpa(&self, x: &Tensor, config: &ops::ocpa_attention::OcpaConfig) -> Result<Tensor, String> {
         let device = &self.runtime.device;
 
@@ -116,13 +136,26 @@ impl TransformerLayer {
         let proj_out = self.wo.forward(&attn_out)?;
         let x2 = ops::add::add(x, &proj_out, device)?;
 
-        let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
-        let gate = self.w_gate.forward(&h2)?;
-        let up = self.w_up.forward(&h2)?;
-        let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
-        let ffn_out = self.w_down.forward(&silu_out)?;
-
-        ops::add::add(&x2, &ffn_out, device)
+        // FFN sub-layer — fused for decode
+        let m = x2.shape()[0];
+        if m == 1 {
+            let gate = ops::fused_rmsnorm_gemm::fused_rmsnorm_gemm(
+                &x2, &self.ffn_norm_gamma, &self.w_gate.weight, 1e-5,
+            )?;
+            let up = ops::fused_rmsnorm_gemm::fused_rmsnorm_gemm(
+                &x2, &self.ffn_norm_gamma, &self.w_up.weight, 1e-5,
+            )?;
+            let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
+            let ffn_out = self.w_down.forward(&silu_out)?;
+            ops::add::add(&x2, &ffn_out, device)
+        } else {
+            let h2 = ops::rmsnorm::rmsnorm(&x2, &self.ffn_norm_gamma, device)?;
+            let gate = self.w_gate.forward(&h2)?;
+            let up = self.w_up.forward(&h2)?;
+            let silu_out = ops::silu::silu_gate(&gate, &up, device)?;
+            let ffn_out = self.w_down.forward(&silu_out)?;
+            ops::add::add(&x2, &ffn_out, device)
+        }
     }
 }
 
