@@ -1,20 +1,24 @@
-//! GFX1100 Instruction Latency Model
+//! RDNA3/RDNA4 Instruction Latency Model
 //!
-//! Provides per-instruction latency and throughput data for the RDNA3
-//! GFX1100 (Navi 31, RX 7900 XTX) GPU. This is the foundation for:
+//! Provides per-instruction latency and throughput data for:
+//! - RDNA3 GFX1100 (Navi 31, RX 7900 XTX)
+//! - RDNA4 GFX1200 (Navi 48, RX 9060 XT)
+//!
+//! This is the foundation for:
 //!
 //! 1. **DAG-based instruction scheduling** — critical path analysis
 //! 2. **Cost model refinement** — accurate K-loop iteration estimation
 //! 3. **Software pipelining** — knowing how many VALU can overlap with VMEM
 //!
 //! # Data Sources
-//! - AMD RDNA3 ISA Reference (public)
+//! - AMD RDNA3/RDNA4 ISA Reference (public)
 //! - hw_probe microbenchmarks on actual GFX1100 hardware
+//! - N14 quantum clock calibration for GFX1200 absolute timing
 //! - rocBLAS Tensile scheduling heuristics (reverse-engineered)
 //!
 //! # Units
 //! All latencies are in **shader clock cycles** (not VALU-normalized).
-//! GFX1100 shader clock ≈ 2.5 GHz.  
+//! GFX1100 shader clock ≈ 2.5 GHz; GFX1200 shader clock ≈ 3.15 GHz.
 //! VALU-normalized factor: 1 VALU-norm ≈ 18.3 shader cycles (Wave32).
 
 use super::ir::Op;
@@ -89,6 +93,12 @@ impl InsnLatency {
         // Throughput: 1 per cycle issue, but result takes 36 cycles.
         InsnLatency { class: InsnClass::WMMA, issue: 1, result: 36, recip_throughput: 1.0 }
     }
+    /// SWMMAC INT4: v_swmmac_i32_16x16x64_iu4 (N14-calibrated).
+    /// XDL pipeline: 16 GPU cycles = ~16 shader cycles (GFX1200 has 1:1 GPU:shader).
+    /// 16,384 INT4 MACs per instruction.
+    const fn swmmac() -> Self {
+        InsnLatency { class: InsnClass::WMMA, issue: 1, result: 16, recip_throughput: 1.0 }
+    }
     const fn ctrl() -> Self {
         InsnLatency { class: InsnClass::CTRL, issue: 1, result: 0, recip_throughput: 1.0 }
     }
@@ -99,9 +109,9 @@ impl InsnLatency {
 
 /// Get the latency model for an instruction.
 ///
-/// # RDNA3 GFX1100 Latency Notes
+/// # RDNA3/RDNA4 Latency Notes
 ///
-/// The RDNA3 architecture has several execution pipelines:
+/// The RDNA3/4 architecture has several execution pipelines:
 /// - **VALU pipe**: simple ALU (1 cycle latency, 1 per cycle)
 /// - **Trans pipe**: transcendental (v_exp, v_log, v_sin, v_cos, v_rcp, v_rsq, v_sqrt)
 ///   - Quarter-rate on RDNA3: 4 cycles per op (shared with VALU pipe)
@@ -110,7 +120,8 @@ impl InsnLatency {
 /// - **LDS pipe**: local data share (~20sc latency)
 /// - **SALU pipe**: scalar ALU (1 cycle, runs in parallel with VALU)
 /// - **SMEM pipe**: scalar memory (kernarg loads, ~25sc)
-/// - **WMMA pipe**: matrix multiply (36sc result latency)
+/// - **WMMA pipe**: matrix multiply (BF16: ~36sc result latency)
+/// - **SWMMAC/XDL pipe**: INT4 matrix multiply (16 GPU cycles, N14-calibrated)
 pub fn op_latency(op: &Op) -> InsnLatency {
     match op {
         // ── VALU: simple arithmetic (1 cycle result latency) ──
@@ -165,14 +176,14 @@ pub fn op_latency(op: &Op) -> InsnLatency {
         // ── SALU: scalar ALU ──
         Op::SAddU32 { .. } | Op::SSubU32 { .. } | Op::SAddcU32 { .. } |
         Op::SAndB32 { .. } | Op::SMulI32 { .. } |
-        Op::SLshlB32 { .. } | Op::SLshrB32 { .. } |
+        Op::SLshlB32 { .. } | Op::SLshrB32 { .. } | Op::SLshrB32SgprShift { .. } |
         Op::SMov { .. } |
         Op::SCmpLtU32 { .. } | Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } |
         Op::SMovToVcc { .. } |
         Op::CaptureTgid { .. } | Op::ComputeGlobalIdX { .. } => InsnLatency::salu(),
 
         // ── SMEM: scalar memory (kernarg loads) ──
-        Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } => InsnLatency::smem(),
+        Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } => InsnLatency::smem(),
 
         // ── WMMA: matrix multiply-accumulate ──
         Op::Wmma { .. } => InsnLatency::wmma(),
@@ -189,7 +200,7 @@ pub fn op_latency(op: &Op) -> InsnLatency {
         Op::Endpgm => InsnLatency::ctrl(),
 
         // ── Synchronization ──
-        Op::Barrier | Op::SBarrier => InsnLatency {
+        Op::Barrier | Op::SBarrier | Op::GlobalInv => InsnLatency {
             class: InsnClass::CTRL, issue: 1, result: 0, recip_throughput: 1.0,
         },
         Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
@@ -210,8 +221,12 @@ pub fn op_latency(op: &Op) -> InsnLatency {
         // ── Shader cycles counter ──
         Op::ReadShaderCycles { .. } => InsnLatency::salu(),
 
+        // ── Wavefront scheduling priority (scalar ALU, 1 cycle) ──
+        Op::SSetPrio(_) => InsnLatency::salu(),
+
         // ── Raw assembly (unknown latency, assume VALU) ──
         Op::RawAsm(_) => InsnLatency::valu(),
+        Op::Probe { .. } => InsnLatency::valu(),
     }
 }
 
@@ -264,6 +279,18 @@ pub fn valu_slots_per_wmma() -> u32 {
 /// (due to pipeline stalls and dependency chains).
 pub fn wmma_valu_equivalent() -> u32 {
     4
+}
+
+/// SWMMAC INT4 XDL pipeline latency in shader cycles (N14-calibrated).
+/// 16 GPU cycles at 3.15 GHz = 5.079 ns absolute.
+pub const SWMMAC_LATENCY_SC: u32 = 16;
+
+/// Estimate how many VALU ops can execute while waiting for SWMMAC.
+///
+/// SWMMAC XDL pipeline: 16 shader cycles.
+/// → ~16 independent VALU ops (or another SWMMAC on different accumulators).
+pub fn valu_slots_per_swmmac() -> u32 {
+    SWMMAC_LATENCY_SC / 1
 }
 
 /// Summary statistics for a block of ops.
@@ -389,6 +416,7 @@ mod tests {
             c: super::super::ir::VReg(0),
             format: super::super::ir::WmmaFormat::BF16_F32,
             ab_width: 8,
+            sparse_idx: None,
         };
         let lat = op_latency(&op);
         assert_eq!(lat.class, InsnClass::WMMA);

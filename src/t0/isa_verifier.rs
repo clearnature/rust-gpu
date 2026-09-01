@@ -9,7 +9,7 @@
 //! Runs automatically during T0Kernel::compile() when `KFD_VERIFY=1` or debug_assertions.
 //! Zero cost in release builds unless opted in.
 
-use super::ir::Op;
+use super::ir::{Op, WmmaFormat};
 
 /// Verification result
 #[derive(Debug)]
@@ -80,6 +80,19 @@ pub fn verify_ops(ops: &[Op]) -> VerifyResult {
                         "Op[{}]: Instruction after s_endpgm is unreachable: {:?}", i, op_name(op)
                     ));
                 }
+            }
+        }
+
+        // Arch fix A (2026-08-27): VReg(0) is the hardware workitem_id_x —
+        // NO op may write it (reads are fine; writes corrupt the tid).
+        // The allocators reserve v0, but a hardcoded `dst: VReg(0)` in IR
+        // would slip past them — this catches it at verification time.
+        for d in op.vreg_defs() {
+            if d.0 == 0 {
+                result.errors.push(format!(
+                    "Op[{}]: {:?} writes VReg(0) = hardware workitem_id_x — illegal (tid corruption)",
+                    i, op_name(op)
+                ));
             }
         }
 
@@ -359,13 +372,38 @@ fn format_op_short(op: &Op) -> String {
             format!("ds_load_b32 v{}, v{}, offset:{}", dst.0, vaddr.0, offset),
         Op::DsStoreB32 { vaddr, src, offset } =>
             format!("ds_store_b32 v{}, v{}, offset:{}", vaddr.0, src.0, offset),
-        Op::Wmma { dst, a, b, c, .. } =>
-            format!("v_wmma_f32_16x16x16_bf16 v[{}:{}], v[{}:{}], v[{}:{}], v[{}:{}]",
-                dst.0, dst.0+7, a.0, a.0+7, b.0, b.0+7, c.0, c.0+7),
+        Op::Wmma { dst, a, b, c, format, ab_width, .. } => {
+            let instr = match format {
+                WmmaFormat::BF16_F32 => "v_wmma_f32_16x16x16_bf16",
+                WmmaFormat::F16_F32 => "v_wmma_f32_16x16x16_f16",
+                WmmaFormat::BF16_BF16 => "v_wmma_bf16_16x16x16_bf16",
+                WmmaFormat::F16_F16 => "v_wmma_f16_16x16x16_f16",
+                WmmaFormat::IU8_I32 => "v_wmma_i32_16x16x16_iu8",
+                WmmaFormat::IU4_I32 => "v_wmma_i32_16x16x16_iu4",
+                WmmaFormat::IU4_I32_K32 => "v_wmma_i32_16x16x32_iu4",
+                WmmaFormat::FP8_F32 => "v_wmma_f32_16x16x16_fp8_fp8",
+                WmmaFormat::BF8_F32 => "v_wmma_f32_16x16x16_bf8_bf8",
+                WmmaFormat::FP8_BF8_F32 => "v_wmma_f32_16x16x16_fp8_bf8",
+                WmmaFormat::BF8_FP8_F32 => "v_wmma_f32_16x16x16_bf8_fp8",
+                // SWMMAC
+                WmmaFormat::SMAC_I4_K64 => "v_swmmac_i32_16x16x64_iu4",
+                WmmaFormat::SMAC_I8_K32 => "v_swmmac_i32_16x16x32_iu8",
+                WmmaFormat::SMAC_F16_K32 => "v_swmmac_f32_16x16x32_f16",
+                WmmaFormat::SMAC_BF16_K32 => "v_swmmac_f32_16x16x32_bf16",
+                WmmaFormat::SMAC_FP8_K32 => "v_swmmac_f32_16x16x32_fp8_fp8",
+                WmmaFormat::SMAC_BF8_K32 => "v_swmmac_f32_16x16x32_bf8_bf8",
+                WmmaFormat::SMAC_FP8_BF8_K32 => "v_swmmac_f32_16x16x32_fp8_bf8",
+                WmmaFormat::SMAC_BF8_FP8_K32 => "v_swmmac_f32_16x16x32_bf8_fp8",
+            };
+            let a_end = a.0 + (*ab_width as u32) - 1;
+            format!("{} v[{}:{}], v[{}:{}], v[{}:{}], v[{}:{}]",
+                instr, dst.0, dst.0+7, a.0, a_end, b.0, b.0+(*ab_width as u32)-1, c.0, c.0+7)
+        }
         Op::WaitVmcnt(n) => format!("s_waitcnt vmcnt({})", n),
         Op::WaitLgkmcnt(n) => format!("s_waitcnt lgkmcnt({})", n),
         Op::WaitKmcnt(n) => format!("s_wait_kmcnt {}", n),
         Op::Barrier | Op::SBarrier => "s_barrier".into(),
+        Op::GlobalInv => "global_inv scope:SCOPE_SE".into(),
         Op::SaveExec { dst } => format!("s_and_saveexec_b32 s{}, vcc", dst.0),
         Op::RestoreExec { src } => format!("s_mov_b32 exec_lo, s{}", src.0),
         Op::ClearVcc => "s_mov_b32 vcc_lo, 0".into(),

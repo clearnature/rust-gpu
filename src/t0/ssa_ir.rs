@@ -608,7 +608,7 @@ pub fn schedule_mach_func(func: &mut MachFunc) -> usize {
 
                     // Stop at control flow / sync boundaries
                     let is_boundary = matches!(&cinst.op,
-                        Op::Barrier | Op::SBarrier |
+                        Op::Barrier | Op::SBarrier | Op::GlobalInv |
                         Op::Label(_) |
                         Op::Branch(_) | Op::BranchScc0(_) | Op::BranchScc1(_) |
                         Op::BranchVccz(_)
@@ -803,7 +803,7 @@ pub fn dce_mach_func(func: &mut MachFunc) -> usize {
             || matches!(inst.op,
                 Op::Branch(_) | Op::BranchScc0(_) | Op::BranchScc1(_) |
                 Op::BranchVccz(_) | Op::Endpgm | Op::Label(_) |
-                Op::Barrier | Op::SBarrier)
+                Op::Barrier | Op::SBarrier | Op::GlobalInv)
             || !inst.implicit_defs.is_empty()
             || inst.defs.is_empty() // no defs = keep (stores, etc.)
             // Coalesced group members (WMMA fragments, etc.) must be kept alive
@@ -1218,6 +1218,7 @@ pub fn cse_mach_func(func: &mut MachFunc) -> usize {
             if matches!(inst.op,
                 Op::Label(_) | Op::Branch(_) | Op::BranchScc0(_) |
                 Op::BranchScc1(_) | Op::BranchVccz(_) | Op::Barrier | Op::SBarrier
+                | Op::GlobalInv
             ) {
                 seen.clear();
                 continue;
@@ -1311,7 +1312,13 @@ pub fn cse_mach_func(func: &mut MachFunc) -> usize {
 /// in A is guaranteed to have already been computed at B's entry point.
 ///
 /// Returns the number of instructions eliminated.
-pub fn cse_mach_func_domtree(func: &mut MachFunc) -> usize {
+/// Cross-block CSE via dominance tree.
+///
+/// `addr_vregs` (arch fix B): virtual VGPR numbers of Address class. Their
+/// def instructions are skipped — CSE merging address chains would fold the
+/// lane_hi component and corrupt WMMA fragment reads (observed: K 8-15 never
+/// read, C_RAND 156 vs 168).
+pub fn cse_mach_func_domtree(func: &mut MachFunc, addr_vregs: &std::collections::HashSet<u32>) -> usize {
     let dt = func.build_domtree();
     let preorder = dt.preorder();
 
@@ -1352,7 +1359,7 @@ pub fn cse_mach_func_domtree(func: &mut MachFunc) -> usize {
             // after it (e.g., LDS values written by other waves between barriers).
             // Without this, CSE merges pre-barrier and post-barrier expressions
             // with identical operands, causing GPU hangs in cooperative GEMM kernels.
-            if matches!(inst.op, Op::Barrier | Op::SBarrier) {
+            if matches!(inst.op, Op::Barrier | Op::SBarrier | Op::GlobalInv) {
                 block_seen[blk_id as usize].clear();
                 continue;
             }
@@ -1363,6 +1370,16 @@ pub fn cse_mach_func_domtree(func: &mut MachFunc) -> usize {
                 Op::Label(_) | Op::Branch(_) | Op::BranchScc0(_) |
                 Op::BranchScc1(_) | Op::BranchVccz(_)
             ) { continue; }
+
+            // Arch fix B: never CSE instructions that DEFINE or USE an
+            // Address-class VReg. Address chains (v_add/v_and/v_xor feeding
+            // ds_load) are semantically load-bearing — merging them folds the
+            // lane_hi component and corrupts WMMA reads. Use-side matters too:
+            // a Normal intermediate feeding an address chain (e.g. lane_row)
+            // must not be CSE-merged either (K=48: C_RAND 565 vs 553).
+            if inst.op.vreg_refs().iter().any(|d| addr_vregs.contains(&d.0)) {
+                continue;
+            }
 
             let tag = match &inst.op {
                 Op::VAddF32 { .. } => Some(ADD_F32),
@@ -1881,7 +1898,7 @@ pub fn licm_mach_func(func: &mut MachFunc) -> usize {
                         Op::VReadfirstlane { .. } |
                         Op::Label(_) | Op::Branch(_) | Op::BranchScc0(_) |
                         Op::BranchScc1(_) | Op::BranchVccz(_) |
-                        Op::Barrier | Op::SBarrier
+                        Op::Barrier | Op::SBarrier | Op::GlobalInv
                     ) { continue; }
 
                     // Safety: skip self-update patterns (dst == src, e.g. v += const).
@@ -2191,6 +2208,17 @@ pub fn optimize_waitcnt_mach_func(func: &mut MachFunc) -> usize {
         let mut pending_lgkmcnt: u32 = 0;
         let mut pending_vscnt: u32 = 0;
         let mut to_remove: Vec<usize> = Vec::new();
+        // CRITICAL (P1 fix 2026-08-27): a WaitVmcnt at the START of a block
+        // (before any memory op in THIS block) may be draining loads issued
+        // by a PREDECESSOR block (e.g. a tail-block K-OOB mask placed after
+        // a branch: SSA splits the branch target into a new block whose
+        // pending counter starts at 0). Removing it lets the async load
+        // overwrite the zero-fill → stale OOB data. Only treat a wait as
+        // redundant after at least one memory op of its own class was seen
+        // in this block.
+        let mut seen_vmem = false;
+        let mut seen_lgkm = false;
+        let mut seen_vscnt = false;
 
         for &idx in &blk.insts {
             let inst = &func.insts[idx];
@@ -2199,6 +2227,7 @@ pub fn optimize_waitcnt_mach_func(func: &mut MachFunc) -> usize {
             if matches!(inst.op,
                 Op::Label(_) | Op::Branch(_) | Op::BranchScc0(_) |
                 Op::BranchScc1(_) | Op::BranchVccz(_) | Op::Barrier | Op::SBarrier
+                | Op::GlobalInv
             ) {
                 pending_vmcnt = u32::MAX;
                 pending_lgkmcnt = u32::MAX;
@@ -2212,24 +2241,30 @@ pub fn optimize_waitcnt_mach_func(func: &mut MachFunc) -> usize {
             match &inst.op {
                 Op::GlobalLoad { .. } | Op::BufferLoad { .. } => {
                     pending_vmcnt = pending_vmcnt.saturating_add(1);
+                    seen_vmem = true;
                 }
                 Op::GlobalStore { .. } | Op::BufferStore { .. } => {
                     pending_vmcnt = pending_vmcnt.saturating_add(1);
                     pending_vscnt = pending_vscnt.saturating_add(1);
+                    seen_vmem = true;
+                    seen_vscnt = true;
                 }
                 Op::GlobalAtomicAddF32 { .. } |
                 Op::GlobalAtomicAddU32Rtn { .. } => {
                     pending_vmcnt = pending_vmcnt.saturating_add(1);
+                    seen_vmem = true;
                 }
                 Op::LdsLoad { .. } | Op::DsLoadB32 { .. } | Op::DsLoadB64 { .. } |
                 Op::DsLoadB128 { .. } | Op::DsLoadU16 { .. } |
                 Op::DsLoadU16D16 { .. } | Op::DsLoadU16D16Hi { .. } |
-                Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } => {
+                Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } => {
                     pending_lgkmcnt = pending_lgkmcnt.saturating_add(1);
+                    seen_lgkm = true;
                 }
                 Op::LdsStore { .. } | Op::DsStoreB16 { .. } | Op::DsStoreB32 { .. } |
                 Op::DsStoreB64 { .. } | Op::DsStoreB128 { .. } => {
                     pending_lgkmcnt = pending_lgkmcnt.saturating_add(1);
+                    seen_lgkm = true;
                 }
                 _ => {}
             }
@@ -2238,11 +2273,13 @@ pub fn optimize_waitcnt_mach_func(func: &mut MachFunc) -> usize {
             // wait_vmcnt(N) means "wait until at most N operations outstanding".
             // After wait_vmcnt(N), pending = min(pending, N), NOT 0.
             // Only wait_vmcnt(0) fully drains the counter.
-            // A wait_vmcnt(N) is redundant if pending <= N (already satisfied).
+            // A wait_vmcnt(N) is redundant if pending <= N (already satisfied)
+            // AND we have actually seen a memory op of its class in this
+            // block (a block-entry wait may drain a predecessor block's loads).
             match &inst.op {
                 Op::WaitVmcnt(n) => {
                     let n = *n as u32;
-                    if pending_vmcnt <= n {
+                    if pending_vmcnt <= n && seen_vmem {
                         // Already at or below target — waitcnt is redundant
                         to_remove.push(idx);
                     } else {
@@ -2251,7 +2288,7 @@ pub fn optimize_waitcnt_mach_func(func: &mut MachFunc) -> usize {
                 }
                 Op::WaitLgkmcnt(n) => {
                     let n = *n as u32;
-                    if pending_lgkmcnt <= n {
+                    if pending_lgkmcnt <= n && seen_lgkm {
                         to_remove.push(idx);
                     } else {
                         pending_lgkmcnt = n;
@@ -2260,7 +2297,7 @@ pub fn optimize_waitcnt_mach_func(func: &mut MachFunc) -> usize {
                 Op::WaitKmcnt(n) => {
                     // On GFX1200, kmcnt replaces lgkmcnt for scalar loads
                     let n = *n as u32;
-                    if pending_lgkmcnt <= n {
+                    if pending_lgkmcnt <= n && seen_lgkm {
                         to_remove.push(idx);
                     } else {
                         pending_lgkmcnt = n;
@@ -2268,7 +2305,7 @@ pub fn optimize_waitcnt_mach_func(func: &mut MachFunc) -> usize {
                 }
                 Op::WaitVscnt(n) => {
                     let n = *n as u32;
-                    if pending_vscnt <= n {
+                    if pending_vscnt <= n && seen_vscnt {
                         to_remove.push(idx);
                     } else {
                         pending_vscnt = n;
@@ -3107,9 +3144,9 @@ mod tests {
 
         let func = lift_to_ssa(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -3158,9 +3195,9 @@ mod tests {
 
         let func = lift_to_ssa(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -3196,7 +3233,7 @@ mod tests {
 
         let func = lift_to_ssa(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(8), count: 8, alignment: Alignment::Align8 },
+            VRegAlloc { vreg: VReg(8), count: 8, alignment: Alignment::Align8, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -3224,8 +3261,8 @@ mod tests {
 
         let func = lift_to_ssa(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -3326,7 +3363,7 @@ mod tests {
             Op::Endpgm,
         ];
 
-        let (result, stats) = super::super::opt_passes::optimize(ops, &[]);
+        let (result, stats) = super::super::opt_passes::optimize(ops, &[], &std::collections::HashSet::new());
 
         eprintln!("=== Full optimize ===");
         eprintln!("Stats: DCE={}, CSE={}, Copy={}, AlgSimp={}",
@@ -3386,7 +3423,7 @@ mod tests {
         eprintln!("After copyprop: stride present = {}", has_stride(&lower_from_ssa(&func)));
 
         // 4. CSE (domtree)
-        cse_mach_func_domtree(&mut func);
+        cse_mach_func_domtree(&mut func, &std::collections::HashSet::new());
         eprintln!("After CSE: stride present = {}", has_stride(&lower_from_ssa(&func)));
 
         // 5. Combine
@@ -3416,5 +3453,262 @@ mod tests {
 
         assert!(has_stride(&final_ops),
             "Self-update was eliminated! Check per-pass output above.");
+    }
+}
+
+// ============================================================================
+// Pingpong Warp Scheduling (s_setprio interleaving)
+// ============================================================================
+
+/// Insert s_setprio instructions to alternate priority between dot and memory clusters.
+///
+/// Based on Triton's BlockPingpong.cpp pattern:
+/// - Before a WMMA cluster: s_setprio(1) — raise priority for dot operations
+/// - After a WMMA cluster: s_setprio(0) — lower priority for memory operations
+///
+/// This ensures the hardware scheduler prioritizes WMMA (dot) operations when they're
+/// ready, allowing memory operations to be issued and completed in the background while
+/// WMMA operations execute. The interleaving improves throughput by hiding memory latency
+/// behind WMMA computation.
+///
+/// # Algorithm
+///
+/// 1. Scan through instructions looking for WMMA operations
+/// 2. Track whether we're in a "dot cluster" (consecutive WMMA ops with no intervening
+///    non-WMMA instructions that have side effects)
+/// 3. Insert s_setprio(1) before the first WMMA in a cluster
+/// 4. Insert s_setprio(0) after the last WMMA in a cluster (before next non-dot op)
+///
+/// # Safety
+///
+/// This pass does NOT modify SSA values or register allocation — it only inserts
+/// s_setprio instructions which are scalar ALU ops with no VReg dependencies.
+/// Safe to run after regalloc.
+///
+/// Returns the number of s_setprio instructions inserted.
+pub fn pingpong_schedule(ops: &mut Vec<Op>) -> usize {
+    let mut inserted = 0;
+    let mut i = 0;
+    let mut in_dot_cluster = false;
+
+    while i < ops.len() {
+        let is_wmma = matches!(&ops[i], Op::Wmma { .. });
+
+        if is_wmma {
+            if !in_dot_cluster {
+                // Start of a new dot cluster — raise priority
+                ops.insert(i, Op::SSetPrio(1));
+                inserted += 1;
+                i += 1; // skip the newly inserted s_setprio
+                in_dot_cluster = true;
+            }
+            // Continue through WMMA ops in the cluster
+            i += 1;
+            continue;
+        }
+
+        // Non-WMMA instruction
+        if in_dot_cluster {
+            // End of dot cluster — lower priority
+            // Don't insert before labels/branches (wasteful), but DO insert
+            // before endpgm to ensure priority is lowered before program exit.
+            let is_ctrl = matches!(&ops[i],
+                Op::Label(_) | Op::Branch(_) | Op::BranchScc0(_) |
+                Op::BranchScc1(_) | Op::BranchVccz(_)
+            );
+            if !is_ctrl {
+                ops.insert(i, Op::SSetPrio(0));
+                inserted += 1;
+                i += 1; // skip the newly inserted s_setprio
+            }
+            in_dot_cluster = false;
+        }
+        i += 1;
+    }
+
+    // If we ended in a dot cluster, lower priority at the end
+    // (before endpgm if present)
+    if in_dot_cluster {
+        let insert_pos = ops.len().saturating_sub(1);
+        // Insert before endpgm if that's the last instruction
+        if let Some(Op::Endpgm) = ops.last() {
+            ops.insert(insert_pos, Op::SSetPrio(0));
+        } else {
+            ops.push(Op::SSetPrio(0));
+        }
+        inserted += 1;
+    }
+
+    if inserted > 0 && std::env::var("T0_DUMP_ASM").is_ok() {
+        eprintln!("  [pingpong] inserted {} s_setprio instructions", inserted);
+    }
+
+    inserted
+}
+
+/// Check if an instruction is a dot/WMMA operation suitable for pingpong scheduling.
+pub fn is_dot_op(op: &Op) -> bool {
+    matches!(op, Op::Wmma { .. })
+}
+
+/// Check if an instruction is a memory operation (load/store).
+pub fn is_mem_op(op: &Op) -> bool {
+    matches!(op,
+        Op::GlobalLoad { .. } | Op::GlobalStore { .. } |
+        Op::BufferLoad { .. } | Op::BufferStore { .. } |
+        Op::LdsLoad { .. } | Op::LdsStore { .. } |
+        Op::DsLoadB32 { .. } | Op::DsLoadB64 { .. } | Op::DsLoadB128 { .. } |
+        Op::DsLoadU16 { .. } | Op::DsLoadU16D16 { .. } | Op::DsLoadU16D16Hi { .. } |
+        Op::DsStoreB16 { .. } | Op::DsStoreB32 { .. } |
+        Op::DsStoreB64 { .. } | Op::DsStoreB128 { .. } |
+        Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } |
+        Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. }
+    )
+}
+
+// ============================================================================
+// Pingpong Scheduling Tests
+// ============================================================================
+
+#[cfg(test)]
+mod pingpong_tests {
+    use super::*;
+
+    #[test]
+    fn test_pingpong_single_wmma() {
+        let mut ops = vec![
+            Op::GlobalLoad { dst: VReg(1), addr: VReg(0), width: Width::B32, offset: 0 },
+            Op::Wmma {
+                dst: VReg(10), a: VReg(20), b: VReg(28), c: VReg(10),
+                format: WmmaFormat::BF16_F32, ab_width: 8,
+                sparse_idx: None,
+            },
+            Op::GlobalStore { addr: VReg(0), src: VReg(10), width: Width::B32, offset: 0 },
+            Op::Endpgm,
+        ];
+
+        let inserted = pingpong_schedule(&mut ops);
+
+        // Should insert s_setprio(1) before WMMA and s_setprio(0) after
+        assert_eq!(inserted, 2);
+
+        // Check the sequence
+        assert!(matches!(&ops[0], Op::GlobalLoad { .. }));
+        assert!(matches!(&ops[1], Op::SSetPrio(1)));
+        assert!(matches!(&ops[2], Op::Wmma { .. }));
+        assert!(matches!(&ops[3], Op::SSetPrio(0)));
+        assert!(matches!(&ops[4], Op::GlobalStore { .. }));
+        assert!(matches!(&ops[5], Op::Endpgm));
+    }
+
+    #[test]
+    fn test_pingpong_consecutive_wmma() {
+        let mut ops = vec![
+            Op::GlobalLoad { dst: VReg(1), addr: VReg(0), width: Width::B32, offset: 0 },
+            // First WMMA cluster (2 WMMA ops)
+            Op::Wmma {
+                dst: VReg(10), a: VReg(20), b: VReg(28), c: VReg(10),
+                format: WmmaFormat::BF16_F32, ab_width: 8,
+                sparse_idx: None,
+            },
+            Op::Wmma {
+                dst: VReg(18), a: VReg(36), b: VReg(44), c: VReg(18),
+                format: WmmaFormat::BF16_F32, ab_width: 8,
+                sparse_idx: None,
+            },
+            Op::GlobalStore { addr: VReg(0), src: VReg(10), width: Width::B32, offset: 0 },
+            Op::Endpgm,
+        ];
+
+        let inserted = pingpong_schedule(&mut ops);
+
+        // Should insert 1 s_setprio(1) before cluster and 1 s_setprio(0) after
+        assert_eq!(inserted, 2);
+
+        // Check: s_setprio(1) before first WMMA
+        assert!(matches!(&ops[0], Op::GlobalLoad { .. }));
+        assert!(matches!(&ops[1], Op::SSetPrio(1)));
+        // Both WMMA ops should be contiguous
+        assert!(matches!(&ops[2], Op::Wmma { .. }));
+        assert!(matches!(&ops[3], Op::Wmma { .. }));
+        // s_setprio(0) after cluster
+        assert!(matches!(&ops[4], Op::SSetPrio(0)));
+        assert!(matches!(&ops[5], Op::GlobalStore { .. }));
+        assert!(matches!(&ops[6], Op::Endpgm));
+    }
+
+    #[test]
+    fn test_pingpong_no_wmma() {
+        let mut ops = vec![
+            Op::GlobalLoad { dst: VReg(1), addr: VReg(0), width: Width::B32, offset: 0 },
+            Op::VAddF32 { dst: VReg(2), src0: Operand::VReg(VReg(1)), src1: Operand::VReg(VReg(1)) },
+            Op::Endpgm,
+        ];
+
+        let inserted = pingpong_schedule(&mut ops);
+
+        // No WMMA = no s_setprio inserted
+        assert_eq!(inserted, 0);
+        assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn test_pingpong_wmma_at_end() {
+        let mut ops = vec![
+            Op::GlobalLoad { dst: VReg(1), addr: VReg(0), width: Width::B32, offset: 0 },
+            Op::Wmma {
+                dst: VReg(10), a: VReg(20), b: VReg(28), c: VReg(10),
+                format: WmmaFormat::BF16_F32, ab_width: 8,
+                sparse_idx: None,
+            },
+            Op::Endpgm,
+        ];
+
+        let inserted = pingpong_schedule(&mut ops);
+
+        // Should insert s_setprio(1) before and s_setprio(0) before endpgm
+        assert_eq!(inserted, 2);
+
+        assert!(matches!(&ops[0], Op::GlobalLoad { .. }));
+        assert!(matches!(&ops[1], Op::SSetPrio(1)));
+        assert!(matches!(&ops[2], Op::Wmma { .. }));
+        assert!(matches!(&ops[3], Op::SSetPrio(0)));
+        assert!(matches!(&ops[4], Op::Endpgm));
+    }
+
+    #[test]
+    fn test_pingpong_multiple_clusters() {
+        let mut ops = vec![
+            // First WMMA cluster
+            Op::Wmma {
+                dst: VReg(10), a: VReg(20), b: VReg(28), c: VReg(10),
+                format: WmmaFormat::BF16_F32, ab_width: 8,
+                sparse_idx: None,
+            },
+            // Memory ops
+            Op::GlobalLoad { dst: VReg(1), addr: VReg(0), width: Width::B32, offset: 0 },
+            // Second WMMA cluster
+            Op::Wmma {
+                dst: VReg(18), a: VReg(36), b: VReg(44), c: VReg(18),
+                format: WmmaFormat::BF16_F32, ab_width: 8,
+                sparse_idx: None,
+            },
+            Op::Endpgm,
+        ];
+
+        let inserted = pingpong_schedule(&mut ops);
+
+        // Should insert 2 s_setprio(1) and 2 s_setprio(0)
+        assert_eq!(inserted, 4);
+
+        // Verify structure
+        assert!(matches!(&ops[0], Op::SSetPrio(1)));
+        assert!(matches!(&ops[1], Op::Wmma { .. }));
+        assert!(matches!(&ops[2], Op::SSetPrio(0)));
+        assert!(matches!(&ops[3], Op::GlobalLoad { .. }));
+        assert!(matches!(&ops[4], Op::SSetPrio(1)));
+        assert!(matches!(&ops[5], Op::Wmma { .. }));
+        assert!(matches!(&ops[6], Op::SSetPrio(0)));
+        assert!(matches!(&ops[7], Op::Endpgm));
     }
 }

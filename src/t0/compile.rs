@@ -1085,6 +1085,11 @@ impl T0Kernel {
             let n_before = self.ops.iter().filter(|o| matches!(o, Op::RawAsm(_))).count();
             eprintln!("[raw] before optimize: {} RawAsm", n_before);
         }
+        if std::env::var("T0_DUMP_IR").is_ok() && self.ops.len() > 1300 {
+            for (oi, op) in self.ops.iter().enumerate().skip(1300).take(15) {
+                eprintln!("[IR] op[{}] = {:?}", oi, op);
+            }
+        }
         let (mut optimized_ops, _stats) = if self.skip_optimize {
             (self.ops.clone(), super::opt_passes::OptStats::default())
         } else {

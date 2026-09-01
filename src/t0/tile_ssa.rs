@@ -383,6 +383,27 @@ pub struct ForLoopAcc {
     pub step: u32,
 }
 
+/// 多累加器 For 循环句柄（由 `for_range_multi` 返回）
+///
+/// 支持任意数量的 loop-carried scalar accumulators。
+/// 每个 accumulator 在 header 有对应的 block param，
+/// 在 body 中可读取（通过 `accs[i]`），在 back-edge 传入新值，
+/// 在 exit block 可获取最终结果（通过 `results[i]`）。
+#[derive(Clone, Debug)]
+pub struct ForLoopMulti {
+    pub header: BlockId,
+    pub body: BlockId,
+    pub exit: BlockId,
+    /// 循环归纳变量（i）
+    pub iv: Value,
+    /// 步长
+    pub step: u32,
+    /// body block 中可用的累加器（header block params）
+    pub accs: Vec<Value>,
+    /// exit block 中的最终累加器结果
+    pub results: Vec<Value>,
+}
+
 // ============================================================================
 // TileOp — Tile-level SSA 操作
 // ============================================================================
@@ -472,6 +493,10 @@ pub enum TileOp {
     LdsLoad { result: Value, base: Value, offset: Value },
     /// 写入 LDS: lds[base + offset * 4] = val
     LdsStore { base: Value, offset: Value, val: Value },
+    /// 转置 LDS store: lds[base + (col * stride + row) * 4] = val
+    LdsStoreT { base: Value, row: Value, col: Value, val: Value, stride: u32 },
+    /// 转置 LDS load: val = lds[base + (col * stride + row) * 4]
+    LdsLoadT { result: Value, base: Value, row: Value, col: Value, stride: u32 },
 
     // ── 原子操作 ──
     /// global_atomic_add_f32: ptr[indices] += val (with optional mask)
@@ -540,7 +565,7 @@ pub enum TileOp {
         val: Value,          // [M, N] f32 tile (accumulator)
     },
 
-    // ── EXEC Mask（条件执行）──
+    // ── EXEC Mask（条件执行 per-lane）──
     /// Push EXEC mask: saved = EXEC; EXEC &= mask
     /// 仅 mask!=0 的 lane 后续指令生效。支持嵌套（栈式保存）。
     /// 等价于 IfMask — maps to: v_cmp + s_and_saveexec_b32
@@ -551,6 +576,17 @@ pub enum TileOp {
     /// Pop EXEC mask: EXEC = saved (恢复原始 mask)
     /// 等价于 EndIf — maps to: s_mov_b32 exec_lo, saved
     ExecMaskPop,
+
+    // ── Scalar 条件分支（SCC-based, 全 workgroup 一致）──
+    /// Scalar conditional branch: if (cond != 0) { ... } else { ... }
+    /// `cond` is a U32 scalar (SGPR), compared against 0.
+    /// Compiles to: s_cmp_lg_u32 cond, 0 + s_cbranch_scc0/scc1
+    /// Used for FlashAttention tile-level mask: entire tile participation.
+    ScalarIfPush { cond: Value },
+    /// Else branch for scalar condition (paired with ScalarIfPush, optional)
+    ElseScalar,
+    /// End of scalar condition block (paired with ScalarIfPush)
+    EndIfScalar,
 }
 
 /// 二元算术操作类型
@@ -969,6 +1005,18 @@ impl TileFunc {
     /// LDS store: lds[base + offset * 4] = val
     pub fn lds_store(&mut self, base: Value, offset: Value, val: Value) {
         self.push_op(TileOp::LdsStore { base, offset, val });
+    }
+
+    /// 转置 LDS store: lds[base + (col * stride + row) * 4] = val
+    pub fn lds_store_t(&mut self, base: Value, row: Value, col: Value, val: Value, stride: u32) {
+        self.push_op(TileOp::LdsStoreT { base, row, col, val, stride });
+    }
+
+    /// 转置 LDS load: val = lds[base + (col * stride + row) * 4]
+    pub fn lds_load_t(&mut self, base: Value, row: Value, col: Value, stride: u32) -> Value {
+        let v = self.alloc_value(TileType::Scalar(ScalarDType::F32), None);
+        self.push_op(TileOp::LdsLoadT { result: v, base, row, col, stride });
+        v
     }
 
     // ── Atomic ──
@@ -1403,6 +1451,78 @@ impl TileFunc {
         ForLoopAcc { header, body, exit, iv, acc, result, step }
     }
 
+    /// 创建运行时 bounds 的多累加器 for 循环:
+    /// `for i in [start, end) step step { acc0, acc1, ... = body(acc0, acc1, ..., i) }`
+    ///
+    /// 所有 init_vals 元素必须是 Scalar 类型。
+    ///
+    /// ```ignore
+    /// let (m_init, l_init) = (f.const_f32(-inf), f.const_f32(0.0));
+    /// let lp = f.for_range_multi_runtime(start, end, BLOCK_N,
+    ///             vec![m_init, l_init]);
+    /// // lp.iv = 循环变量
+    /// // lp.accs[0] = m_prev, lp.accs[1] = l_prev
+    /// let s = f.load(...);
+    /// let m_new = f.max(lp.accs[0], s);
+    /// let l_new = f.add(lp.accs[1], p);
+    /// f.end_for_multi(&lp, vec![m_new, l_new]);
+    /// // lp.results[0] = final m, lp.results[1] = final l
+    /// ```
+    pub fn for_range_multi_runtime(
+        &mut self, start: Value, end: Value, step: u32,
+        init_vals: Vec<Value>,
+    ) -> ForLoopMulti {
+        assert!(!init_vals.is_empty(), "for_range_multi: need at least 1 accumulator");
+
+        let header = self.new_block();
+        let body = self.new_block();
+        let exit = self.new_block();
+
+        // Entry → header(start, init_vals...)
+        let mut header_args = vec![start];
+        header_args.extend_from_slice(&init_vals);
+        self.branch(header, header_args);
+
+        // Header: iv + accs as block params
+        self.switch_to_block(header);
+        let iv = self.add_block_param(header, TileType::Scalar(ScalarDType::U32));
+        let mut accs = Vec::with_capacity(init_vals.len());
+        for init_v in &init_vals {
+            let ty = self.value_type(*init_v).clone();
+            accs.push(self.add_block_param(header, ty));
+        }
+
+        // Compare: iv < end
+        let cond = self.cmp_lt(iv, end);
+
+        // exit gets final accumulator values
+        let mut results = Vec::with_capacity(init_vals.len());
+        for init_v in &init_vals {
+            let ty = self.value_type(*init_v).clone();
+            results.push(self.add_block_param(exit, ty));
+        }
+        self.cond_branch(cond, body, vec![], exit, accs.clone());
+
+        // Switch to body for caller to add ops
+        self.switch_to_block(body);
+
+        ForLoopMulti { header, body, exit, iv, step, accs, results }
+    }
+
+    /// 结束多累加器循环，传入新的累加器值
+    pub fn end_for_multi(&mut self, lp: &ForLoopMulti, new_accs: Vec<Value>) {
+        assert_eq!(new_accs.len(), lp.accs.len(),
+            "end_for_multi: expected {} new_accs, got {}", lp.accs.len(), new_accs.len());
+
+        let step_val = self.const_u32(lp.step);
+        let iv_next = self.add(lp.iv, step_val);
+        let mut back_args = vec![iv_next];
+        back_args.extend_from_slice(&new_accs);
+        self.branch(lp.header, back_args);
+
+        self.switch_to_block(lp.exit);
+    }
+
     // ════════════════════════════════════════════════════════
     // 打印 / Debug
     // ════════════════════════════════════════════════════════
@@ -1479,6 +1599,10 @@ impl TileFunc {
                 format!("{}: F32 = lds_load({}, {})", result, base, offset),
             TileOp::LdsStore { base, offset, val } =>
                 format!("lds_store({}, {}, {})", base, offset, val),
+            TileOp::LdsStoreT { base, row, col, val, stride } =>
+                format!("lds_store_t({}, {}, {}, {}, stride={})", base, row, col, val, stride),
+            TileOp::LdsLoadT { result, base, row, col, stride } =>
+                format!("{}: F32 = lds_load_t({}, {}, {}, stride={})", result, base, row, col, stride),
             TileOp::AtomicAddF32 { ptr, indices, val, mask } => {
                 let m = if mask.is_some() { ", masked" } else { "" };
                 format!("atomic_add_f32({}, {}, {}{})", ptr, indices, val, m)
@@ -1524,6 +1648,13 @@ impl TileFunc {
                 "exec_mask_flip".into(),
             TileOp::ExecMaskPop =>
                 "exec_mask_pop".into(),
+            // ── Scalar conditional ──
+            TileOp::ScalarIfPush { cond } =>
+                format!("scalar_if({})", cond),
+            TileOp::ElseScalar =>
+                "else_scalar".into(),
+            TileOp::EndIfScalar =>
+                "end_if_scalar".into(),
         }
     }
 
@@ -1617,10 +1748,13 @@ fn op_result(op: &TileOp) -> Option<Value> {
         TileOp::Cmp { result, .. } | TileOp::Select { result, .. } |
         TileOp::Reduce { result, .. } | TileOp::Dot { result, .. } => Some(*result),
         TileOp::Store { .. } | TileOp::Barrier |
-        TileOp::LdsStore { .. } | TileOp::AtomicAddF32 { .. } |
+        TileOp::LdsStore { .. } | TileOp::LdsStoreT { .. } |
+        TileOp::AtomicAddF32 { .. } |
         TileOp::TileStore2D { .. } |
+        TileOp::ScalarIfPush { .. } | TileOp::ElseScalar | TileOp::EndIfScalar |
         TileOp::ExecMaskPush { .. } | TileOp::ExecMaskFlip | TileOp::ExecMaskPop => None,
         TileOp::LdsAlloc { result, .. } | TileOp::LdsLoad { result, .. } |
+        TileOp::LdsLoadT { result, .. } |
         TileOp::ZeroAcc { result, .. } | TileOp::CvtPkBf16F32 { result, .. } |
         TileOp::WmmaF32 { result, .. } | TileOp::ExtractF32 { result, .. } |
         TileOp::SplatFragment { result, .. } |

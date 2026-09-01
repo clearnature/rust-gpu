@@ -1,7 +1,8 @@
-//! RDNA3 / GFX1100 Instruction Latency Model
+//! RDNA3/RDNA4 Instruction Latency Model (N14-calibrated)
 //!
 //! Classifies T0 IR ops into hardware pipeline categories and provides
 //! empirically-calibrated latency estimates for instruction scheduling.
+//! Targets both GFX1100 (RDNA3, Navi 31) and GFX1200 (RDNA4, RX 9060 XT).
 //!
 //! # Measurement methodology
 //!
@@ -16,27 +17,105 @@
 //!   VALU+VMEM: 0% overlap, VALU+LDS: 0%, VALU+TRANS: 6% (~serial)
 //! Multi-wave latency hiding is handled at the cost_model level.
 //!
-//! # GFX1100 Instruction Latencies (probe-calibrated 2026-03-24)
+//! # N14-Calibrated Hardware Constants (2026-05-18)
 //!
-//! | Pipeline     | Examples                           | Shader cy | VALU-norm |
-//! |--------------|------------------------------------|-----------|-----------|
-//! | VALU-simple  | add, sub, min, max, and, or, shift |     ~10   |     1     |
-//! | VALU-complex | mul, fma, mul_lo_u32, and_or       |     ~19   |     2     |
-//! | TRANS        | rcp, rsq, exp, log, sqrt           |     ~11   |     1     |
-//! | SALU         | s_add, s_mul, s_lshl               |     ~10   |     1     |
-//! | CVT          | cvt_f32_u32, cvt_u32_f32           |     ~20   |     2     |
-//! | CVT pack     | v_cvt_pk_bf16_f32                  |     ~40   |     4     |
-//! | LDS load     | ds_load_b32/b64/b128               |     ~76   |     7     |
-//! | LDS store    | ds_store_b16/b32/b64/b128          |     ~38   |     4     |
-//! | ds_swizzle   | lane permute (XOR, no mem)         |     ~33   |     3     |
-//! | v_permlane   | v_permlane_x16                     |     ~27   |     3     |
-//! | VMEM load    | global_load b32/b64/b128           |    ~500   |    47     |
-//! | VMEM store   | global_store b32                   |    ~249   |    24     |
-//! | WMMA         | v_wmma_f32_16x16x16_bf16           |     ~36   |     4     |
-//! | Wave reduce  | 5×swizzle + 5×add composite        |    ~254   |    24     |
-//! | CTRL         | branch, waitcnt, barrier           |       0   |     0     |
+//! The N14 quantum clock provides an absolute timing reference for
+//! converting VALU-normalized cycles to real nanoseconds:
+//!
+//!   N14 quantum clock:     9,374,984 Hz (±1.706 PPM)
+//!   GPU core clock:        3.1500 GHz (N14 PLL ratio calibrated)
+//!   GPU cycle period:      317.46 ps
+//!   Shader cycle:          ~3,175 ps (10× GPU cycle)
+//!   1 VALU-norm:           ~3,175 ps (simple v_add_f32)
+//!
+//! # Instruction Latencies (probe-calibrated, N14-absolute)
+//!
+//! | Pipeline     | Examples                           | Shader cy | VALU-norm | N14 abs (ns) |
+//! |--------------|------------------------------------|-----------|-----------|--------------|
+//! | VALU-simple  | add, sub, min, max, and, or, shift |     ~10   |     1     |     3.17     |
+//! | VALU-complex | mul, fma, mul_lo_u32, and_or       |     ~19   |     2     |     6.35     |
+//! | TRANS        | rcp, rsq, exp, log, sqrt           |     ~11   |     1     |     3.49     |
+//! | SALU         | s_add, s_mul, s_lshl               |     ~10   |     1     |     3.17     |
+//! | CVT          | cvt_f32_u32, cvt_u32_f32           |     ~20   |     2     |     6.35     |
+//! | CVT pack     | v_cvt_pk_bf16_f32                  |     ~40   |     4     |    12.70     |
+//! | LDS load     | ds_load_b32/b64/b128               |     ~76   |     7     |    22.22     |
+//! | LDS store    | ds_store_b16/b32/b64/b128          |     ~38   |     4     |    12.70     |
+//! | ds_swizzle   | lane permute (XOR, no mem)         |     ~33   |     3     |    10.48     |
+//! | v_permlane   | v_permlane_x16                     |     ~27   |     3     |    10.48     |
+//! | VMEM load    | global_load b32/b64/b128           |    ~500   |    47     |   149.23     |
+//! | VMEM store   | global_store b32                   |    ~249   |    24     |    76.20     |
+//! | WMMA (BF16)  | v_wmma_f32_16x16x16_bf16           |   32-36   |     4     |    12.70     |
+//! | SWMMAC (INT4)| v_swmmac_i32_16x16x64_iu4          |     16    |     2     |     5.08     |
+//! | Wave reduce  | 5×swizzle + 5×add composite        |    ~254   |    24     |    76.20     |
+//! | CTRL         | branch, waitcnt, barrier           |       0   |     0     |     0.00     |
+//!
+//! WMMA note: RDNA4 HWXDL BF16 measures ~32 shader cycles (vs ~36 on GFX1100).
+//! VALU-norm is rounded to 4 (conservative scheduling for both targets).
+//!
+//! SWMMAC note (N14-calibrated, from SISchedule.td + reverse engineering):
+//!   v_swmmac_i32_16x16x64_iu4 performs 16×16×64 = 16,384 INT4 MACs per instruction.
+//!   XDL pipeline: 4-pass → 16 GPU cycles latency (WriteXDL4PassWMMA).
+//!   At 3.15 GHz: 16 × 317.46 ps = 5.079 ns absolute latency.
+//!   Issue rate: 1 per GPU cycle (pipeline accepts new SWMMAC each cycle).
+//!   16-chain SWMMAC: 128 independent SWMMAC → fills 16-deep XDL pipeline →
+//!   steady-state throughput = 1 SWMMAC/cycle = 16,384 MACs/cycle.
+//!   INT4 TOPs at 3.15 GHz: 16,384 × 2 ops/MAC × 3.15 GHz / 1e12 = 103.2 TOPs/SIMD.
+//!
+//! Reference: /data/rtl-sdr/swmmac/calibration/swmmac_n14_timing.py
 
 use super::ir::*;
+
+// ============================================================================
+// N14-Calibrated Absolute Timing Constants
+// ============================================================================
+
+/// N14 quantum clock frequency (Hz). Measured 2026-05-18, ±1.706 PPM.
+pub const N14_CLOCK_HZ: f64 = 9_374_984.0;
+
+/// GPU core clock frequency (Hz). N14 PLL-calibrated: 3.1500 GHz.
+pub const GPU_CORE_CLOCK_HZ: f64 = 3.1500e9;
+
+/// GPU cycle period in picoseconds (N14-calibrated).
+pub const GPU_CYCLE_PS: f64 = 1e12 / GPU_CORE_CLOCK_HZ;  // ~317.46 ps
+
+/// One shader cycle in picoseconds. On GFX11/12, shader_cycle ≈ 10× GPU cycle.
+pub const SHADER_CYCLE_PS: f64 = GPU_CYCLE_PS * 10.0;  // ~3175 ps
+
+/// One VALU-normalized cycle in picoseconds (≈ simple v_add_f32 latency).
+pub const VALU_CYCLE_PS: f64 = SHADER_CYCLE_PS;  // ~3175 ps
+
+/// Convert VALU-normalized cycles to absolute nanoseconds (N14-calibrated).
+pub const fn valu_to_ns(valu_cycles: u32) -> f64 {
+    valu_cycles as f64 * VALU_CYCLE_PS / 1000.0
+}
+
+// ============================================================================
+// SWMMAC XDL Pipeline Constants (N14-calibrated, from SISchedule.td)
+// ============================================================================
+
+/// SWMMAC INT4 MACs per instruction: 16×16×64 = 16,384.
+pub const SWMMAC_MACS: u64 = 16 * 16 * 64;
+
+/// XDL pipeline passes for INT4 (4-bit → 4 passes through systolic array).
+pub const XDL_PASSES_INT4: u32 = 4;
+
+/// XDL pipeline latency in GPU cycles (WriteXDL4PassWMMA schedule class).
+/// At 3.15 GHz: 16 × 317.46 ps = 5.079 ns.
+pub const XDL_LATENCY_CYCLES: u32 = 16;
+
+/// SWMMAC issue rate: 1 per GPU cycle (XDL pipeline accepts each cycle).
+pub const XDL_ISSUE_RATE: u32 = 1;
+
+/// SWMMAC XDL pipeline latency in absolute nanoseconds (N14-calibrated).
+pub const XDL_LATENCY_NS: f64 = XDL_LATENCY_CYCLES as f64 * GPU_CYCLE_PS / 1000.0;  // ~5.08 ns
+
+/// SWMMAC INT4 theoretical TOPs per SIMD at 3.15 GHz.
+/// = 16,384 MACs × 2 ops/MAC × 3.15 GHz / 1e12
+pub const SWMMAC_TOPS_PER_SIMD: f64 = SWMMAC_MACS as f64 * 2.0 * GPU_CORE_CLOCK_HZ / 1e12;
+
+/// SWMMAC latency in VALU-normalized cycles (for scheduling).
+/// 16 GPU cycles ÷ 10 (shader/VALU ratio) = 1.6, rounded up to 2.
+pub const SWMMAC_LATENCY_VALU_NORM: u32 = 2;
 
 // ============================================================================
 // Pipeline classification
@@ -176,7 +255,7 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
         // ── SALU: 1-cycle scalar ALU ──
         Op::SAddU32 { .. } | Op::SSubU32 { .. } | Op::SAddcU32 { .. } |
         Op::SMulI32 { .. } |
-        Op::SLshlB32 { .. } | Op::SLshrB32 { .. } |
+        Op::SLshlB32 { .. } | Op::SLshrB32 { .. } | Op::SLshrB32SgprShift { .. } |
         Op::SAndB32 { .. } | Op::SMov { .. } |
         Op::SCmpLtU32 { .. } | Op::SCmpGeU32 { .. } | Op::SCmpEqU32 { .. } |
         Op::SaveExec { .. } | Op::RestoreExec { .. } | Op::XorExec { .. } |
@@ -206,7 +285,7 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
         },
 
         // ── SMEM: scalar memory (same counter as LDS) ──
-        Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } => LatencyInfo {
+        Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } => LatencyInfo {
             pipeline: Pipeline::LDS, latency: 7, throughput: 1, is_mem: true,
             wait_counter: Some(WaitCounter::LGKMcnt),
         },
@@ -221,7 +300,7 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
         Op::Label(_) |
         Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
         Op::WaitKmcnt(_) |
-        Op::Barrier | Op::SBarrier | Op::Endpgm |
+        Op::Barrier | Op::SBarrier | Op::GlobalInv | Op::Endpgm |
         Op::CaptureTgid { .. } | Op::ComputeGlobalIdX { .. } => ctrl(),
 
         // ── Lane permute: 3 VALU-norm (measured ~27 shader cycles) ──
@@ -237,6 +316,11 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
 
         // ── Raw asm: unknown, assume simple VALU ──
         Op::RawAsm(_) => valu_simple(),
+        // Probe: injected post-regalloc, not scheduled by latency model.
+        Op::Probe { .. } => valu_simple(),
+
+        // ── s_setprio: SALU instruction, 0 latency (scheduling hint) ──
+        Op::SSetPrio(_) => salu(),
     }
 }
 
@@ -404,11 +488,36 @@ mod tests {
             dst: VReg(0), a: VReg(8), b: VReg(16), c: VReg(24),
             format: WmmaFormat::BF16_F32,
             ab_width: 8,
+            sparse_idx: None,
         };
         let info = op_latency(&op);
         assert_eq!(info.pipeline, Pipeline::WMMA);
         assert_eq!(info.latency, 4);
         assert_eq!(info.throughput, 4);
+    }
+
+    // ── SWMMAC N14-calibrated constants (from SISchedule.td + timing.py) ──
+    #[test]
+    fn test_swmmac_n14_constants() {
+        // SWMMAC MACs: 16×16×64 = 16,384
+        assert_eq!(SWMMAC_MACS, 16384);
+        // XDL pipeline: 4 passes, 16 cycle latency
+        assert_eq!(XDL_PASSES_INT4, 4);
+        assert_eq!(XDL_LATENCY_CYCLES, 16);
+        assert_eq!(XDL_ISSUE_RATE, 1);
+        // Absolute latency: 16 × 317.46 ps ≈ 5.079 ns
+        assert!(XDL_LATENCY_NS > 5.0 && XDL_LATENCY_NS < 5.2,
+            "XDL latency should be ~5.08 ns, got {}", XDL_LATENCY_NS);
+        // VALU-norm: 16 GPU cycles / 10 = 1.6 → rounded to 2
+        assert_eq!(SWMMAC_LATENCY_VALU_NORM, 2);
+        // SWMMAC latency < WMMA latency (XDL pipeline is faster than BF16 WMMA)
+        assert!(SWMMAC_LATENCY_VALU_NORM < 4,
+            "SWMMAC should be faster than WMMA: {} vs 4", SWMMAC_LATENCY_VALU_NORM);
+        // TOPs per SIMD: 16384 × 2 × 3.15 GHz / 1e12 ≈ 103.2
+        assert!(SWMMAC_TOPS_PER_SIMD > 100.0 && SWMMAC_TOPS_PER_SIMD < 110.0,
+            "SWMMAC TOPs/SIMD should be ~103, got {}", SWMMAC_TOPS_PER_SIMD);
+        eprintln!("SWMMAC N14 calibration: {:.3} ns latency, {:.1} TOPs/SIMD",
+            XDL_LATENCY_NS, SWMMAC_TOPS_PER_SIMD);
     }
 
     // ── LDS: load=7, store=4, load > store (asymmetric) ──

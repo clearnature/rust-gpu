@@ -474,12 +474,12 @@ pub fn allocate_ssa(
 
     // ── SGPR allocation (bump, same as legacy) ──
     let mut sgpr_map: HashMap<SReg, u8> = HashMap::new();
-    let mut next_sgpr: u8 = 5; // s0:s1 = kernarg, s2/s3/s4 = TGID
+    let mut next_sgpr: u8 = super::regs::SGPR_ALLOC_BASE; // s0:s1 kernarg, s2-4 TGID
 
     // s63 is RESERVED: on GFX1200 the asm emitter uses it as the zero soffset
     // for buffer_load/buffer_store (SOFFSET_ZERO). If allocated as a general SGPR,
     // it gets clobbered and stores write to wrong addresses.
-    const RESERVED_S63: u8 = 63;
+    const RESERVED_S63: u8 = super::regs::SGPR_SOFFSET_ZERO;
 
     for sa in sreg_allocs {
         // Skip s63 if we'd land on it (reserved for SOFFSET_ZERO on GFX1200)
@@ -512,11 +512,11 @@ pub fn allocate_ssa(
             }
             next_sgpr = base + sa.count as u8;
         }
-        assert!(next_sgpr < 106, "SGPR overflow!");
+        assert!(next_sgpr < super::regs::MAX_SGPRS, "SGPR overflow!");
     }
 
     // ── VGPR allocation ──
-    let mut pool = FreePool::new(1, max_vgprs); // v0 reserved for TID, limited by max_vgprs
+    let mut pool = FreePool::new(super::regs::VGPR0_TID + 1, max_vgprs); // v0 reserved (regs.rs)
     let mut vgpr_map: HashMap<MVal, u8> = HashMap::new();
     let mut spills: Vec<SpillRecord> = Vec::new();
 
@@ -727,12 +727,13 @@ pub fn allocate_ssa(
     // Compute total VGPRs used
     let total_vgprs = pool.next_free;
 
-    // Occupancy diagnostics
-    let (waves, tier) = if total_vgprs <= 64 { (16, "excellent") }
-        else if total_vgprs <= 96 { (10, "good") }
-        else if total_vgprs <= 128 { (8, "fair") }
-        else if total_vgprs <= 192 { (4, "low") }
-        else { (2, "critical") };
+    // Occupancy — MEASURED 2026-08-23: GFX1200 (RDNA4) has 256 VGPRs/SIMD
+    // (LLVM caps at 256, spills beyond). waves = floor(256 / vgpr).
+    // Dual-wave red line = 128 VGPR (= 256/2), matches rtl-sdr docs.
+    let (waves, tier) = if total_vgprs <= 64 { (4, "good") }
+        else if total_vgprs <= 85 { (3, "fair") }
+        else if total_vgprs <= 128 { (2, "fair") }
+        else { (1, "low") };
 
     // Count total reuse hints
     let reuse_hints_total: u32 = reuse_hints.values().map(|v| v.len() as u32).sum();
@@ -1057,9 +1058,9 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
         let result = allocate_ssa(&intervals, &[], &func, 128);
@@ -1088,8 +1089,8 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
         let result = allocate_ssa(&intervals, &[], &func, 128);
@@ -1123,7 +1124,7 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(8), count: 8, alignment: Alignment::Align8 },
+            VRegAlloc { vreg: VReg(8), count: 8, alignment: Alignment::Align8, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
         let result = allocate_ssa(&intervals, &[], &func, 128);
@@ -1160,12 +1161,12 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(4), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(5), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(6), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(4), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(5), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(6), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -1201,12 +1202,12 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(4), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(5), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(6), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(4), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(5), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(6), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -1266,7 +1267,7 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -1303,8 +1304,8 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -1345,12 +1346,12 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(4), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(5), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(6), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(4), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(5), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(6), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -1384,10 +1385,10 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(4), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(4), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
@@ -1425,8 +1426,8 @@ mod tests {
 
         let func = make_func(&ops);
         let allocs = vec![
-            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None },
-            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None },
+            VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: RegClass::Normal },
+            VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
         let result = allocate_ssa(&intervals, &[], &func, 128);

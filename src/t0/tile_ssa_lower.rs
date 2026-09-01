@@ -220,11 +220,13 @@ pub fn lower_elementwise_1d(func: &TileFunc, wg_size: u32, epl: u32) -> Result<L
 
         // EXEC mask save stack for nested if/else (shared across ops in a block)
         let mut exec_save_stack: Vec<SReg> = Vec::new();
+        // Scalar if/else label stack: (else_label, end_label) pairs
+        let mut scalar_if_stack: Vec<(Option<String>, String)> = Vec::new();
 
         // 翻译块内所有 op
         for &op_idx in &block.ops {
             let op = &func.all_ops()[op_idx];
-            lower_tile_op(&mut k, op, func, &mut val_map, &mut exec_save_stack)?;
+            lower_tile_op(&mut k, op, func, &mut val_map, &mut exec_save_stack, &mut scalar_if_stack)?;
         }
 
         // ── Validate ExecMask pairing ──
@@ -368,6 +370,7 @@ fn lower_tile_op(
     func: &TileFunc,
     val_map: &mut HashMap<Value, MachineVal>,
     exec_save_stack: &mut Vec<SReg>,
+    scalar_if_stack: &mut Vec<(Option<String>, String)>,
 ) -> Result<(), String> {
     match op {
         // ── 常量 ──
@@ -463,8 +466,6 @@ fn lower_tile_op(
         // Layout-aware lowering: dispatch based on result's TensorLayout
         TileOp::Load { result, ptr, indices, mask, dtype, .. } => {
             let _result_layout = func.value_type(*result).layout().clone();
-            // Currently all 1D loads use Blocked layout (per-lane address calculation)
-            // Future: Shared layout → cooperative LDS load, MmaAccumulator → register mapping
             debug_assert!(_result_layout.is_blocked() || matches!(_result_layout, TensorLayout::Scalar),
                 "Load: expected Blocked layout, got {:?}", _result_layout);
 
@@ -502,9 +503,7 @@ fn lower_tile_op(
 
             // 如果有 mask，用 EXEC mask 保护
             let saved_exec = if let Some(mask_val) = mask {
-                // mask 是 bool vector，需要设置到 VCC 再应用到 EXEC
                 let mask_v = get_vreg(k, val_map, *mask_val)?;
-                // v_cmp_ne_u32 mask, 0 → VCC
                 k.v_cmp_gt_u32_imm(mask_v, 0);
                 let saved = k.alloc_sreg();
                 k.save_exec(saved);
@@ -623,6 +622,9 @@ fn lower_tile_op(
                         let vdst = k.alloc_vreg();
                         match bin_op {
                             BinOpKind::Sub => k.v_sub_u32(vdst, lv, rv),
+                            BinOpKind::And => k.v_and_b32(vdst, lv, rv),
+                            BinOpKind::Or => k.v_or_b32(vdst, Operand::VReg(lv), Operand::VReg(rv)),
+                            BinOpKind::Xor => k.v_xor_b32(vdst, Operand::VReg(lv), Operand::VReg(rv)),
                             _ => return Err(format!("Unimplemented scalar binop: {:?}", bin_op)),
                         }
                         val_map.insert(*result, MachineVal::VReg(vdst));
@@ -899,7 +901,44 @@ fn lower_tile_op(
                                 k.push(Op::SMov { dst: tmp, src: SOperand::InlineInt(v) });
                                 k.push(Op::SCmpLtU32 { src0: a, src1: tmp });
                             }
-                            _ => return Err("Scalar Cmp Lt: unsupported operand combo".into()),
+                            (SOperand::InlineInt(v), SOperand::SReg(b)) => {
+                                let tmp = k.alloc_sreg();
+                                k.push(Op::SMov { dst: tmp, src: SOperand::InlineInt(v) });
+                                k.push(Op::SCmpLtU32 { src0: tmp, src1: b });
+                            }
+                            (SOperand::InlineInt(a), SOperand::InlineInt(b)) => {
+                                // Both inline: move one to sreg
+                                let tmp_a = k.alloc_sreg();
+                                k.push(Op::SMov { dst: tmp_a, src: SOperand::InlineInt(a) });
+                                let tmp_b = k.alloc_sreg();
+                                k.push(Op::SMov { dst: tmp_b, src: SOperand::InlineInt(b) });
+                                k.push(Op::SCmpLtU32 { src0: tmp_a, src1: tmp_b });
+                            }
+                            _ => return Err(format!("Scalar Cmp Lt: unsupported operand combo: {:?} vs {:?} (lhs_val={:?}, rhs_val={:?})", ls, rs, lhs, rhs)),
+                        }
+                    }
+                    CmpOpKind::Ge => {
+                        match (ls, rs) {
+                            (SOperand::SReg(a), SOperand::SReg(b)) =>
+                                k.push(Op::SCmpGeU32 { src0: a, src1: b }),
+                            (SOperand::SReg(a), SOperand::InlineInt(v)) => {
+                                let tmp = k.alloc_sreg();
+                                k.push(Op::SMov { dst: tmp, src: SOperand::InlineInt(v) });
+                                k.push(Op::SCmpGeU32 { src0: a, src1: tmp });
+                            }
+                            (SOperand::InlineInt(v), SOperand::SReg(b)) => {
+                                let tmp = k.alloc_sreg();
+                                k.push(Op::SMov { dst: tmp, src: SOperand::InlineInt(v) });
+                                k.push(Op::SCmpGeU32 { src0: tmp, src1: b });
+                            }
+                            (SOperand::InlineInt(a), SOperand::InlineInt(b)) => {
+                                let tmp_a = k.alloc_sreg();
+                                k.push(Op::SMov { dst: tmp_a, src: SOperand::InlineInt(a) });
+                                let tmp_b = k.alloc_sreg();
+                                k.push(Op::SMov { dst: tmp_b, src: SOperand::InlineInt(b) });
+                                k.push(Op::SCmpGeU32 { src0: tmp_a, src1: tmp_b });
+                            }
+                            _ => return Err("Scalar Cmp Ge: unsupported operand combo".into()),
                         }
                     }
                     _ => return Err(format!("Unimplemented scalar cmp: {:?}", cmp_op)),
@@ -967,6 +1006,53 @@ fn lower_tile_op(
             // addr = base + offset * 4
             let addr = k.alloc_vreg();
             k.v_lshlrev_b32(addr, 2, off_v);
+            k.v_add_u32(addr, addr, base_v);
+            let dst = k.alloc_vreg();
+            k.ds_load_b32(dst, addr, 0);
+            k.wait_lgkmcnt(0);
+            val_map.insert(*result, MachineVal::VReg(dst));
+        }
+
+        TileOp::LdsStoreT { base, row, col, val, stride } => {
+            let base_v = get_vreg(k, val_map, *base)?;
+            let row_v = get_vreg(k, val_map, *row)?;
+            let col_v = get_vreg(k, val_map, *col)?;
+            let val_v = get_vreg(k, val_map, *val)?;
+            // addr = base + (col * stride + row) * 4
+            let stride_v = k.alloc_vreg();
+            k.v_mov_imm(stride_v, *stride as i32);
+            let tmp = k.alloc_vreg();
+            k.v_mul_lo_u32(tmp, col_v, stride_v);
+            k.v_add_u32(tmp, tmp, row_v);
+            // XOR swizzle: addr XOR ((row & 3) << 3) — avoid LDS bank conflicts
+            let swizzle = k.alloc_vreg();
+            k.v_and_b32_imm(swizzle, row_v, 3);
+            k.v_lshlrev_b32(swizzle, 3, swizzle);
+            k.v_xor_b32(tmp, Operand::VReg(tmp), Operand::VReg(swizzle));
+            let addr = k.alloc_vreg();
+            k.v_lshlrev_b32(addr, 2, tmp);
+            k.v_add_u32(addr, addr, base_v);
+            k.ds_store_b32(addr, val_v, 0);
+            k.wait_lgkmcnt(0);
+        }
+
+        TileOp::LdsLoadT { result, base, row, col, stride } => {
+            let base_v = get_vreg(k, val_map, *base)?;
+            let row_v = get_vreg(k, val_map, *row)?;
+            let col_v = get_vreg(k, val_map, *col)?;
+            // addr = base + (col * stride + row) * 4
+            let stride_v = k.alloc_vreg();
+            k.v_mov_imm(stride_v, *stride as i32);
+            let tmp = k.alloc_vreg();
+            k.v_mul_lo_u32(tmp, col_v, stride_v);
+            k.v_add_u32(tmp, tmp, row_v);
+            // XOR swizzle: matching store swizzle
+            let swizzle = k.alloc_vreg();
+            k.v_and_b32_imm(swizzle, row_v, 3);
+            k.v_lshlrev_b32(swizzle, 3, swizzle);
+            k.v_xor_b32(tmp, Operand::VReg(tmp), Operand::VReg(swizzle));
+            let addr = k.alloc_vreg();
+            k.v_lshlrev_b32(addr, 2, tmp);
             k.v_add_u32(addr, addr, base_v);
             let dst = k.alloc_vreg();
             k.ds_load_b32(dst, addr, 0);
@@ -1206,6 +1292,72 @@ fn lower_tile_op(
             k.restore_exec(saved);
         }
 
+        // ── Scalar 条件分支（SCC-based）──
+        TileOp::ScalarIfPush { cond } => {
+            // cond: U32 scalar (SGPR or inline imm)
+            // Emit: s_cmp_eq_u32 cond, 0 → SCC = (cond == 0)
+            //        s_cbranch_scc1 .Lelse → if cond==0 (false), skip to else/end
+            match val_map.get(cond) {
+                Some(MachineVal::InlineInt(i)) => {
+                    // Constant condition: optimize away
+                    let idx = scalar_if_stack.len();
+                    let end_label = format!("scalar_end_{}", idx);
+                    if *i == 0 {
+                        let else_label = format!("scalar_else_{}", idx);
+                        k.push(Op::Branch(else_label.clone()));
+                        scalar_if_stack.push((Some(else_label), end_label));
+                    } else {
+                        scalar_if_stack.push((None, end_label));
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+            let cond_sreg = match val_map.get(cond) {
+                Some(MachineVal::SReg(sr)) => *sr,
+                Some(MachineVal::VReg(vr)) => {
+                    let sr = k.alloc_sreg();
+                    k.v_readfirstlane(sr, *vr);
+                    sr
+                }
+                _ => return Err("ScalarIfPush: cond must be a scalar value".into()),
+            };
+
+            // Generate unique labels for this if block
+            let idx = scalar_if_stack.len();
+            let else_label = format!("scalar_else_{}", idx);
+            let end_label = format!("scalar_end_{}", idx);
+
+            // SCC = (cond == 0) — false condition sets SCC=1
+            k.s_cmp_eq_u32_imm(cond_sreg, 0);
+            // If SCC=1 (cond was 0/false), jump to else/end
+            k.branch_scc1(&else_label);
+
+            scalar_if_stack.push((Some(else_label), end_label));
+        }
+        TileOp::ElseScalar => {
+            let (else_label, end_label) = scalar_if_stack.last_mut()
+                .ok_or("ElseScalar: no matching ScalarIfPush")?;
+            if else_label.is_none() {
+                return Err("ElseScalar: duplicate else in same scalar if block".into());
+            }
+            let else_lbl = else_label.take().unwrap();
+            // Jump past the else body to end
+            k.push(Op::Branch(end_label.clone()));
+            // Emit the else label
+            k.label(&else_lbl);
+        }
+        TileOp::EndIfScalar => {
+            let (else_label, end_label) = scalar_if_stack.pop()
+                .ok_or("EndIfScalar: no matching ScalarIfPush")?;
+            // If no else was emitted, we need the else label here
+            if let Some(else_lbl) = else_label {
+                k.label(&else_lbl);
+            }
+            // Emit the end label
+            k.label(&end_label);
+        }
+
         _ => return Err(format!("Unimplemented tile op: {:?}", op)),
     }
 
@@ -1298,6 +1450,26 @@ fn get_sreg_or_inline(val_map: &HashMap<Value, MachineVal>, v: Value) -> Result<
         MachineVal::SReg(sr) => Ok(SOperand::SReg(sr)),
         MachineVal::InlineInt(i) => Ok(SOperand::InlineInt(i)),
         other => Err(format!("Expected scalar, got {:?}", other)),
+    }
+}
+
+/// Get an SReg for a value, materializing from InlineInt/VReg if needed.
+/// Used for scalar comparisons that require SGPR operands (s_cmp_*).
+fn get_sreg(k: &mut T0Kernel, val_map: &mut HashMap<Value, MachineVal>, v: Value) -> Result<SReg, String> {
+    match get_val(val_map, v)? {
+        MachineVal::SReg(sr) => Ok(sr),
+        MachineVal::InlineInt(i) => {
+            let sr = k.alloc_sreg();
+            k.s_mov_imm(sr, i);
+            Ok(sr)
+        }
+        MachineVal::VReg(vr) => {
+            // VReg → SReg via v_readfirstlane (lane 0 value → SGPR)
+            let sr = k.alloc_sreg();
+            k.push(Op::RawAsm(format!("v_readfirstlane_b32 s{}, v{}", sr.0, vr.0)));
+            Ok(sr)
+        }
+        other => Err(format!("Cannot materialize as SReg: {:?}", other)),
     }
 }
 
@@ -1511,6 +1683,9 @@ pub fn lower_tiled_gemm(func: &TileFunc) -> Result<LoweredTiledGemm, String> {
         transpose: tile_ir::TileTranspose::NT,
         acc_swap: false,
         epilogue: vec![],
+            waves_per_wg: None,
+        wmma_format: super::ir::WmmaFormat::BF16_F32,
+        persistent: false,
     };
     
     eprintln!("[lower_tiled_gemm] spec: {} (wg={}, lds={}, db={})",

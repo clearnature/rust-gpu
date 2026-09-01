@@ -46,6 +46,8 @@ pub fn block_to_ssa(kb: &BlockKernel) -> Result<TileFunc, String> {
     let mut loop_map: HashMap<usize, ForLoop> = HashMap::new();
     // Active ForLoopAcc handles keyed by ForAccBegin node index
     let mut acc_loop_map: HashMap<usize, super::tile_ssa::ForLoopAcc> = HashMap::new();
+    // Active ForLoopMulti handles keyed by ForMultiBegin node index
+    let mut multi_loop_map: HashMap<usize, super::tile_ssa::ForLoopMulti> = HashMap::new();
 
     for (i, node) in nodes.iter().enumerate() {
         // ForBegin/ForEnd/ForAccBegin/ForAccEnd/ForAccResult are handled inline
@@ -103,6 +105,49 @@ pub fn block_to_ssa(kb: &BlockKernel) -> Result<TileFunc, String> {
                 val_map.insert(i, lp.result);
                 continue;
             }
+            BNode::ForMultiBegin { start, end, step, init_accs } => {
+                let start_v = val_map.get(&start.0).copied()
+                    .ok_or_else(|| format!("ForMultiBegin: start BVal {} not mapped", start.0))?;
+                let end_v = val_map.get(&end.0).copied()
+                    .ok_or_else(|| format!("ForMultiBegin: end BVal {} not mapped", end.0))?;
+                let init_vals: Vec<Value> = init_accs.iter()
+                    .map(|a| val_map.get(&a.0).copied()
+                        .ok_or_else(|| format!("ForMultiBegin: init_acc BVal {} not mapped", a.0)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let lp = f.for_range_multi_runtime(start_v, end_v, *step, init_vals);
+                // Map ForMultiBegin's BVal to the loop induction variable
+                val_map.insert(i, lp.iv);
+                multi_loop_map.insert(i, lp);
+                continue;
+            }
+            BNode::ForMultiPhi { begin_node, acc_idx } => {
+                let lp = multi_loop_map.get(begin_node)
+                    .ok_or_else(|| format!("ForMultiPhi: no matching ForMultiBegin for node {}", begin_node))?;
+                val_map.insert(i, lp.accs[*acc_idx]);
+                continue;
+            }
+            BNode::ForMultiEnd { begin_node, new_accs } => {
+                let new_acc_vals: Vec<Value> = new_accs.iter()
+                    .map(|a| val_map.get(&a.0).copied()
+                        .ok_or_else(|| format!("ForMultiEnd: new_acc BVal {} not mapped", a.0)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let lp = multi_loop_map.get(begin_node)
+                    .ok_or_else(|| format!("ForMultiEnd: no matching ForMultiBegin for node {}", begin_node))?
+                    .clone();
+                f.end_for_multi(&lp, new_acc_vals);
+                continue;
+            }
+            BNode::ForMultiResult { begin_node, acc_idx } => {
+                let lp = multi_loop_map.get(begin_node)
+                    .ok_or_else(|| format!("ForMultiResult: no matching ForMultiBegin for node {}", begin_node))?;
+                let result = lp.results[*acc_idx];
+                val_map.insert(i, result);
+                // Remove the loop handle after the last result is consumed
+                if *acc_idx == lp.results.len() - 1 {
+                    multi_loop_map.remove(begin_node);
+                }
+                continue;
+            }
             // IfMask/ElseMask/EndIf → ExecMaskPush/Flip/Pop TileOps
             BNode::IfMask(mask) => {
                 let mask_v = val_map.get(&mask.0).copied()
@@ -116,6 +161,46 @@ pub fn block_to_ssa(kb: &BlockKernel) -> Result<TileFunc, String> {
             }
             BNode::EndIf => {
                 f.push_op(super::tile_ssa::TileOp::ExecMaskPop);
+                continue;
+            }
+            // IfScalar/ElseScalar/EndIfScalar → ScalarIfPush/ElseScalar/EndIfScalar TileOps
+            BNode::IfScalar(cond) => {
+                let cond_v = val_map.get(&cond.0).copied()
+                    .ok_or_else(|| format!("IfScalar: cond BVal {} not mapped", cond.0))?;
+                f.push_op(super::tile_ssa::TileOp::ScalarIfPush { cond: cond_v });
+                continue;
+            }
+            BNode::ElseScalar => {
+                f.push_op(super::tile_ssa::TileOp::ElseScalar);
+                continue;
+            }
+            BNode::EndIfScalar => {
+                f.push_op(super::tile_ssa::TileOp::EndIfScalar);
+                continue;
+            }
+            // CondRescale → exp2(-scale) multiply under scalar condition
+            // Semantic: if (scale < threshold) { acc * exp2(-scale) } else { acc }
+            // Expanded inline using ScalarIfPush/EndIfScalar + Select
+            BNode::CondRescale { acc, acc_scale_log2, threshold } => {
+                let acc_v = val_map.get(&acc.0).copied()
+                    .ok_or_else(|| format!("CondRescale: acc BVal {} not mapped", acc.0))?;
+                let scale_v = val_map.get(&acc_scale_log2.0).copied()
+                    .ok_or_else(|| format!("CondRescale: acc_scale_log2 BVal {} not mapped", acc_scale_log2.0))?;
+
+                // 1. Compute condition: scale < threshold (vector cmp, all lanes same for scalar input)
+                let thresh_v = f.const_f32(*threshold);
+                let cond = f.cmp_lt(scale_v, thresh_v);
+
+                // 2. Compute rescale factor: exp2(-scale)
+                let neg_scale = f.neg(scale_v);
+                let exp_factor = f.exp2(neg_scale);
+                let rescaled = f.mul(acc_v, exp_factor);
+
+                // 3. Select: cond ? rescaled : original acc
+                let result = f.select(cond, rescaled, acc_v);
+
+                // This node produces a BVal result
+                val_map.insert(i, result);
                 continue;
             }
             _ => {}
@@ -349,13 +434,18 @@ fn translate_node(
         // ── For loops are handled in block_to_ssa() main loop ──
         BNode::ForBegin { .. } | BNode::ForEnd { .. }
         | BNode::ForAccBegin { .. } | BNode::ForAccPhi { .. }
-        | BNode::ForAccEnd { .. } | BNode::ForAccResult { .. } => {
-            unreachable!("For*/ForAcc* handled inline in block_to_ssa()")
+        | BNode::ForAccEnd { .. } | BNode::ForAccResult { .. }
+        | BNode::ForMultiBegin { .. } | BNode::ForMultiPhi { .. }
+        | BNode::ForMultiEnd { .. } | BNode::ForMultiResult { .. } => {
+            unreachable!("For*/ForAcc*/ForMulti* handled inline in block_to_ssa()")
         }
 
         // ── Conditional branching (handled inline in block_to_ssa) ──
         BNode::IfMask(_) | BNode::ElseMask | BNode::EndIf => {
             unreachable!("IfMask/ElseMask/EndIf handled inline in block_to_ssa()")
+        }
+        BNode::IfScalar(_) | BNode::ElseScalar | BNode::EndIfScalar | BNode::CondRescale { .. } => {
+            unreachable!("IfScalar/ElseScalar/EndIfScalar/CondRescale handled inline in block_to_ssa()")
         }
 
         // ── LDS ──
@@ -368,6 +458,37 @@ fn translate_node(
         BNode::LdsStore { base, offset, val } => {
             f.lds_store(get(base)?, get(offset)?, get(val)?);
             Ok(None)
+        }
+        // Transposed LDS store: addr = base + (col * stride + row) * 4
+        // XOR swizzle applied: addr XOR ((row & 3) << 3) to avoid LDS bank conflicts
+        BNode::LdsStoreT { base, row, col, val, stride } => {
+            let col_v = get(col)?;
+            let row_v = get(row)?;
+            let stride_v = f.const_u32(*stride);
+            let c3 = f.const_u32(3);
+            let prod = f.mul(col_v, stride_v);
+            let raw_offset = f.add(prod, row_v);
+            // XOR swizzle: swap bits to spread consecutive rows across banks
+            let swizzle_bits = f.binop_raw(super::tile_ssa::BinOpKind::And, row_v, c3);
+            let swizzle_shifted = f.binop_raw(super::tile_ssa::BinOpKind::Shl, swizzle_bits, c3);
+            let offset = f.binop_raw(super::tile_ssa::BinOpKind::Xor, raw_offset, swizzle_shifted);
+            f.lds_store(get(base)?, offset, get(val)?);
+            Ok(None)
+        }
+        // Transposed LDS load: addr = base + (col * stride + row) * 4
+        // XOR swizzle applied: matching store pattern
+        BNode::LdsLoadT { base, row, col, stride } => {
+            let col_v = get(col)?;
+            let row_v = get(row)?;
+            let stride_v = f.const_u32(*stride);
+            let c3 = f.const_u32(3);
+            let prod = f.mul(col_v, stride_v);
+            let raw_offset = f.add(prod, row_v);
+            // XOR swizzle: matching store swizzle
+            let swizzle_bits = f.binop_raw(super::tile_ssa::BinOpKind::And, row_v, c3);
+            let swizzle_shifted = f.binop_raw(super::tile_ssa::BinOpKind::Shl, swizzle_bits, c3);
+            let offset = f.binop_raw(super::tile_ssa::BinOpKind::Xor, raw_offset, swizzle_shifted);
+            Ok(Some(f.lds_load(get(base)?, offset)))
         }
         BNode::Barrier => {
             f.barrier();
@@ -427,6 +548,12 @@ fn translate_node(
             let acc2 = f.tile_dot(tile_a, tile_b, acc);
             f.tile_store_2d(y, row_off, col_off, n, acc2);
             Ok(None) // void
+        }
+
+        // Control-flow nodes are handled in the main loop and never reach translate_node
+        BNode::IfScalar(_) | BNode::ElseScalar | BNode::EndIfScalar |
+        BNode::CondRescale { .. } => {
+            unreachable!("translate_node: control-flow BNode should be handled in main loop")
         }
     }
 }
@@ -1806,6 +1933,269 @@ mod tests {
             compiled.workgroup_size[0], compiled.workgroup_size[1]);
         assert!(compiled.elf.len() > 100, "ELF too small");
         assert_eq!(compiled.args.len(), 6); // A, B, C, M, N, K
+    }
+}
+
+// ════════════════════════════════════════════
+//  DSL-3 + DSL-4 tests
+// ════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests_dsl3_dsl4 {
+    use super::*;
+
+    /// DSL-3: if_scalar — SSA translation test (no GPU)
+    ///
+    /// Simulates FlashAttention tile-level mask: if (tile_end > seq_len) skip.
+    #[test]
+    fn test_if_scalar_ssa() {
+        let mut kb = BlockKernel::new("if_scalar_test", 64);
+        let x_ptr = kb.arg_ptr("x");
+        let out_ptr = kb.arg_ptr("out");
+        let n = kb.arg_u32("n");
+        let tile_size = kb.const_u32(32);
+
+        let offsets = kb.arange(0, 64);
+        let mask = offsets.lt(&mut kb, n);
+        let a = kb.load(x_ptr, offsets, mask);
+
+        // Scalar condition: n < tile_size (both scalar U32 values)
+        // This produces a scalar bool (Mask type, but scalar in SSA)
+        let in_tile = n.lt(&mut kb, tile_size);
+
+        kb.if_scalar(in_tile);
+        // True body: multiply by 2
+        let two = kb.const_f32(2.0);
+        let doubled = a.mul(&mut kb, two);
+        kb.store(out_ptr, offsets, doubled, mask);
+        kb.end_if_scalar();
+
+        // Translate to SSA
+        let func = block_to_ssa(&kb).unwrap();
+        let ir_text = func.dump();
+        eprintln!("=== if_scalar SSA IR ===\n{}", ir_text);
+
+        // Verify ScalarIfPush/EndIfScalar appear in IR (dump format: scalar_if/end_if_scalar)
+        assert!(ir_text.contains("scalar_if"), "IR should contain scalar_if");
+        assert!(ir_text.contains("end_if_scalar"), "IR should contain end_if_scalar");
+    }
+
+    /// DSL-3: if_scalar/else_scalar — SSA translation with else branch
+    #[test]
+    fn test_if_else_scalar_ssa() {
+        let mut kb = BlockKernel::new("if_else_scalar_test", 64);
+        let x_ptr = kb.arg_ptr("x");
+        let out_ptr = kb.arg_ptr("out");
+        let n = kb.arg_u32("n");
+        let threshold = kb.const_u32(32);
+
+        let offsets = kb.arange(0, 64);
+        let mask = offsets.lt(&mut kb, n);
+        let a = kb.load(x_ptr, offsets, mask);
+
+        // Scalar condition: n > 32
+        let big_enough = n.ge(&mut kb, threshold); // U32: 0 or 1
+
+        kb.if_scalar(big_enough);
+        // True: y = x * 3
+        let three = kb.const_f32(3.0);
+        let tripled = a.mul(&mut kb, three);
+        kb.store(out_ptr, offsets, tripled, mask);
+        kb.else_scalar();
+        // False: y = x + 10
+        let ten = kb.const_f32(10.0);
+        let shifted = a.add(&mut kb, ten);
+        kb.store(out_ptr, offsets, shifted, mask);
+        kb.end_if_scalar();
+
+        let func = block_to_ssa(&kb).unwrap();
+        let ir_text = func.dump();
+        eprintln!("=== if_else_scalar SSA IR ===\n{}", ir_text);
+
+        assert!(ir_text.contains("scalar_if"), "IR should contain scalar_if");
+        assert!(ir_text.contains("else_scalar"), "IR should contain else_scalar");
+        assert!(ir_text.contains("end_if_scalar"), "IR should contain end_if_scalar");
+    }
+
+    /// DSL-3: if_scalar compile test (compilation only, no GPU dispatch)
+    #[test]
+    #[cfg(feature = "rocm")]
+    fn test_if_scalar_compile() {
+        let mut kb = BlockKernel::new("if_scalar_compile", 64);
+        let x_ptr = kb.arg_ptr("x");
+        let out_ptr = kb.arg_ptr("out");
+        let n = kb.arg_u32("n");
+        let tile_size = kb.const_u32(32);
+
+        let offsets = kb.arange(0, 64);
+        let mask = offsets.lt(&mut kb, n);
+        let a = kb.load(x_ptr, offsets, mask);
+
+        let tid = kb.thread_id();
+        let in_tile = tid.lt(&mut kb, tile_size);
+
+        kb.if_scalar(in_tile);
+        let two = kb.const_f32(2.0);
+        let doubled = a.mul(&mut kb, two);
+        kb.store(out_ptr, offsets, doubled, mask);
+        kb.end_if_scalar();
+
+        let compiled = kb.compile(Target::detect())
+            .expect("if_scalar compile failed");
+        eprintln!("✓ if_scalar compile: {} bytes ELF, ka={}", compiled.elf.len(), compiled.kernarg_size);
+        assert!(compiled.elf.len() > 100, "ELF too small");
+    }
+
+    /// DSL-4: exp2 — SSA translation test (no GPU)
+    ///
+    /// Tests that BNode::ExpF32 maps to v_exp_f32 (2^x) in SSA IR.
+    #[test]
+    fn test_exp2_ssa() {
+        let mut kb = BlockKernel::new("exp2_test", 64);
+        let x_ptr = kb.arg_ptr("x");
+        let out_ptr = kb.arg_ptr("out");
+        let n = kb.arg_u32("n");
+
+        let offsets = kb.arange(0, 64);
+        let mask = offsets.lt(&mut kb, n);
+        let x = kb.load(x_ptr, offsets, mask);
+
+        // exp2(x) = 2^x (hardware v_exp_f32)
+        let y = x.exp2(&mut kb);
+        kb.store(out_ptr, offsets, y, mask);
+
+        let func = block_to_ssa(&kb).unwrap();
+        let ir_text = func.dump();
+        eprintln!("=== exp2 SSA IR ===\n{}", ir_text);
+
+        // Verify Exp2 unary op appears in IR
+        assert!(ir_text.contains("Exp2"), "IR should contain Exp2 unary op");
+    }
+
+    /// DSL-4: cond_rescale — SSA translation test (no GPU)
+    ///
+    /// FlashAttention-style conditional rescale:
+    /// if (acc_scale_log2 < -8.0) { acc * exp2(-acc_scale_log2) } else { acc }
+    #[test]
+    fn test_cond_rescale_ssa() {
+        let mut kb = BlockKernel::new("cond_rescale_test", 64);
+        let x_ptr = kb.arg_ptr("x");
+        let out_ptr = kb.arg_ptr("out");
+        let n = kb.arg_u32("n");
+
+        let offsets = kb.arange(0, 64);
+        let mask = offsets.lt(&mut kb, n);
+        let acc = kb.load(x_ptr, offsets, mask);
+
+        // Simulate acc_scale_log2 as a scalar (loaded from kernarg)
+        let acc_scale_log2 = kb.arg_f32("scale_log2");
+
+        // Conditional rescale: if scale < -8.0, rescale acc
+        let rescaled = kb.cond_rescale(acc, acc_scale_log2, -8.0);
+        kb.store(out_ptr, offsets, rescaled, mask);
+
+        let func = block_to_ssa(&kb).unwrap();
+        let ir_text = func.dump();
+        eprintln!("=== cond_rescale SSA IR ===\n{}", ir_text);
+
+        // Verify key operations in IR
+        assert!(ir_text.contains("Lt"), "IR should contain Lt (condition check)");
+        assert!(ir_text.contains("Exp2"), "IR should contain Exp2 (rescale factor)");
+        assert!(ir_text.contains("select"), "IR should contain select (conditional output)");
+    }
+
+    /// DSL-4: cond_rescale compile test (compilation only, no GPU)
+    #[test]
+    #[cfg(feature = "rocm")]
+    fn test_cond_rescale_compile() {
+        let mut kb = BlockKernel::new("cond_rescale_compile", 64);
+        let x_ptr = kb.arg_ptr("x");
+        let out_ptr = kb.arg_ptr("out");
+        let n = kb.arg_u32("n");
+
+        let offsets = kb.arange(0, 64);
+        let mask = offsets.lt(&mut kb, n);
+        let acc = kb.load(x_ptr, offsets, mask);
+        let acc_scale_log2 = kb.arg_f32("scale_log2");
+
+        let rescaled = kb.cond_rescale(acc, acc_scale_log2, -8.0);
+        kb.store(out_ptr, offsets, rescaled, mask);
+
+        let compiled = kb.compile(Target::detect())
+            .expect("cond_rescale compile failed");
+        eprintln!("✓ cond_rescale compile: {} bytes ELF, ka={}", compiled.elf.len(), compiled.kernarg_size);
+        assert!(compiled.elf.len() > 100, "ELF too small");
+    }
+
+    /// DSL-3+4 integration: FlashAttention-style tile-level mask + rescale
+    ///
+    /// Simulates the FlashAttention inner loop pattern:
+    /// for each KV tile j:
+    ///   if (j * BLOCK_N < kv_len):  // scalar tile mask
+    ///     // load and compute
+    ///   acc = cond_rescale(acc, scale, -8.0)  // numerical stability
+    #[test]
+    fn test_flash_attention_pattern_ssa() {
+        let BLOCK_N: u32 = 32;
+        let mut kb = BlockKernel::new("fa_pattern", 64);
+
+        let q_ptr = kb.arg_ptr("q");
+        let k_ptr = kb.arg_ptr("k");
+        let out_ptr = kb.arg_ptr("out");
+        let kv_len = kb.arg_u32("kv_len");
+        let scale_log2 = kb.arg_f32("scale_log2");
+
+        let offsets = kb.arange(0, 64);
+
+        // Outer loop: iterate over KV tiles
+        let zero = kb.const_u32(0);
+        let block_n = kb.const_u32(BLOCK_N);
+        let init_acc = kb.const_f32(0.0);
+        let init_m = kb.const_f32(f32::NEG_INFINITY);
+        let (j, accs) = kb.for_range_multi(
+            zero, kv_len, BLOCK_N,
+            vec![init_acc, init_m], // [acc, m]
+        );
+        let acc_prev = accs[0];
+        let m_prev = accs[1];
+
+        // Scalar tile mask: j + BLOCK_N <= kv_len → in-bounds
+        let tile_end = j.add(&mut kb, block_n);
+        let in_bounds = tile_end.lt(&mut kb, kv_len); // U32: 0 or 1
+
+        kb.if_scalar(in_bounds);
+        // True body: process this tile (simplified)
+        let k_offsets = j.add(&mut kb, offsets);
+        let k_mask = k_offsets.lt(&mut kb, kv_len);
+        let k_vals = kb.load(k_ptr, k_offsets, k_mask);
+
+        // Compute: new_acc = acc + sum(k)
+        let new_acc = acc_prev.add(&mut kb, k_vals);
+
+        // Conditional rescale for numerical stability
+        let acc_rescaled = kb.cond_rescale(new_acc, scale_log2, -8.0);
+
+        // Update m (not really, just for pattern)
+        let new_m = m_prev.max(&mut kb, k_vals);
+
+        kb.store(out_ptr, offsets, acc_rescaled, k_mask);
+        kb.else_scalar();
+        // False: skip this tile (keep acc unchanged)
+        kb.end_if_scalar();
+
+        let results = kb.end_for_multi(j, vec![acc_rescaled, new_m]);
+
+        // Translate to SSA
+        let func = block_to_ssa(&kb).unwrap();
+        let ir_text = func.dump();
+        eprintln!("=== FlashAttention pattern SSA IR ===\n{}", ir_text);
+
+        // Verify key patterns (using IR dump format names)
+        assert!(ir_text.contains("scalar_if"), "Should have scalar tile mask");
+        assert!(ir_text.contains("end_if_scalar"), "Should close scalar if");
+        assert!(ir_text.contains("Exp2"), "Should have exp2 for rescale");
+        assert!(ir_text.contains("select"), "Should have select for cond_rescale");
+        assert!(ir_text.contains("bb1("), "Should have multi-accumulator loop header");
     }
 }
 

@@ -22,7 +22,15 @@ use super::ir::*;
 ///
 /// `coalesced_groups`: optional list of VReg ranges that must remain physically
 /// contiguous (WMMA fragments, etc.). CopyProp/DCE will skip these.
-pub fn optimize(ops: Vec<Op>, coalesced_groups: &[super::compile::CoalescedGroup]) -> (Vec<Op>, OptStats) {
+///
+/// `addr_vregs`: virtual VGPR numbers of Address class (arch fix B). Their
+/// def instructions are never algebraically rewritten — CSE would fold the
+/// lane_hi address component and corrupt WMMA reads (C_RAND 156 vs 168).
+pub fn optimize(
+    ops: Vec<Op>,
+    coalesced_groups: &[super::compile::CoalescedGroup],
+    addr_vregs: &std::collections::HashSet<u32>,
+) -> (Vec<Op>, OptStats) {
     let mut stats = OptStats::default();
     let original_len = ops.len();
 
@@ -58,7 +66,9 @@ pub fn optimize(ops: Vec<Op>, coalesced_groups: &[super::compile::CoalescedGroup
     if !skip("copy") { stats.copies_propagated = super::ssa_ir::copy_propagate_mach_func(&mut func); }
 
     // Pass 4: CSE (D4e+ cross-block via domtree)
-    if !skip("cse") { stats.cse_eliminated = super::ssa_ir::cse_mach_func_domtree(&mut func); }
+    // Address-class defs are excluded (arch fix B): CSE must never merge
+    // address chains — the lane_hi component is semantically load-bearing.
+    if !skip("cse") { stats.cse_eliminated = super::ssa_ir::cse_mach_func_domtree(&mut func, addr_vregs); }
 
     // Pass 5: Instruction Combining — mul+add → fma (D4f)
     if !skip("combine") { stats.instructions_combined = super::ssa_ir::instruction_combine_mach_func(&mut func); }
@@ -148,6 +158,16 @@ pub fn optimize(ops: Vec<Op>, coalesced_groups: &[super::compile::CoalescedGroup
     stats.loads_coalesced = coal_count;
     ops = new_ops;
 
+    // Pass 8: Software Pipelining (three-stage: Schedule→Lower→Pipeline)
+    // Overlaps iteration N's compute with iteration N+1's loads.
+    // Only applies to loops with global/buffer loads + wait + compute pattern.
+    // Disabled for WMMA loops (already hand-pipelined with LDS double-buffer).
+    if opt_level >= 4 && !std::env::var("T0_SKIP_SWP").is_ok() {
+        let (new_ops, swp_count) = software_pipeline(ops);
+        stats.sw_pipelined = swp_count;
+        ops = new_ops;
+    }
+
     // Pass 10: Post-regalloc instruction scheduling (Phase D)
     // Operates on Vec<Op> with physical registers — safe to reorder
     // because regalloc has already assigned registers.
@@ -155,6 +175,15 @@ pub fn optimize(ops: Vec<Op>, coalesced_groups: &[super::compile::CoalescedGroup
         let (new_ops, sched_count) = post_regalloc_schedule(ops);
         stats.ops_reordered = sched_count;
         ops = new_ops;
+    }
+
+    // Pass 11: Pingpong warp scheduling (s_setprio interleaving)
+    // Inserts s_setprio to alternate priority between WMMA and memory clusters.
+    // Based on Triton's BlockPingpong.cpp pattern for latency hiding.
+    // Safe to run after regalloc — s_setprio is scalar ALU, no VReg dependencies.
+    if opt_level >= 4 && !std::env::var("T0_SKIP_PINGPONG").is_ok() {
+        let pingpong_count = super::ssa_ir::pingpong_schedule(&mut ops);
+        stats.pingpong_inserted = pingpong_count;
     }
 
     if opt_level <= 4 {
@@ -171,10 +200,10 @@ pub fn optimize(ops: Vec<Op>, coalesced_groups: &[super::compile::CoalescedGroup
         || stats.waitcnts_removed > 0 || stats.cse_eliminated > 0
         || stats.licm_hoisted > 0 || stats.loops_unrolled > 0
         || stats.sw_pipelined > 0 || stats.strength_reduced > 0
-        || stats.loads_coalesced > 0;
+        || stats.loads_coalesced > 0 || stats.pingpong_inserted > 0;
     if any_change {
         eprintln!(
-            "[T0 Optimize] {} ops → {} ops: DCE -{}, CF -{}, AlgSimp -{}, CopyProp ~{}, CSE ~{}, Combine ~{}, Unroll ×{}, LICM ~{}, SR ~{}, Coal ~{}, SWP ~{}, WaitOpt -{}, Sched ~{}",
+            "[T0 Optimize] {} ops → {} ops: DCE -{}, CF -{}, AlgSimp -{}, CopyProp ~{}, CSE ~{}, Combine ~{}, Unroll ×{}, LICM ~{}, SR ~{}, Coal ~{}, SWP ~{}, WaitOpt -{}, Sched ~{}, PingPong +{}",
             stats.original_ops, stats.final_ops,
             stats.dead_ops_removed, stats.consts_folded,
             stats.algebraic_simplified, stats.copies_propagated,
@@ -182,7 +211,7 @@ pub fn optimize(ops: Vec<Op>, coalesced_groups: &[super::compile::CoalescedGroup
             stats.loops_unrolled, stats.licm_hoisted,
             stats.strength_reduced, stats.loads_coalesced,
             stats.sw_pipelined, stats.waitcnts_removed,
-            stats.ops_reordered
+            stats.ops_reordered, stats.pingpong_inserted
         );
     }
 
@@ -207,6 +236,7 @@ pub struct OptStats {
     pub ops_reordered: usize,
     pub strength_reduced: usize,
     pub loads_coalesced: usize,
+    pub pingpong_inserted: usize,
 }
 
 struct LoopInfo {
@@ -325,7 +355,7 @@ fn is_safe_to_unroll(ops: &[Op], body_start: usize, body_end: usize) -> bool {
             Op::Label(_) | Op::Branch(_) | Op::BranchScc1(_) | Op::BranchScc0(_) |
             Op::BranchVccz(_) => return false,
             // Barriers (WG sync semantics)
-            Op::Barrier | Op::SBarrier => return false,
+            Op::Barrier | Op::SBarrier | Op::GlobalInv => return false,
             // WMMA (already hand-optimized)
             Op::Wmma { .. } => return false,
             _ => {}
@@ -464,7 +494,7 @@ fn rename_op_vregs(op: &Op, offset: u32, rename_set: &HashSet<u32>) -> Op {
         // Scalar ops — pass through unchanged (SGPRs are not renamed)
         Op::SAddU32 { .. } | Op::SSubU32 { .. } | Op::SAddcU32 { .. } |
         Op::SAndB32 { .. } | Op::SMulI32 { .. } | Op::SLshlB32 { .. } |
-        Op::SLshrB32 { .. } | Op::SMov { .. } | Op::SCmpLtU32 { .. } |
+        Op::SLshrB32 { .. } | Op::SLshrB32SgprShift { .. } | Op::SMov { .. } | Op::SCmpLtU32 { .. } |
         Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } => op.clone(),
         // VMulLoU32
         Op::VMulLoU32 { dst, src0, src1 } =>
@@ -882,7 +912,7 @@ fn post_regalloc_schedule(ops: Vec<Op>) -> (Vec<Op>, usize) {
                     if wait_match(cur) { break; }
 
                     // Stop at control flow / sync boundaries
-                    if matches!(cur, Op::Barrier | Op::SBarrier |
+                    if matches!(cur, Op::Barrier | Op::SBarrier | Op::GlobalInv |
                         Op::Label(_) | Op::Branch(_) | Op::BranchScc0(_) |
                         Op::BranchScc1(_) | Op::BranchVccz(_)
                     ) { break; }
@@ -973,10 +1003,36 @@ fn post_regalloc_schedule(ops: Vec<Op>) -> (Vec<Op>, usize) {
     (result, total_reordered)
 }
 
-/// Software pipelining: reorder loop body to overlap loads with compute.
+/// Software pipelining: three-stage pipeline to overlap loads with compute.
 ///
+/// Inspired by Triton's ScheduleLoops.cpp pattern:
+/// - **Stage 1 (Schedule)**: Classify loop body ops into load/compute/store/sync clusters
+/// - **Stage 2 (Lower)**: Generate prologue→main→epilogue loop structure
+/// - **Stage 3 (Pipeline)**: Overlap iteration N's compute with iteration N+1's loads
+///
+/// ## Three-Stage Structure
+///
+/// Given a loop body: [loads → wait → compute → store]
+///
+/// **Prologue** (before loop):
+///   loads(0)          — prefetch iteration 0 data
+///
+/// **Main Loop** (repeated N-1 times):
+///   wait              — wait for current iteration's loads
+///   compute           — compute using loaded data
+///   loads(next)       — prefetch next iteration's data (overlaps with next iter's wait)
+///   store             — store current iteration's results
+///
+/// **Epilogue** (after loop):
+///   wait              — wait for last iteration's loads
+///   compute(last)     — compute last iteration
+///   store(last)       — store last iteration's results
+///
+/// ## Safety
 /// - No barriers or nested control flow in body
-/// - Trip count must be ≥ 2 (otherwise prologue+epilogue is worse)
+/// - Trip count must be ≥ 2
+/// - No LDS loads/stores (complex double-buffer dependencies)
+/// - No WMMA (already hand-optimized with LDS pipelining)
 fn software_pipeline(ops: Vec<Op>) -> (Vec<Op>, usize) {
     let loops = detect_loops(&ops);
     if loops.is_empty() { return (ops, 0); }
@@ -986,111 +1042,130 @@ fn software_pipeline(ops: Vec<Op>) -> (Vec<Op>, usize) {
 
     for lp in loops.iter().rev() {
         let body = &result[lp.body_start..lp.latch_add_idx];
-        let body_len = body.len();
 
-        // Safety: no barriers, nested loops, or WMMA
+        // ── Stage 1: Schedule — Classify ops ──
         if !is_safe_to_unroll(&result, lp.body_start, lp.latch_add_idx) {
             continue;
         }
 
-        // Find loads and their matching waits in the body
-        let mut load_indices: Vec<usize> = Vec::new(); // relative to body_start
-        let mut wait_index: Option<usize> = None;
+        let mut load_indices: Vec<usize> = Vec::new();   // relative to body_start
+        let mut wait_indices: Vec<usize> = Vec::new();
         let mut has_lds = false;
+        let mut has_wmma = false;
 
         for (j, op) in body.iter().enumerate() {
             match op {
-                Op::GlobalLoad { .. } => { load_indices.push(j); }
-                Op::WaitVmcnt(0) => { wait_index = Some(j); }
-                // LDS ops in body prevent software pipelining (complex dependencies)
+                // Memory loads (global/buffer — candidates for prefetch)
+                Op::GlobalLoad { .. } | Op::BufferLoad { .. } => {
+                    load_indices.push(j);
+                }
+                // Wait instructions
+                Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitKmcnt(_) => {
+                    wait_indices.push(j);
+                }
+                // LDS ops — prevent pipelining (double-buffer deps)
                 Op::LdsLoad { .. } | Op::LdsStore { .. } |
                 Op::DsLoadB32 { .. } | Op::DsStoreB32 { .. } |
                 Op::DsLoadB64 { .. } | Op::DsStoreB64 { .. } |
-                Op::DsLoadB128 { .. } | Op::DsStoreB128 { .. } => { has_lds = true; }
+                Op::DsLoadB128 { .. } | Op::DsStoreB128 { .. } |
+                Op::DsLoadU16 { .. } | Op::DsStoreB16 { .. } => {
+                    has_lds = true;
+                }
+                // WMMA — already hand-optimized
+                Op::Wmma { .. } => { has_wmma = true; }
                 _ => {}
             }
         }
 
-        // Need at least one load AND a wait, no LDS
-        if load_indices.is_empty() || wait_index.is_none() || has_lds {
-            continue;
-        }
-        let wait_idx = wait_index.unwrap();
+        // Safety checks
+        if has_lds || has_wmma { continue; }
 
-        // The wait must come AFTER all loads (otherwise the pattern is unusual)
-        if load_indices.iter().any(|&li| li >= wait_idx) {
-            continue;
-        }
+        // Need at least one load AND one wait
+        if load_indices.is_empty() || wait_indices.is_empty() { continue; }
 
-        // Collect VRegs defined by loads (these need double-buffering)
-        let mut load_dst_vregs: HashSet<u32> = HashSet::new();
-        for &li in &load_indices {
-            for d in body[li].vreg_defs() {
-                load_dst_vregs.insert(d.0);
-            }
-        }
+        // All loads must come before the first wait (standard pattern)
+        let first_wait = *wait_indices.iter().min().unwrap();
+        if load_indices.iter().any(|&li| li >= first_wait) { continue; }
 
-        // Compute the rename offset for the "next iteration" buffer
-        let max_v = max_vreg_in_ops(&result);
-        let _buf_offset = max_v + 1;
+        // Collect VRegs defined by loads (for dependency tracking)
+        let load_dst_vregs: HashSet<u32> = load_indices.iter()
+            .flat_map(|&li| body[li].vreg_defs().into_iter().map(|v| v.0))
+            .collect();
 
-        // Build the pipelined version:
-        //
-        // PROLOGUE (before loop): issue loads for iteration 0
-        //   [original loads]
-        //
-        // LOOP BODY (rewritten):
-        //   [wait for current data]
-        //   [prefetch loads for iter+1, using renamed dst VRegs]
-        //   [compute using original VRegs (already loaded)]
-        //   [store results]
-        //   [swap buffers: copy prefetch VRegs to original VRegs — but we use
-        //    renamed refs in next iteration's compute, so no explicit swap needed
-        //    if we rename the compute sources too]
-        //
-        // For simplicity, we use a simpler approach:
-        // - Prologue: emit original loads
-        // - Loop body: move loads AFTER the wait (they prefetch for next iter)
-        //   which converts: load→wait→compute → wait→compute→load (of next iter)
-        //   This naturally overlaps the load with the back-edge branch latency.
+        // Check that compute ops (between wait and end) use the loaded VRegs
+        // If no dependency, pipelining is pointless
+        let compute_uses_loads = body[first_wait..].iter().any(|op| {
+            op.vreg_uses().iter().any(|u| load_dst_vregs.contains(&u.0))
+        });
+        if !compute_uses_loads { continue; }
 
-        // Reorder the body: [wait] [compute/store ops] [loads] (loads now prefetch)
-        let mut reordered_body: Vec<Op> = Vec::with_capacity(body_len);
+        // ── Stage 2: Lower — Build three-phase structure ──
 
-        // 1. Wait instruction first
-        reordered_body.push(body[wait_idx].clone());
+        // Split body into three groups:
+        //   pre_wait: ops before the first wait (loads + any scalar setup)
+        //   wait_ops: the wait instruction(s)
+        //   post_wait: compute + store ops (after wait)
+        let pre_wait_ops: Vec<&Op> = body[..first_wait].iter().collect();
+        let wait_ops: Vec<&Op> = body[first_wait..=first_wait].iter().collect();
+        let post_wait_ops: Vec<&Op> = body[first_wait + 1..].iter().collect();
 
-        // 2. All non-load, non-wait ops (compute + stores + scalar ops)
-        for (j, op) in body.iter().enumerate() {
-            if load_indices.contains(&j) || j == wait_idx { continue; }
-            reordered_body.push(op.clone());
-        }
+        // Identify which pre_wait ops are loads vs other setup
+        let load_ops: Vec<&Op> = load_indices.iter().map(|&li| &body[li]).collect();
+        let non_load_pre_wait: Vec<&Op> = pre_wait_ops.iter()
+            .filter(|op| !matches!(op, Op::GlobalLoad { .. } | Op::BufferLoad { .. }))
+            .copied()
+            .collect();
 
-        // 3. Load instructions last (they prefetch the next iteration's data)
-        for &li in &load_indices {
-            reordered_body.push(body[li].clone());
-        }
-
-        // Build the new op sequence
-        let mut new_ops: Vec<Op> = Vec::with_capacity(result.len() + load_indices.len() * 2);
+        // Build new op sequence
+        let mut new_ops: Vec<Op> = Vec::with_capacity(result.len() + body.len());
 
         // Everything before the loop body
         for i in 0..lp.body_start {
             new_ops.push(result[i].clone());
         }
 
-        // Prologue: first iteration's loads (before loop body, inside the loop header)
-        for &li in &load_indices {
-            new_ops.push(body[li].clone());
+        // ── Prologue: Issue loads for iteration 0 ──
+        // (any non-load setup ops are also emitted here)
+        for op in &non_load_pre_wait {
+            new_ops.push((*op).clone());
+        }
+        for op in &load_ops {
+            new_ops.push((*op).clone());
         }
 
-        // Reordered body
-        new_ops.extend(reordered_body);
+        // ── Main Loop Body: wait → compute → prefetch → store ──
+        // The key transformation:
+        //   Original: [loads → wait → compute → store]
+        //   Pipelined: [wait → compute → loads(prefetch) → store]
+        // This overlaps iteration N+1's loads with iteration N's compute+store.
 
-        // Latch + back-edge + everything from exit label onward
+        // Wait for current iteration's data
+        for op in &wait_ops {
+            new_ops.push((*op).clone());
+        }
+
+        // Compute (using data that just arrived)
+        for op in &post_wait_ops {
+            new_ops.push((*op).clone());
+        }
+
+        // Prefetch: issue loads for NEXT iteration (moved to after compute)
+        for op in &load_ops {
+            new_ops.push((*op).clone());
+        }
+
+        // Latch (SAddU32 + Branch) + exit label + everything after
         for i in lp.latch_add_idx..result.len() {
             new_ops.push(result[i].clone());
         }
+
+        // ── Stage 3: Pipeline — waitcnt is already correct ──
+        // The existing wait instruction (WaitVmcnt(0)) ensures the prefetch
+        // loads complete before the NEXT iteration's compute uses them.
+        // The transformation naturally creates the overlap:
+        //   iter N: [wait(N) → compute(N) → loads(N+1) → branch]
+        //   iter N+1: [wait(N+1) → compute(N+1) → loads(N+2) → branch]
+        // The wait in iter N+1 covers the loads issued at end of iter N.
 
         result = new_ops;
         pipelined_count += 1;
@@ -1116,7 +1191,7 @@ mod tests {
             Op::Endpgm,
         ];
 
-        let (_result, stats) = optimize(ops, &[]);
+        let (_result, stats) = optimize(ops, &[], &std::collections::HashSet::new());
         assert!(stats.consts_folded >= 1, "should fold at least 1 op");
         assert!(stats.dead_ops_removed >= 1, "should remove at least 1 dead op");
     }
@@ -1260,6 +1335,114 @@ mod tests {
         let (result, pipelined) = software_pipeline(ops);
         assert_eq!(pipelined, 0, "no loops → 0 pipelined");
         assert_eq!(result.len(), original.len(), "op list should be unchanged");
+    }
+
+    #[test]
+    fn test_sw_pipeline_three_stage_structure() {
+        // Verify the three-stage structure: prologue → [wait→compute→prefetch] → latch
+        let body = vec![
+            Op::GlobalLoad { dst: VReg(3), addr: VReg(20), width: Width::B32, offset: 0 },
+            Op::GlobalLoad { dst: VReg(5), addr: VReg(21), width: Width::B32, offset: 0 },
+            Op::WaitVmcnt(0),
+            Op::VAddF32 { dst: VReg(4), src0: Operand::VReg(VReg(3)), src1: Operand::VReg(VReg(5)) },
+            Op::GlobalStore { addr: VReg(10), src: VReg(4), width: Width::B32, offset: 0 },
+        ];
+        let ops = make_counted_loop(body, 0, 8, 1);
+
+        let (result, pipelined) = software_pipeline(ops);
+        assert_eq!(pipelined, 1, "should pipeline 1 loop");
+
+        // Count loads: should be 4 (2 prologue + 2 in loop body prefetch)
+        let load_count = result.iter().filter(|op| matches!(op, Op::GlobalLoad { .. })).count();
+        assert_eq!(load_count, 4, "should have 4 loads (2 prologue + 2 prefetch)");
+
+        // Verify structure: prologue loads → loop header → wait → compute → store → prefetch → latch
+        let mut seen_prologue_load = false;
+        let mut seen_wait = false;
+        let mut seen_compute = false;
+        let mut seen_store = false;
+        let mut seen_prefetch = false;
+
+        for op in &result {
+            match op {
+                Op::GlobalLoad { .. } if !seen_wait => { seen_prologue_load = true; }
+                Op::WaitVmcnt(0) => { seen_wait = true; assert!(seen_prologue_load); }
+                Op::VAddF32 { .. } if seen_wait && !seen_store => { seen_compute = true; }
+                Op::GlobalStore { .. } if seen_compute => { seen_store = true; }
+                Op::GlobalLoad { .. } if seen_store => { seen_prefetch = true; }
+                _ => {}
+            }
+        }
+        assert!(seen_prologue_load, "should have prologue loads");
+        assert!(seen_wait, "should have wait");
+        assert!(seen_compute, "should have compute");
+        assert!(seen_store, "should have store");
+        assert!(seen_prefetch, "should have prefetch loads after store");
+    }
+
+    #[test]
+    fn test_sw_pipeline_no_dependency_skips() {
+        // If loads don't feed into compute, pipelining is pointless → skip
+        let body = vec![
+            Op::GlobalLoad { dst: VReg(3), addr: VReg(20), width: Width::B32, offset: 0 },
+            Op::WaitVmcnt(0),
+            // Compute uses VReg(99), not VReg(3) — no dependency on load
+            Op::VAddF32 { dst: VReg(4), src0: Operand::VReg(VReg(99)), src1: Operand::InlineFloat(1.0) },
+            Op::GlobalStore { addr: VReg(10), src: VReg(4), width: Width::B32, offset: 0 },
+        ];
+        let ops = make_counted_loop(body, 0, 8, 1);
+
+        let (result, pipelined) = software_pipeline(ops);
+        assert_eq!(pipelined, 0, "no dependency → should not pipeline");
+    }
+
+    #[test]
+    fn test_sw_pipeline_lds_blocked() {
+        // Loop with LDS ops should NOT be pipelined
+        let body = vec![
+            Op::GlobalLoad { dst: VReg(3), addr: VReg(20), width: Width::B32, offset: 0 },
+            Op::WaitVmcnt(0),
+            Op::DsStoreB32 { vaddr: VReg(0), src: VReg(3), offset: 0 },
+            Op::VAddF32 { dst: VReg(4), src0: Operand::VReg(VReg(3)), src1: Operand::InlineFloat(1.0) },
+        ];
+        let ops = make_counted_loop(body, 0, 8, 1);
+
+        let (result, pipelined) = software_pipeline(ops);
+        assert_eq!(pipelined, 0, "LDS ops → should not pipeline");
+    }
+
+    #[test]
+    fn test_sw_pipeline_wmma_blocked() {
+        // Loop with WMMA should NOT be pipelined (already hand-optimized)
+        let body = vec![
+            Op::GlobalLoad { dst: VReg(3), addr: VReg(20), width: Width::B32, offset: 0 },
+            Op::WaitVmcnt(0),
+            Op::Wmma { dst: VReg(10), a: VReg(20), b: VReg(28), c: VReg(10),
+                format: WmmaFormat::BF16_F32, ab_width: 8, sparse_idx: None },
+        ];
+        let ops = make_counted_loop(body, 0, 8, 1);
+
+        let (result, pipelined) = software_pipeline(ops);
+        assert_eq!(pipelined, 0, "WMMA → should not pipeline");
+    }
+
+    #[test]
+    fn test_sw_pipeline_buffer_load() {
+        // BufferLoad should also be pipelined (not just GlobalLoad)
+        let body = vec![
+            Op::BufferLoad { dst: VReg(3), voffset: VReg(20), srsrc: SReg(0),
+                width: Width::B32, offset: 0, soffset: SReg(0) },
+            Op::WaitVmcnt(0),
+            Op::VAddF32 { dst: VReg(4), src0: Operand::VReg(VReg(3)), src1: Operand::InlineFloat(1.0) },
+            Op::GlobalStore { addr: VReg(10), src: VReg(4), width: Width::B32, offset: 0 },
+        ];
+        let ops = make_counted_loop(body, 0, 8, 1);
+
+        let (result, pipelined) = software_pipeline(ops);
+        assert_eq!(pipelined, 1, "BufferLoad should be pipelined");
+
+        let load_count = result.iter().filter(|op| matches!(op, Op::BufferLoad { .. })).count();
+        assert_eq!(load_count, 2, "should have 2 BufferLoads (1 prologue + 1 prefetch)");
     }
 
     // ═══════════════════════════════════════════

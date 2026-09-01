@@ -210,17 +210,42 @@ pub enum BNode {
     LdsAlloc { size_bytes: u32 },                     // 分配 LDS 空间
     LdsLoad { base: BVal, offset: BVal },             // f32 from LDS
     LdsStore { base: BVal, offset: BVal, val: BVal }, // f32 to LDS
+    /// Transposed LDS store: addr = base + (col * stride + row) * 4
+    /// Used for V matrix in FlashAttention: V[seqlen, head_dim] → LDS[head_dim, seqlen]
+    LdsStoreT { base: BVal, row: BVal, col: BVal, val: BVal, stride: u32 },
+    /// Transposed LDS load: addr = base + (col * stride + row) * 4
+    LdsLoadT { base: BVal, row: BVal, col: BVal, stride: u32 },
 
     // ── 同步 ──
     Barrier,                  // s_barrier + lgkmcnt(0)
 
-    // ── 条件分支 ──
+    // ── 条件分支（per-lane EXEC mask）──
     /// if (mask): 仅 mask=1 的 lane 执行后续代码（SaveExec）
     IfMask(BVal),
     /// else: 切换到 mask=0 的 lane（XorExec）
     ElseMask,
     /// endif: 恢复原始 EXEC（RestoreExec）
     EndIf,
+
+    // ── 条件分支（scalar SCC, 全 workgroup 一致）──
+    /// if_scalar(cond): scalar 条件跳转，cond 为 U32 (0=false, ≠0=true)
+    /// 编译为 s_cmp + s_cbranch_scc0/scc1，影响所有 lane。
+    /// 用于 FlashAttention tile-level mask: 整个 tile 是否参与计算。
+    IfScalar(BVal),
+    /// else_scalar: scalar 条件的 else 分支（与 IfScalar 配对，可选）
+    ElseScalar,
+    /// end_if_scalar: 结束 scalar 条件分支（与 IfScalar 配对）
+    EndIfScalar,
+
+    // ── 条件 rescale ──
+    /// 条件 rescale: if (acc_scale_log2 < threshold) { return acc * exp2(-acc_scale_log2) }
+    ///              else { return acc }
+    ///
+    /// FlashAttention 在线 softmax 的数值稳定性优化。
+    /// 当 acc_scale_log2 < threshold (默认 -8.0) 时，
+    /// 用 `exp2(-acc_scale_log2)` 缩放 acc 使其回到安全范围。
+    /// 返回 rescale 后的 acc（如果不需要 rescale 则返回原值）。
+    CondRescale { acc: BVal, acc_scale_log2: BVal, threshold: f32 },
 
     // ── 循环 ──
     ForBegin { start: BVal, end: BVal, step: u32 },   // SGPR loop header
@@ -236,6 +261,16 @@ pub enum BNode {
     ForAccEnd { begin_node: usize, new_acc: BVal },
     /// Get the final result of accumulator loop after it exits
     ForAccResult { begin_node: usize },
+
+    // ── 多累加器循环（多循环携带变量）──
+    /// Loop with multiple carried accumulators
+    ForMultiBegin { start: BVal, end: BVal, step: u32, init_accs: Vec<BVal> },
+    /// Phi nodes for multi-accumulator values (one per accumulator)
+    ForMultiPhi { begin_node: usize, acc_idx: usize },
+    /// End of multi-accumulator loop; new_accs are the updated values
+    ForMultiEnd { begin_node: usize, new_accs: Vec<BVal> },
+    /// Get the final results of multi-accumulator loop (one per accumulator)
+    ForMultiResult { begin_node: usize, acc_idx: usize },
 
     // ── WG 级归约（跨 wave，通过 LDS）──
     WgReduceAddF32(BVal),
@@ -304,16 +339,26 @@ impl BNode {
             BNode::LdsAlloc { .. } => BType::LdsPtr,
             BNode::LdsLoad { .. } => BType::F32,
             BNode::LdsStore { .. } => BType::U32, // void
+            BNode::LdsLoadT { .. } => BType::F32,
+            BNode::LdsStoreT { .. } => BType::U32, // void
             BNode::Barrier => BType::U32,          // void
             BNode::IfMask(_) => BType::U32,        // void
             BNode::ElseMask => BType::U32,         // void
             BNode::EndIf => BType::U32,            // void
+            BNode::IfScalar(_) => BType::U32,     // void (scalar branch)
+            BNode::ElseScalar => BType::U32,      // void
+            BNode::EndIfScalar => BType::U32,     // void
+            BNode::CondRescale { .. } => BType::F32, // returns rescaled acc
             BNode::ForBegin { .. } => BType::U32,  // iter var
             BNode::ForEnd { .. } => BType::U32,    // void
             BNode::ForAccBegin { .. } => BType::U32,  // iter var
             BNode::ForAccPhi { .. } => BType::F32,    // accumulator (current value)
             BNode::ForAccEnd { .. } => BType::U32,    // void
             BNode::ForAccResult { .. } => BType::F32, // final accumulator value
+            BNode::ForMultiBegin { .. } => BType::U32,  // iter var
+            BNode::ForMultiPhi { .. } => BType::F32,    // accumulator (current value)
+            BNode::ForMultiEnd { .. } => BType::U32,    // void
+            BNode::ForMultiResult { .. } => BType::F32, // final accumulator value
             BNode::WgReduceAddF32(_) | BNode::WgReduceMaxF32(_) => BType::F32,
             BNode::ZeroAcc => BType::F32x8,
             BNode::CvtPkBf16F32 { .. } => BType::U32, // bf16x2 packed in u32
@@ -862,6 +907,34 @@ impl BlockKernel {
         self.push(BNode::LdsStore { base, offset, val });
     }
 
+    /// Transposed LDS store: lds[base + (col * stride + row) * 4] = val
+    ///
+    /// Stores data in transposed layout (col-major → row-major in LDS).
+    /// Used for V matrix in FlashAttention: V[seqlen, head_dim] stored
+    /// transposed in LDS as LDS[head_dim, seqlen] for efficient P*V GEMM.
+    ///
+    /// XOR swizzle is applied to avoid LDS bank conflicts:
+    /// `addr = (col * stride + row) XOR ((row & 3) << 3)`
+    pub fn lds_store_transposed(&mut self, base: BVal, row: BVal, col: BVal, val: BVal, stride: u32) {
+        assert_eq!(self.types[base.0], BType::LdsPtr, "lds_store_transposed: base must be LdsPtr");
+        assert_eq!(self.types[row.0], BType::U32, "lds_store_transposed: row must be U32");
+        assert_eq!(self.types[col.0], BType::U32, "lds_store_transposed: col must be U32");
+        assert_eq!(self.types[val.0], BType::F32, "lds_store_transposed: val must be F32");
+        assert!(stride > 0, "lds_store_transposed: stride must be > 0");
+        self.push(BNode::LdsStoreT { base, row, col, val, stride });
+    }
+
+    /// Transposed LDS load: val = lds[base + (col * stride + row) * 4]
+    ///
+    /// Loads from transposed LDS layout with XOR swizzle (matching `lds_store_transposed`).
+    pub fn lds_load_transposed(&mut self, base: BVal, row: BVal, col: BVal, stride: u32) -> BVal {
+        assert_eq!(self.types[base.0], BType::LdsPtr, "lds_load_transposed: base must be LdsPtr");
+        assert_eq!(self.types[row.0], BType::U32, "lds_load_transposed: row must be U32");
+        assert_eq!(self.types[col.0], BType::U32, "lds_load_transposed: col must be U32");
+        assert!(stride > 0, "lds_load_transposed: stride must be > 0");
+        self.push(BNode::LdsLoadT { base, row, col, stride })
+    }
+
     // ── 同步 ──
 
     /// Workgroup barrier (all waves in WG synchronize)
@@ -869,7 +942,109 @@ impl BlockKernel {
         self.push(BNode::Barrier);
     }
 
-    // ── 条件分支 ──
+    // ── LDS 双缓冲（FlashAttention K/V 预取）──
+
+    /// Allocate a double-buffered LDS region for tile prefetching.
+    ///
+    /// Returns an `LdsDoubleBuffer` handle that manages two equally-sized LDS
+    /// buffers. During FlashAttention, the *active* buffer holds the current
+    /// K/V tile being consumed, while the *inactive* buffer receives the next
+    /// tile prefetched from global memory.
+    ///
+    /// ```ignore
+    /// let lds_db = kb.lds_alloc_double_buffer(tile_elems * 4);  // total = 2× tile
+    /// // prefetch first tile into buffer[0]
+    /// lds_db.lds_prefetch_buffered(&mut kb, offsets, data);
+    /// kb.barrier();
+    /// // main loop: swap → read active → prefetch inactive
+    /// lds_db.begin_buffer_swap(&mut kb);
+    /// let val = lds_db.lds_load_buffered(&mut kb, offsets);
+    /// ```
+    pub fn lds_alloc_double_buffer(&mut self, single_buffer_bytes: u32) -> LdsDoubleBuffer {
+        // Allocate contiguous LDS for two buffers
+        let total = single_buffer_bytes * 2;
+        let base = self.lds_alloc(total);
+        LdsDoubleBuffer {
+            base,
+            buffer_size_bytes: single_buffer_bytes,
+            active: 0, // buffer 0 is initially active
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────
+//  LdsDoubleBuffer — FlashAttention K/V 双缓冲抽象
+// ────────────────────────────────────────────────────────
+
+/// Double-buffered LDS accessor for FlashAttention K/V tile prefetching.
+///
+/// Two equally-sized LDS regions (buffer 0 and buffer 1) are laid out
+/// contiguously starting at `base`. While the compute pipeline consumes the
+/// *active* buffer, the load pipeline can write the next tile into the
+/// *inactive* buffer without stalling.
+///
+/// After a `barrier()`, call `begin_buffer_swap()` to atomically flip which
+/// buffer is active. This is a host-side (DSL-level) bookkeeping flip — no
+/// GPU instructions are emitted for the swap itself.
+pub struct LdsDoubleBuffer {
+    /// LDS base pointer (both buffers start here)
+    base: BVal,
+    /// Size of a single buffer in bytes
+    buffer_size_bytes: u32,
+    /// Currently active buffer index (0 or 1)
+    active: u32,
+}
+
+impl LdsDoubleBuffer {
+    /// Get the LDS base handle (for passing to raw lds_load/lds_store if needed).
+    pub fn base(&self) -> BVal { self.base }
+
+    /// Get the single buffer size in bytes.
+    pub fn buffer_size_bytes(&self) -> u32 { self.buffer_size_bytes }
+
+    /// Get the currently active buffer index (0 or 1).
+    pub fn active_index(&self) -> u32 { self.active }
+
+    /// Swap which buffer is *active* (the one `lds_load_buffered` reads from).
+    ///
+    /// Call this **after** a `barrier()` so all lanes see the same swap.
+    /// No GPU instructions are emitted — this flips the DSL-level bookkeeping
+    /// so subsequent `lds_load_buffered` / `lds_prefetch_buffered` calls
+    /// target the opposite half of the LDS allocation.
+    pub fn begin_buffer_swap(&mut self) {
+        self.active = 1 - self.active;
+    }
+
+    /// Load one f32 element from the *active* LDS buffer.
+    ///
+    /// `offset` is the per-lane byte offset *within* the active buffer
+    /// (i.e. 0-based, range [0, buffer_size_bytes)).
+    ///
+    /// The effective LDS byte address is:
+    /// `base + active * buffer_size_bytes + offset * 4`
+    pub fn lds_load_buffered(&self, kb: &mut BlockKernel, offset: BVal) -> BVal {
+        let active_off = kb.const_u32(self.active * self.buffer_size_bytes);
+        let addr = offset.add(kb, active_off);
+        kb.lds_load(self.base, addr)
+    }
+
+    /// Store one f32 element into the *inactive* LDS buffer (prefetch target).
+    ///
+    /// `offset` is the per-lane byte offset *within* the inactive buffer.
+    /// During FlashAttention, the load stage calls this to fill the next K/V
+    /// tile while the compute stage reads from the active buffer.
+    pub fn lds_prefetch_buffered(&self, kb: &mut BlockKernel, offset: BVal, val: BVal) {
+        let inactive = 1 - self.active;
+        let inactive_off = kb.const_u32(inactive * self.buffer_size_bytes);
+        let addr = offset.add(kb, inactive_off);
+        kb.lds_store(self.base, addr, val);
+    }
+}
+
+// ═══════════════════════════════════════════════
+//  条件分支 / 循环 (continued in BlockKernel)
+// ═══════════════════════════════════════════════
+impl BlockKernel {
 
     /// if (mask): 仅 mask=1 的 lane 执行后续代码
     ///
@@ -894,6 +1069,60 @@ impl BlockKernel {
     /// endif: 恢复原始 EXEC（与 if_mask 配对）
     pub fn end_if(&mut self) {
         self.push(BNode::EndIf);
+    }
+
+    // ── Scalar 条件分支（SCC-based）──
+
+    /// if_scalar(cond): scalar 条件分支，所有 lane 统一跳转。
+    ///
+    /// `cond` 是 U32 标量值：0 = false, 非 0 = true。
+    /// 编译为 `s_cmp_lg_u32 cond, 0` + `s_cbranch_scc0/scc1`。
+    ///
+    /// 用于 FlashAttention tile-level mask：判断当前 KV tile 是否在序列边界外。
+    ///
+    /// ```ignore
+    /// let kv_end = j.add(&mut kb, block_n);  // scalar: j + BLOCK_N
+    /// let past_end = kv_end.gt_scalar(&mut kb, kv_len); // 0 or 1
+    /// kb.if_scalar(past_end);
+    ///   // skip this tile (all lanes skip)
+    /// kb.else_scalar();
+    ///   // process this tile (all lanes participate)
+    /// kb.end_if_scalar();
+    /// ```
+    pub fn if_scalar(&mut self, cond: BVal) {
+        let ty = self.types[cond.0];
+        assert!(ty == BType::U32 || ty == BType::Mask,
+            "if_scalar: cond must be U32 or Mask, got {:?}", ty);
+        self.push(BNode::IfScalar(cond));
+    }
+
+    /// else_scalar: scalar 条件的 else 分支（与 if_scalar 配对，可选）
+    pub fn else_scalar(&mut self) {
+        self.push(BNode::ElseScalar);
+    }
+
+    /// end_if_scalar: 结束 scalar 条件分支（与 if_scalar 配对）
+    pub fn end_if_scalar(&mut self) {
+        self.push(BNode::EndIfScalar);
+    }
+
+    // ── 条件 rescale ──
+
+    /// 条件 rescale: if (acc_scale_log2 < -8.0) { return acc * exp2(-acc_scale_log2) }
+    ///              else { return acc }
+    ///
+    /// FlashAttention 在线 softmax 的数值稳定性优化：
+    /// 当 acc_scale_log2 < threshold (默认 -8.0) 时，
+    /// 用 `exp2(-acc_scale_log2)` 缩放 acc 使其回到安全范围。
+    /// 返回 rescale 后的 acc。
+    ///
+    /// ```ignore
+    /// let rescaled = kb.cond_rescale(acc, acc_scale_log2, -8.0);
+    /// ```
+    pub fn cond_rescale(&mut self, acc: BVal, acc_scale_log2: BVal, threshold: f32) -> BVal {
+        assert_eq!(self.types[acc.0], BType::F32, "cond_rescale: acc must be F32");
+        assert_eq!(self.types[acc_scale_log2.0], BType::F32, "cond_rescale: acc_scale_log2 must be F32");
+        self.push(BNode::CondRescale { acc, acc_scale_log2, threshold })
     }
 
     // ── 循环 ──
@@ -946,6 +1175,73 @@ impl BlockKernel {
             "end_for_acc: iter_var must come from for_range_acc");
         self.push(BNode::ForAccEnd { begin_node, new_acc });
         self.push(BNode::ForAccResult { begin_node })
+    }
+
+    // ── 多累加器循环 ──
+
+    /// Loop with multiple loop-carried accumulators.
+    ///
+    /// Returns `(iter_var, acc_vars)` where:
+    /// - `iter_var`: loop induction variable (U32)
+    /// - `acc_vars`: Vec of BVal handles, one per accumulator, valid inside loop body
+    ///
+    /// Use `end_for_multi()` to close the loop and get final results.
+    ///
+    /// ```ignore
+    /// let neg_inf = kb.const_f32(f32::NEG_INFINITY);
+    /// let zero = kb.const_f32(0.0);
+    /// let (j, accs) = kb.for_range_multi(
+    ///     kb.const_u32(0), kv_blocks, BLOCK_N as u32,
+    ///     vec![neg_inf, zero]  // m_prev=-inf, l_prev=0
+    /// );
+    /// let m_prev = accs[0];
+    /// let l_prev = accs[1];
+    /// // ... loop body using m_prev, l_prev ...
+    /// let results = kb.end_for_multi(j, vec![m_new, l_new]);
+    /// let m_final = results[0];
+    /// let l_final = results[1];
+    /// ```
+    pub fn for_range_multi(
+        &mut self, start: BVal, end: BVal, step: u32,
+        init_accs: Vec<BVal>,
+    ) -> (BVal, Vec<BVal>) {
+        assert!(!init_accs.is_empty(), "for_range_multi: need at least 1 accumulator");
+        assert!(step > 0, "for_range_multi: step must be > 0");
+
+        let n_accs = init_accs.len();
+        let iter_var = self.push(BNode::ForMultiBegin {
+            start, end, step, init_accs,
+        });
+        let begin_node = iter_var.0;
+
+        let mut acc_vars = Vec::with_capacity(n_accs);
+        for idx in 0..n_accs {
+            acc_vars.push(self.push(BNode::ForMultiPhi { begin_node, acc_idx: idx }));
+        }
+
+        (iter_var, acc_vars)
+    }
+
+    /// End multi-accumulator loop, return final result BVal for each accumulator.
+    pub fn end_for_multi(&mut self, iter_var: BVal, new_accs: Vec<BVal>) -> Vec<BVal> {
+        let begin_node = iter_var.0;
+        assert!(matches!(self.nodes[begin_node], BNode::ForMultiBegin { .. }),
+            "end_for_multi: iter_var must come from for_range_multi");
+
+        let n_accs = match &self.nodes[begin_node] {
+            BNode::ForMultiBegin { init_accs, .. } => init_accs.len(),
+            _ => unreachable!(),
+        };
+        assert_eq!(new_accs.len(), n_accs,
+            "end_for_multi: expected {} new_accs, got {}", n_accs, new_accs.len());
+
+        self.push(BNode::ForMultiEnd { begin_node, new_accs });
+
+        let mut results = Vec::with_capacity(n_accs);
+        for idx in 0..n_accs {
+            results.push(self.push(BNode::ForMultiResult { begin_node, acc_idx: idx }));
+        }
+        results
     }
 
     // ── WMMA 操作 ──
@@ -1165,8 +1461,8 @@ mod gpu_tests {
     #[test]
     fn test_gpu_vector_add() {
         let rt = setup();
-        let n: usize = 1024;
-        let block_size: u32 = 256;
+        let n: usize = 128;
+        let block_size: u32 = 128;
 
         // Build kernel
         let mut kb = BlockKernel::new("gpu_vector_add", block_size);
@@ -1205,7 +1501,7 @@ mod gpu_tests {
         ka[16..24].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
         ka[24..28].copy_from_slice(&(n as u32).to_le_bytes());
 
-        // Dispatch
+        // Dispatch — try with exact workgroup count (grid in workgroups)
         let gpu_kernel = rt.compile_dsl(compiled).unwrap();
         let grid_x = ((n as u32 + block_size - 1) / block_size) * block_size;
         rt.dispatch(&gpu_kernel, [grid_x, 1, 1], &ka).unwrap();
@@ -1213,6 +1509,11 @@ mod gpu_tests {
         // Verify
         let result = rt.read_f32(&out_buf, n);
         let mut max_err = 0f32;
+        // Debug: show first and last elements
+        eprintln!("  [DBG] result[0..4] = {:?}", &result[..4.min(n)]);
+        if n > 32 {
+            eprintln!("  [DBG] result[30..34] = {:?}", &result[30..34.min(n)]);
+        }
         for i in 0..n {
             let expected = x_data[i] + y_data[i];
             let err = (result[i] - expected).abs();

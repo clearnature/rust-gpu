@@ -14,6 +14,8 @@
 //! ```
 
 pub mod ir;
+pub mod regs;
+pub mod lane_mapping;
 pub mod regalloc;
 pub mod asm_emitter;
 pub mod compile;
@@ -23,6 +25,7 @@ pub mod dsl;
 pub mod gemm_gen;
 pub mod block_dsl;
 pub mod opt_passes;
+pub mod gpu_probe;
 pub mod isa_probe;
 pub mod latency_model;
 pub mod cost_model;
@@ -30,6 +33,7 @@ pub mod tile_ir;
 pub mod tile_ssa;
 pub mod tile_ssa_lower;
 pub mod block_dsl_to_ssa;
+pub mod kernel_debugger;
 
 pub mod ssa_ir;
 pub mod ssa_regalloc;
@@ -41,6 +45,12 @@ pub mod insn_latency;
 
 
 pub mod auto_gemm;
+pub mod prefill_dispatch;
+pub mod prefill_spec_cache;
+
+#[cfg(feature = "monitor")]
+pub mod monitor;
+
 pub mod softmax_kernels;
 pub mod ce_loss_kernels;
 pub mod rope_kernels;
@@ -49,6 +59,9 @@ pub mod rmsnorm_kernels;
 pub mod embedding_kernels;
 pub mod adamw_kernels;
 pub mod elementwise_kernels;
+pub mod ffn_fused_kernels;
+pub mod quant_kernels;
+pub mod flash_attn;
 #[cfg(test)]
 mod gpu_tests;
 #[cfg(test)]
@@ -57,6 +70,8 @@ mod test_tile_gemm_suite;
 mod precision_vs_torch;
 #[cfg(test)]
 mod tile_boundary_tests;
+#[cfg(test)]
+mod test_e2e_pipeline;
 
 pub use ir::*;
 pub use compile::T0Kernel;
@@ -65,3 +80,5 @@ pub use gemm_gen::{GemmConfig, GemmTranspose, auto_select, compute_grid_auto, bu
     auto_select_backward_data, auto_select_backward_weight,
     build_kernargs_backward_data, build_kernargs_backward_weight,
     compute_grid_backward_data, compute_grid_backward_weight};
+pub use prefill_spec_cache::cached_auto_select;
+#[cfg(test)] mod check_v_add_co;

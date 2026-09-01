@@ -176,22 +176,40 @@ pub fn estimate_tile_cost(
     let tile_k = config.tile_k;
 
     // ── VGPR estimation ──
-    // Accumulators: n_wmma_tiles × m_wmma_per_wave × 8 VGPRs (f32 accumulator)
+    // Must match gemm_gen::estimated_vgprs() for accurate feasibility checks.
+    //
+    // gemm_gen generates GMEM→LDS cooperative loads using b128 (16-byte) loads.
+    // Each b128 load needs 4 VGPRs. The number of loads per thread =
+    //   (tile_m * tile_k * 2) / (wg_size * 16) for X
+    //   (tile_n * tile_k * 2) / (wg_size * 16) for WT
+    // where tile_n may be reduced by n_col_passes (multi-pass for tile_n > 64).
+
     let n_wmma = config.n_wmma_tiles();
     let m_wmma = config.m_wmma_per_wave();
-    let acc_vgprs = n_wmma * m_wmma * 8;
 
-    // Fragments: A fragment (8 VGPRs) + B fragments (n_wmma × 8 VGPRs)
+    // Accumulators: m_wmma × n_wmma × 8 VGPRs (f32 accumulator per WMMA tile)
+    let acc_vgprs = m_wmma * n_wmma * 8;
+
+    // WMMA fragments: A fragment (m_wmma × 8) + B fragments (n_wmma × 8)
     let frag_a_vgprs = m_wmma * 8;
     let frag_b_vgprs = n_wmma * 8;
 
-    // Address registers: ~6 (x_base, wt_base, k_byte_off, etc.)
-    let addr_vgprs = 6u32;
+    // GMEM load temporaries: each b128 load needs 4 VGPRs (addr(2) + data(4) reused)
+    // tile_n > 64 is split into n_col_passes × 64 in gemm_gen
+    let effective_tile_n = tile_n.min(64);
+    let wg_size = config.waves_per_wg * 32;
+    let x_bytes_per_thread = (tile_m * tile_k * 2) / wg_size;
+    let wt_bytes_per_thread = (effective_tile_n * tile_k * 2) / wg_size;
+    let x_loads_per_thread = x_bytes_per_thread / 16; // b128 loads
+    let wt_loads_per_thread = wt_bytes_per_thread / 16;
+    let gmem_x_vgprs = x_loads_per_thread * 4; // 4 VGPRs per b128 register
+    let gmem_wt_vgprs = wt_loads_per_thread * 4;
 
-    // Thread ID / lane decomposition: ~4
-    let misc_vgprs = 4u32;
+    // Address computation, LDS offsets, loop counters, store phase temps: ~49
+    // (matches gemm_gen's addr_temps constant, empirically calibrated)
+    let addr_temps = 49u32;
 
-    let vgprs = acc_vgprs + frag_a_vgprs + frag_b_vgprs + addr_vgprs + misc_vgprs;
+    let vgprs = acc_vgprs + frag_a_vgprs + frag_b_vgprs + gmem_x_vgprs + gmem_wt_vgprs + addr_temps;
 
     // ── SGPR estimation ──
     // Kernargs (5 pointers/dims × 2) + TGID (3) + loop counter + misc
@@ -556,6 +574,9 @@ impl TileConfig {
             transpose: super::tile_ir::TileTranspose::NT,
             acc_swap: false,
             epilogue: vec![],
+            waves_per_wg: None,
+            wmma_format: super::ir::WmmaFormat::BF16_F32,
+            persistent: false,
         }
     }
 
@@ -1046,6 +1067,9 @@ fn load_tile_ir_cache(path: &std::path::Path) -> Option<TileIrTuneResult> {
         transpose: super::tile_ir::TileTranspose::NT,
         acc_swap: false,
         epilogue: vec![],
+            waves_per_wg: None,
+        wmma_format: super::ir::WmmaFormat::BF16_F32,
+        persistent: false,
     };
 
     Some(TileIrTuneResult {
