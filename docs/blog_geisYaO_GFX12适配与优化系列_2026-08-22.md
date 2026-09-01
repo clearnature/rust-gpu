@@ -2,7 +2,8 @@
 
 > 来源: https://www.zhihu.com/people/geisyao/posts
 > 存档日期: 2026-08-22
-> 覆盖范围: GFX1200/RDNA4 裸金属适配的 4 篇系列文章 + 性能优化 + rocBLAS 基线 + AM 驱动
+> 覆盖范围: RDNA4 (GFX12) 裸金属适配的 4 篇系列文章 + 性能优化 + rocBLAS 基线 + AM 驱动
+> 硬件: geisYaO 使用 RX 9070 XT (gfx1201, Navi 48, 64CU) — 与本项目 RX 9060 XT (gfx1200, Navi 44, 32CU) 同属 RDNA4 但核心规模不同
 
 ---
 
@@ -109,7 +110,7 @@ AMDHSA ABI 规范: 所有架构通用，workgroup ID 固定在 s2/s3/s4。ttmp �
 
 ## 三、性能优化路线
 
-### GEMM 起点: 85.47 TF (RX 9070 XT, 4096³ NT BF16)
+### GEMM 起点: 85.47 TF (RX 9070 XT / gfx1201 / 64CU, 4096³ NT BF16)
 
 | Backend | TFLOPS | autotune? |
 |---------|--------|-----------|
@@ -152,7 +153,7 @@ AMDHSA ABI 规范: 所有架构通用，workgroup ID 固定在 s2/s3/s4。ttmp �
 
 ## 四、rocBLAS 性能基线
 
-**RX 9070 XT, ROCm 7.2.1, 纯 rocBLAS (ROCBLAS_USE_HIPBLASLT=0) + TuneableOp**:
+**RX 9070 XT (gfx1201, 64CU), ROCm 7.2.1, 纯 rocBLAS (ROCBLAS_USE_HIPBLASLT=0) + TuneableOp**:
 
 | 尺寸 | TFLOPS | ms/iter |
 |------|--------|---------|

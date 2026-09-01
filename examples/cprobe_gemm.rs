@@ -176,6 +176,8 @@ fn main() {
             eprintln!("[probe+] @probe 48..64: {:?}", &p2[48..64]);
             eprintln!("[probe+] @probe 64..80: {:?}", &p2[64..80]);
             eprintln!("[probe+] @probe 80..96: {:?}", &p2[80..96]);
+            // 地址区在字节 80-91 = 元素 20-22 (x_lds_reads_0[0], raw[0], v0)
+            eprintln!("[probe+] ADDR (elem 20-24, bytes 80-99): {:?}", &p2[20..24]);
         }
     }
     }

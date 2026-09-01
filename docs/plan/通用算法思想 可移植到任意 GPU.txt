@@ -1,0 +1,693 @@
+通用算法思想（可移植到任意 GPU）
+
+    1. 软件流水线 + 多阶段异步（核心价值）
+
+    DeepGEMM 的 mainloop 设计非常精炼：
+
+     1 for each k-tile:
+     2     TMA prefetch k+2 tile → SMEM staging buffer
+     3     wgmma compute current tile from SMEM
+     4     commit/wait barriers between stages
+
+    这个 TMA prefetch → compute → commit 的交错模式在任何 GPU 上都有对应物：
+     - AMD RDNA/CDNA: global_load_dwordx4 + s_waitcnt + v_mfma
+     - 旧 NVIDIA (SM80): cp.async + mma.sync
+
+    2. Swizzled SMEM 布局
+
+    DeepGEMM 对 SMEM 布局的 swizzle 模式非常讲究（16B/32B/64B/128B），目的是消除 bank conflict。这个思想完全通用：
+     - Swizzle 的本质是 (addr XOR offset) % num_banks 的均匀分布
+     - AMD 共享内存同样有 bank conflict 问题，同样的 swizzle 模式适用
+3. M 维分组 GEMM（MoE 专用）
+
+     1 # DeepGEMM 的 MoE 分组策略
+     2 m_grouped_fp8_gemm_nt_contiguous  # 推理 prefill：token 按 expert 拼接
+     3 m_grouped_fp8_gemm_nt_masked      # 推理 decode：CUDA graph 兼容的 masked 版本
+
+    这个 "只 group M 维，N/K 固定" 的设计是 MoE 场景的通用最优策略，不依赖任何硬件。
+
+    4. Block 调度器的 Swizzle 策略
+
+    scheduler/gemm.cuh 中的 get_swizzled_block_idx：
+
+     1 // 将 block_idx 映射到 (m_block_idx, n_block_idx)，使相邻 block 在 L2 cache 中重叠
+     2 const auto group_idx = block_idx / num_blocks_per_group;
+     3 auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
+     4 // ... swizzle for better L2 usages
+
+    这是 2D block tiling 的 L2 locality 优化，在任何 GPU 上都有效。CUTLASS 2.x/3.x 也有类似设计。
+5. Mega MoE 的计算-通信重叠调度
+
+    scheduler/mega_moe.cuh 的核心思路：
+
+     1 L1 warmup waves (all Linear1 tasks) →
+     2 交替调度 L1/L2 tasks，保证：
+     3   - L1 产出被 L2 消费前已完成
+     4   - NVLink dispatch/combine 与 tensor core 计算重叠
+
+    这个 producer-consumer 流水线 模式是纯算法层面的：
+     - 通信层可以是 NVLink、PCIe、InfiniBand
+     - 计算层可以是任何 MMA 指令
+     - Ring buffer + barrier 同步可以用任何 GPU 的 atomic/fence 实现
+
+    6. MQA Scoring Kernel 的算法设计
+
+     1 # 每个 token i 对所有 token j 计算 logit
+     2 out[i,j] = sum_heads(relu(q[i] @ kv[j]) * weights[i])
+
+    这个 weighted ReLU MQA 的分块计算策略（按 seq_len 分 tile，每 tile 内做 head 维 reduction）完全通用。
+
+    7. JIT 编译 + shape-specific 优化
+
+    DeepGEMM 的 JIT 系统将 BLOCK_M, BLOCK_N, BLOCK_K, kNumStages 等作为编译期常量，生成针对特定 shape 的 kernel。这个思路在任何平台上都适用——Triton 就是这么做的。
+
+    8. FP8 per-channel scaling 的通用处理
+
+    虽然 SM90 用 FP32 SF、SM100 用 UE8M0 SF，但 per-128-channel scaling 的算法本身是通用的——只需适配缩放因子的存储格式。
+    移植优先级建议
+
+
+    ┌────────┬────────────────────────────┬──────┬─────────────────────────────────────────┐
+    │ 优先级 │ 算法                       │ 难度 │ 价值                                    │
+    ├────────┼────────────────────────────┼──────┼─────────────────────────────────────────┤
+    │ P0     │ 软件流水线 + 多 stage 异步 │ 中   │ 这是性能的根基                          │
+    ├────────┼────────────────────────────┼──────┼─────────────────────────────────────────┤
+    │ P0     │ SMEM swizzle 布局          │ 低   │ 消除 bank conflict，几乎所有 GPU 都需要 │
+    ├────────┼────────────────────────────┼──────┼─────────────────────────────────────────┤
+    │ P1     │ Block 调度器 L2 locality   │ 低   │ 纯 CPU 端逻辑，直接搬                   │
+    ├────────┼────────────────────────────┼──────┼─────────────────────────────────────────┤
+    │ P1     │ MoE M-grouped 分组策略     │ 低   │ 纯算法，已有 PyTorch 接口               │
+    ├────────┼────────────────────────────┼──────┼─────────────────────────────────────────┤
+    │ P1     │ JIT shape-specialization   │ 中   │ 可复用 Triton 的 JIT 框架               │
+    ├────────┼────────────────────────────┼──────┼─────────────────────────────────────────┤
+    │ P2     │ Mega MoE 计算-通信重叠     │ 高   │ 需要对称内存 + 多进程，实现复杂         │
+    ├────────┼────────────────────────────┼──────┼─────────────────────────────────────────┤
+    │ P2     │ MQA Scoring                │ 中   │ 算法清晰，需适配底层 MMA                │
+    └────────┴────────────────────────────┴──────┴─────────────────────────────────────────┘
+
+    总结
+
+    DeepGEMM 的真正价值不在于用了什么 SM90/SM100 指令，而在于它展示了一个极简但高效的 GEMM kernel 应该长什么样：精确的 swizzle、清晰的 stage 流水线、L2-aware 的 block 调度、以及 MoE 场景下的分组与融合策略。这些算法思想移植到
+    AMD CDNA/RDNA 或旧 NVIDIA SM80 上，框架需要重写，但设计模式可以直接复用。
+以下是 t0-gpu docs/plan 与 DeepGEMM 算法的对应关系：
+
+    ---
+
+    对照表
+
+
+    ┌───────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
+    │ t0-gpu 文档                       │ 与 DeepGEMM 的关联                                                                                           │ 可借鉴/移植方向                                                     │
+    ├───────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+    │ 14-scheduler-architecture.md      │ DeepGEMM 的 scheduler/gemm.cuh 是 Level 3（模板调度）+ Level 2（指令调度）的融合体。5 层架构中 t0-gpu 在     │ DeepGEMM 的 swizzle block 调度 → t0-gpu 的 CostModel tile           │
+    │                                   │ Level 2 最强                                                                                                 │ 选择；Mega MoE 的 L1/L2 交替调度 → 图级调度                         │
+    ├───────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+    │ 05-ilp-scheduling-analysis.md     │ DeepGEMM 用 软件流水线（多 stage barrier 交错）而非 ILP list scheduling。两者互补：软件流水线处理            │ t0-gpu 的 Phase D: 软件流水 + Pingpong 已有基础，可直接对齐         │
+    │                                   │ macro-pipeline，ILP 处理 micro-scheduling                                                                    │ DeepGEMM 的 kNumStages ring buffer 模式                             │
+    ├───────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+    │ 10-memory-model-comparison.md     │ DeepGEMM 用 TMA 做 GMEM→SMEM 异步搬运；t0-gpu 用 KFD 的 VRAM/GTT mmap。SMEM 布局的 swizzle 模式是共通问题    │ KFD 对应 TMA 的是 cp.async / AMD global_load_dwordx4 + LDS；swizzle │
+    │                                   │                                                                                                              │  模式直接搬                                                         │
+    ├───────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+    │ 09-t0-compiler-pipeline.md        │ DeepGEMM 的 JIT 系统把 BLOCK_M/N/K 作为编译期常量实例化。t0-gpu 的 T0 编译器有 DSL→SSA IR→ISA 的完整流水线   │ t0-gpu 可以在 Level 3 模板层实现 DeepGEMM 风格的 shape-specialized  │
+    │                                   │                                                                                                              │ kernel 生成                                                         │
+    ├───────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+    │ 08-ignis-framework.md             │ ignis 已有 bf16_matmul.rs(424 行)、ocpa_attention.rs(589 行)、fused_rmsnorm_gemm.rs(154 行)。DeepGEMM 的 MQA │ MQA scoring 算法可直接移植到 ignis 的 attention 层；MoE grouped     │
+    │                                   │  scoring 和 HyperConnection prenorm GEMM 是同族算法                                                          │ GEMM 补 ignis 缺失的 MoE 支持                                       │
+    ├───────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+    │ 15-universal-runtime-framework.md │ 完整的多厂商运行时架构。DeepGEMM 的 Mega MoE 用对称内存做 NVLink 通信 → t0-gpu 的 KFD 已有 MAP_MEMORY_TO_GPU │ Mega MoE 的 ring buffer + barrier 同步模式可以在 KFD 对称内存上实现 │
+    │                                   │  多设备映射                                                                                                  │                                                                     │
+    ├───────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+    │ 03-universal-runtime-arch.md      │ AMD KFD 的 CREATE_QUEUE + AQL packet 对应 NVIDIA 的 GPFIFO + QMD。DeepGEMM 的 persistent kernel              │ t0-gpu 的 AQL queue 已支持 persistent kernel 的循环调度             │
+    │                                   │ 调度在两者上都需要 queue 管理                                                                                │                                                                     │
+    ├───────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+    │ 01-rocm-runtime-stack.md          │ DeepGEMM 依赖 CUTLASS 4.0 做 TMA 描述符和 MMA traits 的薄封装。t0-gpu 绕过了 HIP→ROCr→libhsakmt 三层，直接   │ 如果要在 AMD 上实现 DeepGEMM 级 GEMM，需要在 t0-gpu 的 KFD          │
+    │                                   │ KFD                                                                                                          │ 层之上建类似 CUTLASS 的 MMA trait 层                                │
+    └───────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
+
+
+    ---
+
+    最高价值的 3 个交叉点
+
+    1. `14-scheduler-architecture.md` × DeepGEMM 的 swizzle 调度器
+
+    t0-gpu 的 5 层调度架构在 Level 2（指令调度）有软件流水线，但 Level 3（模板调度）的 tile 选择靠 CostModel 穷举。DeepGEMM 的 get_swizzled_block_idx 展示了如何在 Level 3 用 L2 locality 感知的 swizzle 分配
+    block——这比纯穷举高效。
+
+    2. `05-ilp-scheduling-analysis.md` × DeepGEMM 的多 stage pipeline
+
+    DeepGEMM 的 mainloop 是 kNumStages=3~5 的 producer-consumer ring buffer，用 full_barrier/empty_barrier 控制流。t0-gpu 的 Phase D 已有 Pingpong 调度，但只做了 2 stage。DeepGEMM 的实现展示了如何扩展到 N stage 并处理 TMA 的
+    arrive_and_expect_tx 延迟计数。
+
+    3. `08-ignis-framework.md` × DeepGEMM 的 MoE/MQA kernel
+
+    ignis 有 BF16 GEMM、OCPA attention、SiLU 等单 kernel，但缺 MoE 支持。DeepGEMM 的 m_grouped_fp8_gemm_nt_contiguous（M-grouped 分组）和 fp8_mqa_logits（MQA scoring）是 ignis 下一步最需要补的 kernel 类型。算法可直接移植——底层
+    MMA 指令换成 AMD WMMA/MFMA 即可。
+以下是 DeepGEMM 的内存管理与 t0-gpu docs/plan 中虚拟内存/虚拟设备设计的完整对照：
+
+    ---
+
+    内存虚拟管理对比
+
+    DeepGEMM 的内存模型（NVIDIA 侧）
+
+    DeepGEMM 不自己管理内存分配——它假设 PyTorch 已分配好 tensor，只负责：
+
+
+    ┌───────────────────┬───────────────────────────────────────────────────────────────────────────────────────────┬───────────────────────────────┐
+    │ 层面              │ DeepGEMM 做的事                                                                           │ 依赖的底层                    │
+    ├───────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────┤
+    │ GMEM              │ 不分配，直接用传入的 gmem_a_ptr                                                           │ PyTorch/CUDA allocator        │
+    ├───────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────┤
+    │ SMEM              │ #pragma clang attribute push(__attribute__((external_shared)))                            │ 编译器静态分配                │
+    ├───────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────┤
+    │ TMA 描述符        │ CPU 端预编程 cute::TmaDescriptor，通过 __grid_constant__ 传入                             │ CUDA driver 的 tensor map API │
+    ├───────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────┤
+    │ Mega MoE 对称内存 │ deep_gemm.get_symm_buffer_for_mega_moe() → PyTorch 2.9 torch.distributed.symmetric_memory │ NVLink P2P + CUDA IPC         │
+    ├───────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────┤
+    │ JIT 缓存          │ $HOME/.deep_gemm/ 磁盘缓存                                                                │ 文件系统                      │
+    └───────────────────┴───────────────────────────────────────────────────────────────────────────────────────────┴───────────────────────────────┘
+
+    关键点：DeepGEMM 的 TMA 描述符是虚拟地址到物理 SMEM 的映射表，CPU 端编程一次，kernel 内通过 tensormap.replace.tile.global_address 动态更新地址——这是一种轻量级虚拟内存映射。
+
+    t0-gpu docs/plan 的虚拟内存设计
+
+
+    ┌───────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬─────────────────┐
+    │ 文档                              │ 虚拟内存相关内容                                                                                                                       │ 状态            │
+    ├───────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────┤
+    │ 10-memory-model-comparison.md     │ AMD KFD 三步映射（ALLOC → MAP_TO_GPU → mmap）vs NVIDIA 五步（RM alloc → UVM map → DMA map）                                            │ 已实现 KFD 部分 │
+    ├───────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────┤
+    │ 12-nvidia-driver-interface.md     │ NVIDIA FERMI_VASPACE_A（带 fault 模型的 VA 空间）、UVM_CREATE_EXTERNAL_RANGE、UVM_MAP_EXTERNAL_ALLOCATION                              │ 纯分析，未实现  │
+    ├───────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────┤
+    │ 15-universal-runtime-framework.md │ 三层分配器设计：BumpAllocator（线性）/ BuddyAllocator（可释放）/ PoolAllocator（2^n 桶缓存）+ UnifiedMemoryManager（跨设备自动选路径） │ 设计阶段        │
+ 三方虚拟设备/虚拟内存架构对比
+
+      1 ┌─────────────────────────────────────────────────────────────────────────┐
+      2 │                        应用层                                            │
+      3 │  DeepGEMM: PyTorch tensor (已有 VA)     t0-gpu: ignis Tensor + GpuBuffer│
+      4 └────────────────────┬───────────────────────────┬────────────────────────┘
+      5                      │                           │
+      6 ┌────────────────────▼───────────────────────────▼────────────────────────┐
+      7 │                  虚拟地址管理层                                          │
+      8 │                                                                         │
+      9 │  NVIDIA (DeepGEMM 依赖):                                               │
+     10 │  ┌──────────────────────────────────────────────────────────────────┐   │
+     11 │  │ FERMI_VASPACE_A  ← 用户态管理的 VA space                        │   │
+     12 │  │   ├── Bump allocator 分配 VA 区间                               │   │
+     13 │  │   ├── NV01_MEMORY_VIRTUAL ← GPU VA 分配                         │   │
+     14 │  │   ├── UVM_CREATE_EXTERNAL_RANGE ← 创建 VA 映射范围              │   │
+     15 │  │   └── UVM_MAP_EXTERNAL_ALLOCATION ← 将物理内存映射到 VA          │   │
+     16 │  │                                                                  │   │
+     17 │  │ TMA TensorMap ← DeepGEMM 的 "虚拟描述符"：                       │   │
+     18 │  │   预编程 (base_addr, dims, strides) → kernel 内 replace_address  │   │
+     19 │  └──────────────────────────────────────────────────────────────────┘   │
+     20 │                                                                         │
+     21 │  AMD KFD (t0-gpu 已实现):                                              │
+     22 │  ┌──────────────────────────────────────────────────────────────────┐   │
+     23 │  │ KFD 内部 VA 管理 (用户态不可见)                                  │   │
+     24 │  │   ├── ALLOC_MEMORY_OF_GPU(va_addr=0) → KFD 自动分配 VA          │   │
+     25 │  │   ├── MAP_MEMORY_TO_GPU → 建立 GPU 页表 (VA → 物理 VRAM)        │   │
+     26 │  │   └── mmap(kfd_fd, offset) → 建立 CPU 页表 (VA → 物理 VRAM)     │   │
+     27 │  │                                                                  │   │
+
+     28 │  │ 无 TMA 等价物：                                                  │   │
+     29 │  │   AMD 的 MUBUF/FLAT 指令直接用 64-bit VA，无描述符间接层         │   │
+     30 │  └──────────────────────────────────────────────────────────────────┘   │
+     31 └────────────────────┬───────────────────────────┬────────────────────────┘
+     32                      │                           │
+    33 ┌────────────────────▼───────────────────────────▼────────────────────────┐
+     34 │                  物理内存管理层                                          │
+     35 │                                                                         │
+     36 │  DeepGEMM 不管这层（PyTorch/CUDA runtime 管）                          │
+     37 │                                                                         │
+     38 │  t0-gpu docs/plan 设计:                                                │
+     39 │  ┌──────────────────────────────────────────────────────────────────┐   │
+     40 │  │ BumpAllocator  → 单次 dispatch，极快，不可释放                   │   │
+     41 │  │ BuddyAllocator → 通用场景，2^n 分桶，可释放，减少碎片            │   │
+     42 │  │ PoolAllocator  → ignis buffer_pool 的 2^n 桶缓存，命中率优化    │   │
+     43 │  └──────────────────────────────────────────────────────────────────┘   │
+     44 └─────────────────────────────────────────────────────────────────────────┘
+ DeepGEMM 对 t0-gpu 虚拟内存设计的参考价值
+
+    1. TMA 描述符 → AMD 上的等价抽象
+
+    DeepGEMM 的 TMA 描述符本质上是一个预编程的 DMA 元数据：
+
+     1 // DeepGEMM: CPU 端编程一次
+     2 cute::TmaDescriptor tensor_map_a = make_tma_descriptor(gmem_a, ...);
+     3 
+     4 // Kernel 内动态替换地址（K-grouped GEMM 的关键技巧）
+     5 tensormap.replace.tile.global_address.shared::cta.b1024.b64(tensor_map_a, new_addr);
+
+    在 AMD KFD 上，没有 TMA 等价物，但可以实现类似的 预编程 DMA 描述符：
+
+      1 // t0-gpu 可以设计的等价抽象
+      2 struct DmaDescriptor {
+      3     src_va: u64,           // GPU VA
+      4     dst_smem_offset: u16,  // LDS 偏移
+      5     size: u32,
+      6     stride: u32,
+      7     swizzle: SwizzleMode,  // bank conflict 消除
+      8 }
+      9 
+     10 impl DmaDescriptor {
+     11     fn replace_address(&mut self, new_va: u64) { self.src_va = new_va; }
+     12 }
+
+    这比每条 global_load_dwordx4 手动计算地址高效得多。
+
+    2. Mega MoE 对称内存 → KFD 多设备映射
+
+    DeepGEMM 的 Mega MoE 用 PyTorch 的 symmetric memory 做 NVLink P2P 通信：
+
+     1 buffer = deep_gemm.get_symm_buffer_for_mega_moe(group, num_experts, ...)
+     2 # buffer 内部: 每个 rank 的 VA 指向同一物理内存，通过 NVLink 可见
+ t0-gpu 的 KFD 已支持这个模式（10-memory-model-comparison.md）：
+
+     1 // KFD 的多设备映射 = DeepGEMM 对称内存的 AMD 等价物
+     2 ioctl(MAP_MEMORY_TO_GPU, MapMemoryArgs {
+     3     handle: alloc_handle,
+     4     device_ids_array_ptr: &gpu_ids,  // 多个 GPU ID
+     5     n_devices: num_gpus,
+     6     // 输出: 每个 GPU 的 gpu_vm_addr
+     7 });
+
+    差距：KFD 走 PCIe（32 GB/s），NVLink 走 900 GB/s。但算法模式完全相同。
+
+    3. JIT 缓存的虚拟文件系统
+
+    DeepGEMM 的 JIT 缓存（$HOME/.deep_gemm/）按 hash 缓存编译后的 kernel：
+
+     1 hash = sha256(source + compiler_flags + arch)
+     2 cache_dir/hash.cubin
+
+    t0-gpu 的 15-universal-runtime-framework.md 设计了类似的 compiler/code_object/，但没设计缓存层。可以参考 DeepGEMM 的 csrc/jit/cache.hpp 和 csrc/jit/include_parser.hpp（跟踪 header 依赖做 cache invalidation）。
+4. 虚拟设备抽象的差距
+
+
+    ┌──────────────┬────────────────────────────────────┬──────────────────────────────────┬──────────────────────────┐
+    │ 维度         │ DeepGEMM（NVIDIA 生态）            │ t0-gpu docs/plan                 │ 差距                     │
+    ├──────────────┼────────────────────────────────────┼──────────────────────────────────┼──────────────────────────┤
+    │ VA 空间管理  │ 用户态 VASpace + fault model       │ KFD 内核态自动管理（用户不可见） │ t0-gpu 更简单但灵活性低  │
+    ├──────────────┼────────────────────────────────────┼──────────────────────────────────┼──────────────────────────┤
+    │ 内存描述符   │ TMA TensorMap（硬件 DMA 引擎消费） │ 无等价物                         │ 需要在 LDS load 层设计   │
+    ├──────────────┼────────────────────────────────────┼──────────────────────────────────┼──────────────────────────┤
+    │ P2P 映射     │ NVLink + symmetric memory          │ KFD MAP_MEMORY_TO_GPU 多设备     │ 带宽差距大，算法模式相同 │
+    ├──────────────┼────────────────────────────────────┼──────────────────────────────────┼──────────────────────────┤
+    │ 统一地址空间 │ UVM（自动迁移）                    │ KFD SVM（有限支持）              │ docs 建议 Phase 2 再做   │
+    ├──────────────┼────────────────────────────────────┼──────────────────────────────────┼──────────────────────────┤
+    │ 多进程共享   │ CUDA IPC + symmetric memory        │ KFD AMDKFD_IOC_IMPORT/EXPORT     │ 未在 docs 中讨论         │
+    └──────────────┴────────────────────────────────────┴──────────────────────────────────┴──────────────────────────┘
+
+    5. 最值得借鉴的 3 点
+
+     1. 地址热替换模式：DeepGEMM 的 tensormap.replace.tile.global_address 让同一个 kernel 处理不同 GEMM 分片而无需重新编译。t0-gpu 可以在 AQL packet 的 kernarg 段设计类似的轻量级地址切换。
+
+     2. 对称内存 + barrier 跨设备同步：DeepGEMM 的 comm/barrier.cuh 用 atomic increment + phase-based wait 实现跨 rank 同步。t0-gpu 的 KFD 有 AMDGPU_GEM_OP_WAIT_IDLE_VALUE 可以做类似的事。
+
+     3. 三层分配器的优先级：docs 中 BumpAllocator / BuddyAllocator / PoolAllocator 的分层设计和 DeepGEMM 的实际使用模式一致——推理场景用 Bump（单次 dispatch），训练场景用 Pool（buffer 复用），通用场景用 Buddy。
+现在完整的数据流图清晰了。以下是 DeepGEMM 的 SMEM 数据交换机制，以及与 t0-gpu LDS 的逐层对比：
+
+    ---
+
+    DeepGEMM 的 SMEM 数据交换全景
+
+    数据流路径
+
+      1 ┌─────────────────────────────────────────────────────────────────────┐
+      2 │  GMEM (全局显存)                                                     │
+      3 │  gmem_a [M×K]  gmem_b [N×K]  gmem_sf_a [M]  gmem_sf_b [N]         │
+      4 └──────┬────────────┬──────────────┬──────────────┬────────────────────┘
+      5        │            │              │              │
+      6        │  TMA 异步搬运 (硬件 DMA 引擎)              │
+      7        │  cp.async.bulk.shared::cluster.global     │
+      8        ▼            ▼              ▼              ▼
+      9 ┌─────────────────────────────────────────────────────────────────────┐
+     10 │  SMEM (共享内存)  — 多 stage ring buffer                            │
+     11 │                                                                      │
+     12 │  ┌─────────┐ ┌─────────┐ ┌─────────┐                               │
+     13 │  │ Stage 0 │ │ Stage 1 │ │ Stage 2 │  ← kNumStages = 3~5          │
+     14 │  │ smem_a  │ │ smem_a  │ │ smem_a  │  BLOCK_M × BLOCK_K × FP8     │
+     15 │  │ smem_b  │ │ smem_b  │ │ smem_b  │  BLOCK_N × BLOCK_K × FP8     │
+     16 │  │ smem_sfa│ │ smem_sfa│ │ smem_sfa│  BLOCK_M × FP32              │
+     17 │  │ smem_sfb│ │ smem_sfb│ │ smem_sfb│  BLOCK_N × FP32              │
+     18 │  └────┬────┘ └────┬────┘ └────┬────┘                               │
+     19 │       │           │           │                                      │
+     20 │  full_barrier[i]  ← TMA 完成通知 (arrive_and_expect_tx)            │
+     21 │  empty_barrier[i] ← WGMMA 消费完毕通知                              │
+     22 └───────┬───────────┬───────────┬─────────────────────────────────────┘
+     23         │           │
+     24         │  WGMMA 直接从 SMEM 描述符读取（不经过寄存器！）
+     25         │  MMA_64xNx32_F32E4M3E4M3_SS_TN
+     26         │  desc_a = make_smem_desc(smem_a[stage] + ...)
+     27         │  desc_b = make_smem_desc(smem_b[stage] + ...)
+
+     28         ▼
+     29 ┌─────────────────────────────────────────────────────────────────────┐
+     30 │  WGMMA 寄存器累加器 (float accum[kNumAccum])                        │
+     31 │                                                                      │
+     32 │  // 每个 k-tile:                                                    │
+     33 │  1. ld_shared(smem_sfa) → scale_a_0, scale_a_1     ← 普通 SMEM 读  │
+     34 │  2. ld_shared(smem_sfb) → scales_b[0..N]           ← 普通 SMEM 读  │
+     35 │  3. warpgroup_arrive()                                                      │
+     36 │  4. wgmma(desc_a, desc_b, accum, k)                ← 硬件 MMA      │
+     37 │  5. warpgroup_commit_batch()                                            │
+     38 │  6. warpgroup_wait<0>()                                                 │
+     39 │  7. final_accum += scale_a * scale_b * accum       ← 寄存器 FMA    │
+     40 │  8. empty_barrier[stage].arrive()                   ← 通知 TMA     │
+     41 └───────┬─────────────────────────────────────────────────────────────┘
+     42         │
+     43         │  st_shared(smem_d, final_accum)  ← 写回 SMEM
+     44         │  NamedBarrier::sync(128)
+     45         ▼
+     46 ┌─────────────────────────────────────────────────────────────────────┐
+     47 │  SMEM D (输出缓冲)  BLOCK_M × BLOCK_N × FP32                       │
+     48 │       │                                                              │
+     49 │       │  TMA store (SMEM → GMEM)                                   │
+     50 │       │  SM90_TMA_REDUCE_ADD_2D::copy(tensor_map_cd, smem_d, ...)  │
+     51 │       ▼                                                              │
+     52 │  gmem_cd [M×N]  ← 最终结果                                         │
+     53 └─────────────────────────────────────────────────────────────────────┘
+
+    关键同步点
+
+      1 // 1. TMA warp: 发起搬运，通知字节数
+      2 full_barrier.arrive_and_expect_tx(
+      3     SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
+      4 
+      5 // 2. Math warps: 等 TMA 完成
+      6 full_barriers[stage_idx]->wait(phase);
+      7 
+      8 // 3. Math warps: 计算完毕，通知消费完
+      9 empty_barriers[stage_idx]->arrive();
+     10 
+     11 // 4. TMA warp: 等上一轮消费完再复用 stage
+     12 empty_barriers[stage_idx]->wait(phase ^ 1);
+
+    ---
+
+    与 t0-gpu LDS 的逐层对比
+
+
+    ┌──────────────────┬─────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────────────┐
+    │ 数据交换层       │ DeepGEMM (NVIDIA SM90)                          │ t0-gpu (AMD RDNA4)                                                               │ 差距/可移植性                        │
+    ├──────────────────┼─────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+    │ GMEM → LDS       │ TMA 硬件 DMA，CPU 端预编程描述符                │ global_load → VGPR → ds_write（两步）或 global_load_async_to_lds（GFX1250 直通） │ GFX1200 无直通，需 VGPR 中转         │
+    ├──────────────────┼─────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+    │ LDS 读取 → 计算  │ WGMMA 直接从 SMEM 描述符读（不经过寄存器）      │ ds_read_b128 → VGPR → v_wmma（必须经过寄存器）                                   │ RDNA4 的 WMMA 必须从 VGPR 读，多一跳 │
+    ├──────────────────┼─────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+    │ Wave 内数据交换  │ __shfl_sync（warp shuffle）                     │ ds_swizzle_b32（XOR 模式）或 v_permlanex16                                       │ 功能等价，t0-gpu 已实现两种          │
+    ├──────────────────┼─────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+    │ 跨 wave/barrier  │ mbarrier.arrive/try_wait（计数型）              │ s_barrier_signal/wait（GFX1200）                                                 │ 模型不同但可映射                     │
+    ├──────────────────┼─────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+    │ 跨 CTA 共享      │ mapa.shared::cluster + st.async.shared::cluster │ 无（AMD 无 cluster 概念）                                                        │ 需要显式 LDS + barrier               │
+    ├──────────────────┼─────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+    │ 输出 SMEM → GMEM │ TMA store（SM90_TMA_REDUCE_ADD_2D）             │ ds_read → VGPR → global_store                                                    │ 无 TMA 等价物                        │
+    └──────────────────┴─────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────────┘
+
+    t0-gpu 已有的 LDS 交换实现
+
+    1. ds_swizzle XOR 转置（最精华的部分）
+
+     1 // rdna3_asm.rs — butterfly_transpose_16x16()
+     2 // 4 级 butterfly：XOR(1) → XOR(2) → XOR(4) → XOR(24)
+     3 // 每级：ds_swizzle + v_cndmask 跨 VGPR 路由
+     4 // 结果：16×16 bf16 矩阵原地转置，零 barrier
+
+    这在 DeepGEMM 里不需要——WGMMA 直接处理转置布局（SS_TN 中 T 表示转置 B）。但对 RDNA4 WMMA 来说是必需的，因为 WMMA 要求特定的 A/B 布局。
+
+    2. ds_swizzle 数据交换 vs v_permlanex16
+
+     1 // 方案 A: ds_swizzle (使用 LDS crossbar)
+     2 self.ds_swizzle(dest, src, 0x401F);  // SWAP16
+     3 self.wait_lgkmcnt(0);                // 必须等！
+     4 
+     5 // 方案 B: v_permlanex16 (纯 VALU，不碰 LDS)
+     6 self.permlanex16(dest, src);          // dest[lane] = src[lane XOR 16]
+     7 // 无需 wait！下一个 cycle 即可用
+
+    t0-gpu 同时实现了两种，方案 B 更优（不占用 LDS crossbar，可与并发的 ds_read 重叠）。
+
+    3. lds_load_transposed_tile（从 LDS 读转置块）
+
+     1 // 从 XOR-swizzled LDS 读 16×16 转置矩阵
+     2 // 地址计算：row_base + (col_byte ^ ((row & 7) << 4))
+     3 // 当前实现有局限：无法动态计算 XOR 偏移，用了 ds_load_u16 的固定 offset
+
+    这个函数目前注释中标注了问题——col_byte ^ mask 不是编译时常量，需要运行时 XOR。当前的简化版假设无 swizzle。
+
+    ---
+
+    DeepGEMM 对 t0-gpu LDS 设计的启示
+
+    1. 多 stage ring buffer 模式（最高价值）
+
+    DeepGEMM 的核心不是单次 LDS 读写，而是 N stage 的 producer-consumer 流水线：
+
+     1 // SMEM 布局：stage 0, 1, 2 交替使用
+     2 // Stage i 的生命周期：
+     3 //   TMA warp: empty_wait → TMA load → full_arrive
+     4 //   Math warp: full_wait → compute → empty_arrive
+
+    t0-gpu 可以用 LDS 实现同样的模式：
+
+      1 // t0-gpu 多 stage LDS pipeline 设计
+      2 struct LdsStage {
+      3     a_buf: [u8; BLOCK_M * BLOCK_K],  // FP8 A tile
+      4     b_buf: [u8; BLOCK_N * BLOCK_K],  // FP8 B tile
+      5     full_barrier: u32,                // s_barrier ID
+      6     empty_barrier: u32,
+      7 }
+      8 
+      9 // Warp 0 (DMA warp): global_load → VGPR → ds_write → s_barrier_signal
+     10 // Warp 1..N (Math warp): s_barrier_wait → ds_read → v_wmma → s_barrier_signal
+
+    关键差异：AMD 没有 TMA 的 arrive_and_expect_tx（字节数通知），需要用 s_barrier_signal 的到达计数来模拟。
+
+    2. WGMMA 的 "零寄存器读取" 无法复制
+
+    DeepGEMM 最大的性能优势是 WGMMA 直接从 SMEM 读操作数——math warp 的寄存器只存累加器。AMD WMMA 必须：
+
+     1 ds_read_b128 → VGPR → v_wmma  (多一跳，占用 VGPR 带宽)
+
+    这意味着 AMD 的 LDS stage 可以比 NVIDIA 窄（不需要 SMEM 存完整 tile），但 VGPR 压力更大。t0-gpu 的 reg_transpose_c_to_ab 和 butterfly_transpose_16x16 正是在弥补这个差距——用 ds_swizzle 在寄存器内完成转置，避免额外的 LDS
+    读写。
+
+    3. 真正缺的是：LDS double-buffer prefetch
+
+    t0-gpu 当前的 GEMM kernel 是单 buffer 的——load 一块、计算一块、再 load 下一块。DeepGEMM 的多 stage 模式让 load 和计算完全重叠。在 RDNA4 上：
+
+      1 // 需要实现的模式：
+      2 loop {
+      3     // Stage (iter % 3): DMA warp 写入
+      4     global_load → VGPR → ds_write(lds_stage[next])
+      5     s_barrier_signal(full_barrier[next])
+      6     
+      7     // Stage ((iter-1) % 3): Math warp 读取
+      8     s_barrier_wait(full_barrier[prev])
+      9     ds_read(lds_stage[prev]) → VGPR
+     10     v_wmma
+     11     s_barrier_signal(empty_barrier[prev])
+     12     
+     13     // Stage ((iter-2) % 3): DMA warp 复用
+     14     s_barrier_wait(empty_barrier[prev_prev])
+     15 }
+
+    这正是 t0-gpu docs/plan/14-scheduler-architecture.md 中 Level 2 的 "软件流水" 部分，但目前只实现了 2 stage Pingpong。DeepGEMM 展示了 3~5 stage 如何处理——关键是 phase 位翻转避免 ABA 问题。
+    
+综合 DeepGEMM、t0-gpu 和业界实践，无硬件冒烟测试分 7 个层次：
+
+    ---
+
+    无 GPU 硬件的冒烟测试方法
+
+    L1：指令编码正确性（纯 CPU，零依赖）
+
+    t0-gpu 已有，最成熟的一层。
+
+      1 // rdna3_asm.rs 中 30+ 个 #[test]
+      2 #[test]
+      3 fn test_gfx1250_async_to_lds_b128() {
+      4     let [w0, w1, w2] = gfx11::global_load_async_to_lds_b128(2, 0, 0);
+      5     assert_eq!(w0, 0xEE18807C, "async_to_lds_b128 word0");
+      6 }
+      7 
+      8 #[test]
+      9 fn test_ds_swizzle_xor_pattern() {
+     10     assert_eq!(gfx11::xor_pattern(1),  0x0401);
+     11     assert_eq!(gfx11::xor_pattern(16), 0x041F);
+     12 }
+
+    方法：每条指令的编码与 llvm-mc --show-encoding 输出逐 bit 对比。
+    覆盖：SMEM load/store、FLAT load/store、Atomics、Barrier、ds_swizzle、WMMA。
+    成本：零，cargo test 即可。
+
+    L2：ELF/Code Object 结构验证（纯 CPU）
+
+    t0-gpu 的 nvidia_smoke_tests.rs 展示了完整模式：
+
+     1 #[test]
+     2 fn test_cubin_elf_structure() {
+     3     let content = std::fs::read("probe_kernels.cubin").unwrap();
+     4     // ELF magic
+     5     assert_eq!(content[0], 0x7f);
+     6     assert_eq!(content[1], b'E');
+     7     // section headers, symbol table...
+     8 }
+
+    t0-gpu 对 AMD 的等价测试：验证生成的 HSA ELF code object 的 .text section 大小、kernarg layout、workgroup_size 等元数据是否合法。
+
+    方法：生成 ELF → 解析 header → 检查 section/symbol/layout。
+    覆盖：code object 生成器的结构正确性。
+
+    L3：算法数值正确性（CPU 参考实现 vs GPU 输出）
+
+    DeepGEMM 的核心测试方法——`calc_diff` + PyTorch CPU 参考：
+
+      1 # deep_gemm/testing/numeric.py
+      2 def calc_diff(x, y):
+      3     x, y = x.double(), y.double()  # 提升到 FP64 精度
+      4     denominator = (x * x + y * y).sum()
+      5     sim = 2 * (x * y).sum() / denominator
+      6     return 1 - sim  # 0 = 完全一致
+      7 
+      8 # test_bf16.py
+      9 a, b, c, d, ref_d = generate_normal(m, n, k, ...)
+     10 deep_gemm.bf16_gemm_nt(a, b, d, c=c)          # GPU kernel
+     11 diff = calc_diff(d, ref_d)                      # vs PyTorch CPU reference
+     12 assert diff < 1e-5
+
+    无 GPU 时的替代方案：
+
+     1 # 用 CPU 模拟 kernel 的计算逻辑
+     2 def reference_fp8_gemm(a_fp8, b_fp8, sfa, sfb):
+     3     a_f32 = a_fp8.float() * sfa.unsqueeze(1)  # 反量化
+     4     b_f32 = b_fp8.float() * sfb.unsqueeze(1)
+     5     return a_f32 @ b_f32.T
+     6 
+     7 # 验证：给定固定的输入，检查参考输出是否符合预期
+     8 assert torch.allclose(reference_fp8_gemm(a, b, sfa, sfb), expected, atol=1e-3)
+
+    t0-gpu 的 ignis 测试已有此模式：
+
+     1 // ignis/tests.rs — test_numerical_gradient_check()
+     2 fn test_numerical_gradient_check() {
+     3     // 数值梯度 vs 解析梯度对比
+     4     let eps = 1e-4;
+     5     // f(x+eps) - f(x-eps) / 2*eps ≈ backward_grad
+     6 }
+
+    L4：编译流水线冒烟（CPU 端 JIT 验证）
+
+    DeepGEMM 的 JIT 系统可以无 GPU 测试到编译阶段：
+
+     1 # 验证 JIT 编译器能正确生成 kernel 源码（不实际编译）
+     2 # 检查：模板参数展开、SMEM 布局计算、swizzle 模式选择
+     3 
+     4 # t0-gpu 的 T0 编译器同理：
+     5 // DSL → SSA IR → Opt Passes → ISA 指令序列
+     6 // 每一步都可以在 CPU 上验证
+
+    可测试的内容：
+     - 模板参数组合是否合法（BLOCK_M % 64 == 0 等约束）
+     - SMEM 大小计算是否超出硬件限制
+     - swizzle 模式与 BLOCK_K 的一致性
+     - barrier 初始化参数正确性
+
+    L5：调度器逻辑验证（纯 CPU 模拟）
+
+    DeepGEMM 的 `scheduler/gemm.cuh` 可以提取为纯 CPU 测试：
+
+      1 // 模拟 Scheduler 的 block 分配逻辑
+      2 fn simulate_scheduler(m: u32, n: u32, k: u32, num_sms: u32) -> Vec<(u32, u32)> {
+      3     let mut blocks = Vec::new();
+      4     let mut sched = Scheduler::new(m, n, k);
+      5     while let Some((m_idx, n_idx)) = sched.get_next_block() {
+      6         blocks.push((m_idx, n_idx));
+      7     }
+      8     blocks
+      9 }
+     10 
+     11 // 验证：所有 tile 都被分配、无重复、L2 locality 合理
+     12 let blocks = simulate_scheduler(4096, 4096, 512, 132);
+     13 assert_eq!(blocks.len(), (4096/128) * (4096/128));
+     14 assert!(no_duplicates(&blocks));
+
+    t0-gpu 的 `cost_model.rs`（1368 行）同理——穷举 400+ 候选 tile 配置的 Roofline 分析完全在 CPU 上运行。
+
+    L6：汇编产物静态分析（CPU 端反汇编验证）
+
+     1 # 生成 kernel ELF → objdump 反汇编 → 检查关键指令序列
+     2 
+     3 # AMD:
+     4 llvm-objdump -d --mcpu=gfx1200 kernel.o | grep -c "ds_read"
+     5 llvm-objdump -d --mcpu=gfx1200 kernel.o | grep -c "s_barrier"
+     6 
+     7 # NVIDIA:
+     8 cuobjdump -sass kernel.cubin | grep -c "LDGSTS"  # TMA load
+     9 cuobjdump -sass kernel.cubin | grep -c "HMMA"    # Tensor Core MMA
+
+    可验证：
+     - 指令选择正确性（用了 WMMA 而非标量 FMA）
+     - 寄存器分配合理性（VGPR/SGPR 使用量）
+     - LDS 分配大小是否匹配预期
+     - barrier 数量是否与 pipeline stage 匹配
+
+    L7：ISA 模拟器执行（最重，但最接近真实）
+
+
+    ┌────────────────────────────────────────┬───────────────┬──────────┬───────────┐
+    │ 工具                                   │ 覆盖          │ 精度     │ 速度      │
+    ├────────────────────────────────────────┼───────────────┼──────────┼───────────┤
+    │ AMD GPU ISA Simulator (Mesa/aubinator) │ RDNA 指令子集 │ 寄存器级 │ ~1000x 慢 │
+    ├────────────────────────────────────────┼───────────────┼──────────┼───────────┤
+    │ NVIDIA SASS Simulator (无公开工具)     │ —             │ —        │ —         │
+    ├────────────────────────────────────────┼───────────────┼──────────┼───────────┤
+    │ Triton CPU interpreter                 │ Triton IR     │ 语义级   │ ~10x 慢   │
+    ├────────────────────────────────────────┼───────────────┼──────────┼───────────┤
+    │ tinygrad Python emulator               │ UOp           │ 语义级   │ ~100x 慢  │
+    └────────────────────────────────────────┴───────────────┴──────────┴───────────┘
+
+    t0-gpu 可以自建一个轻量级 wave 模拟器：
+
+      1 struct WaveSimulator {
+      2     vgprs: [[f32; 256]; 32],  // 32 lanes × 256 VGPRs
+      3     sgprs: [f32; 108],
+      4     lds: Vec<u8>,              // 64KB LDS
+      5     pc: u32,
+      6 }
+      7 
+      8 impl WaveSimulator {
+      9     fn exec_ds_read_b128(&mut self, vdst: u8, vaddr: u8, offset: u16) {
+     10         let addr = self.read_vgpr(vaddr) + offset as u32;
+     11         for i in 0..4 {
+     12             self.vgprs[0][(vdst + i) as usize] = 
+     13                 f32::from_le_bytes(self.lds[(addr + i*4) as usize..].try_into().unwrap());
+     14         }
+     15     }
+     16     
+     17     fn exec_v_wmma(&mut self, ...) {
+     18         // 模拟 WMMA 矩阵乘法
+     19     }
+     20 }
+
+    ---
+
+    推荐分层策略
+
+      1 ┌─────────────────────────────────────────────────────────┐
+      2 │  L1 指令编码     cargo test              100% 无硬件   │  ← t0-gpu 已有
+      3 │  L2 ELF 结构     cargo test              100% 无硬件   │  ← t0-gpu 已有
+      4 │  L3 数值正确     CPU reference impl      100% 无硬件   │  ← ignis 部分有
+      5 │  L4 编译流水线   JIT template 验证       100% 无硬件   │  ← 可加
+      6 │  L5 调度器逻辑   模拟 block 分配          100% 无硬件   │  ← cost_model 已有
+      7 │  L6 静态分析     objdump + 指令计数       100% 无硬件   │  ← 可加
+      8 │  L7 ISA 模拟器   wave 级模拟              100% 无硬件   │  ← 值得建
+      9 ├─────────────────────────────────────────────────────────┤
+     10 │  L8 真硬件 E2E   cargo test --features rocm  需要 GPU  │  ← 现有 e2e_tests
+     11 └─────────────────────────────────────────────────────────┘
+
+    L1-L5 现在就能跑，覆盖了 DeepGEMM 移植所需的大部分验证。L7（ISA 模拟器）投入最大但回报最高——可以在没有 RX 9060 XT 的情况下验证 WMMA 指令序列的数值行为。
+
+

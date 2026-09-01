@@ -219,3 +219,11 @@ wgp_mode=false 无帮助；frag_b_shared（pong）省 4 VGPR 但 ping-pong 结�
 
 **结论**：128×128 编译的最近路径是"省 1 个普通 VGPR"（4-wave，正确性已验证）或"修 8-wave hang"
 （wavepart 适配）。均已回退实验配置，字段/等价改动保留。下一步：VReg 分配统计精确定位可省的 1 个。
+
+### 5.13 省 1 VGPR 峰值定位（2026-08-31 第三轮）
+
+T0_DUMP_ALLOC 峰值统计：4-wave + acc_swap 配置下普通池 high-water 255，
+溢出的是 **VReg(304) count=1**（phys=255，last_use=1306）——3 个 count=1 临时
+（VReg(300/303/304)）同区使用，位于 acc 交换/DS 存储区（IR op[1300-1314] 为
+DsStoreB128/VMov 交换序列）。精确追踪该临时在 tile_ir 的 alloc 调用点成本高
+（helper 复用、虚拟号跨函数），暂缓——8-wave 路径（编译已通过）优先。
