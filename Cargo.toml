@@ -5,7 +5,7 @@ edition = "2021"
 description = "T0 — RDNA3 裸金属 GPU 内核编译器 & KFD 运行时"
 authors = ["GeisYaO <q1179671016@gmail.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/GeisYaO/t0-gpu"
+repository = "https://github.com/clearnature/rust-gpu"
 
 [workspace]  # Keep as standalone crate
 
