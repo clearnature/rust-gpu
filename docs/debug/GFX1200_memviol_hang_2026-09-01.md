@@ -64,6 +64,13 @@ amdgpu: sq_intr: error, detail 0x00180000, type 2, sh 0, priv 1, wave_id 5-14, s
 - `c3dab78` with_rt poisoned 重建 + kernarg 对齐 + lock poison 容忍
 - `60facb1` tile_auto_select 测试期望对齐
 
+## 六点五、测试集拆分（2026-09-01）
+
+`a4bcfe5`：gpu_tests 拆分为通过集/失败集。
+- **通过集**（默认全集 28 个，3.43s 全过）：GEMM 验证/编译/e2e/persistent/minimal/barrier/静态
+- **失败集**（#[ignore]——手动 `--ignored`）：7 个 benchmark（性能测量——async 批/CPU verify 慢——全集必卡）+ `test_tile_ir_correctness_sweep`（**64x64 k64 kernel 数值 bug：max_err=inf**——256³/512³/1024³——sweep 暴露，k32 不受影响）+ `test_persistent_loop_claims_all_tiles`（persistent 输出全零）
+- `tile_auto_select` 绕开 64x64 k64（改用 k32——k64 修复后恢复）
+
 ## 七、待解（vs-3 剩余）
 
 **MEMVIOL 精确违规指令未定位**——静态层全部合理，运行时状态敏感。候选方向：
