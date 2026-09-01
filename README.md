@@ -1,23 +1,23 @@
 # T0-GPU
 
-**RDNA3 裸金属 GPU 内核编译器 & KFD 运行时**
-**Bare-Metal GPU Kernel Compiler & KFD Runtime for RDNA3**
+**RDNA3/RDNA4 裸金属 GPU 内核编译器 & KFD 运行时**
+**Bare-Metal GPU Kernel Compiler & KFD Runtime for RDNA3/RDNA4**
 
 ---
 
 ## 概述 / Overview
 
-T0-GPU 是一个纯 Rust 实现的 GPU 编程框架，直接面向 AMD RDNA3 (GFX1100) 硬件。它完全绕过 HIP/ROCm 用户态库，通过 Linux KFD 驱动接口与 GPU 直接通信。**~50,000 行 Rust 代码，零外部依赖。**
+T0-GPU 是一个纯 Rust 实现的 GPU 编程框架，直接面向 AMD RDNA3/RDNA4（GFX1100 / GFX1200）硬件。它完全绕过 HIP/ROCm 用户态库，通过 Linux KFD 驱动接口与 GPU 直接通信。**~75,000 行 Rust 代码，零外部依赖。**
 
-T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3 (GFX1100) hardware. It bypasses HIP/ROCm userspace libraries entirely, communicating directly with the GPU through the Linux KFD driver interface. **~50,000 lines of Rust, zero external dependencies.**
+T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3/RDNA4 (GFX1100 / GFX1200) hardware. It bypasses HIP/ROCm userspace libraries entirely, communicating directly with the GPU through the Linux KFD driver interface. **~75,000 lines of Rust, zero external dependencies.**
 
 ### 核心组件 / Core Components
 
 | 组件 / Component | 说明 / Description |
 |---|---|
-| **T0 编译器 / Compiler** | DSL → SSA IR → 6-pass 优化 → 寄存器分配 → GFX1100 ISA → AMD HSA ELF |
+| **T0 编译器 / Compiler** | DSL → SSA IR → 6-pass 优化 → 寄存器分配 → GFX1100/GFX1200 ISA → AMD HSA ELF |
 | **GEMM 生成器 / GEMM Generator** | 参数化 bf16 WMMA GEMM：cooperative load + LDS double-buffer + K-loop 流水线 |
-| **ISA 编码器 / ISA Encoder** | GFX1100 全指令集机器码编码（VOP1/VOP2/VOP3/SMEM/FLAT/WMMA/DS/MUBUF） |
+| **ISA 编码器 / ISA Encoder** | GFX1100/GFX1200 指令集机器码编码（VOP1/VOP2/VOP3/SMEM/FLAT/WMMA/DS/MUBUF） |
 | **Code Object 生成器** | 手工构建 AMD HSA ELF 二进制（不依赖 LLVM linker） |
 | **KFD 运行时 / Runtime** | 裸金属 GPU 调度：AQL 队列、VRAM 管理、doorbell dispatch (~2μs) |
 
@@ -51,7 +51,7 @@ T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3 (GFX1100) ha
 
 ### 环境要求 / Requirements
 
-- **GPU**: AMD RDNA3 (RX 7900 XTX / 7900 XT / 7800 XT 等)
+- **GPU**: AMD RDNA3/RDNA4（RX 7900 XTX / RX 9060 XT 等——KFD 直驱，gfx1100/gfx1200）
 - **OS**: Linux, 内核 5.15+（Ubuntu 22.04+ 推荐）/ Linux kernel 5.15+
 - **驱动 / Driver**: amdgpu KFD（内核模块自带，无需额外安装）/ Built-in kernel module
 - **工具链 / Toolchain**: Rust 1.70+, LLVM 17+ (`llvm-mc`, `ld.lld`)
@@ -110,7 +110,7 @@ kb.if_lt(gid, n, |kb| {
     kb.store_f32(x, gid, c);
 });
 
-let compiled = kb.compile(Target::GFX1100)?;
+let compiled = kb.compile(Target::detect())?;  // 自动检测 gfx1100/gfx1200
 // → AMD HSA ELF binary, ready for KFD dispatch
 ```
 
@@ -198,7 +198,9 @@ For bf16 WMMA matrix multiplication.
 
 ### T0 vs rocBLAS vs Triton 对比 / Head-to-Head Comparison (2026-03-31)
 
-BF16 GEMM，RX 7900 XTX，同机同条件测量。rocBLAS baseline: PyTorch 2.9.1+rocm6.4 `torch.mm()`; Triton 3.6.0 with `@triton.autotune`。
+BF16 GEMM，**RX 7900 XTX（GFX1100）**，同机同条件测量（历史基准 2026-03-31）。
+> 当前开发硬件：**RX 9060 XT（GFX1200/RDNA4）**——基准见 `test_benchmark_rx9060`（256³ 154.8μs / 4096³ 555.7ms，2026-09-01）。
+> rocBLAS baseline: PyTorch 2.9.1+rocm6.4 `torch.mm()`; Triton 3.6.0 with `@triton.autotune`。
 
 BF16 GEMM on RX 7900 XTX, same machine, same session:
 
@@ -255,7 +257,7 @@ BF16 GEMM on RX 7900 XTX, same machine, same session:
 ## 项目结构 / Project Structure
 
 ```
-t0-gpu/  (~50,000 LOC)
+t0-gpu/  (~75,000 LOC)
 ├── Cargo.toml
 ├── README.md
 ├── docs/
@@ -272,9 +274,10 @@ t0-gpu/  (~50,000 LOC)
     ├── prelude.rs
     ├── rdna3_asm.rs              # ISA 编码器 (3,100 LOC)
     ├── rdna3_code_object.rs      # ELF 生成器 (1,400 LOC)
-    ├── kfd/
-    │   └── mod.rs                # KFD 裸金属运行时 (3,000 LOC)
-    └── t0/                       # T0 编译器 (34 文件, ~38K LOC)
+    ├── kfd/                      # KFD 裸金属运行时（aql/ioctl/buffer/device/kernel/pm4/pool）
+    ├── t0/                       # T0 编译器（block_dsl/ssa/tile_ir/asm_emitter 等）
+    ├── ignis/                    # 高级算子库（ops/tensor/nn）
+    └── universal/                # 通用框架（MultiGpu/UnifiedMem/DeviceManager/compiler）
         ├── block_dsl.rs          #   BlockDSL 前端 (2,000 LOC)
         ├── block_dsl_to_ssa.rs   #   DSL → SSA 翻译 (1,800 LOC)
         ├── ssa_ir.rs             #   SSA 中间表示 (3,400 LOC)
@@ -423,9 +426,9 @@ T0_DUMP_ASM=1 cargo test --release --features rocm \
 | ✅ | **buffer_load 优化** | SRD 寻址替代 global_load，减少 VGPR 压力 |
 | ✅ | **LDS Bank Conflict 优化** | stride padding + swizzle 消除 bank conflict |
 | 🟡 | **Graph 级算子融合** / Op Fusion | GEMM+Bias+RMSNorm 融合内核 |
-| 🟡 | **Async GPU Dispatch** | `GpuFuture` + `submit_async()` |
-| 🟢 | **多 GPU / Multi-GPU** | 多队列调度、PCIe P2P 传输 |
-| 🟢 | **RDNA4 支持** / GFX12 | GFX12 ISA 适配 |
+| 🟡 | **Async GPU Dispatch** | `dispatch_async` + `wait_idle` 已有；`GpuFuture`/`submit_async()` 待做 |
+| 🟡 | **多 GPU / Multi-GPU** | `MultiGpuManager`（发现/管理/CPU 中转传输）已有；P2P 直传、多队列调度待做 |
+| 🟢 | **RDNA4 支持** / GFX12 | GFX12 ISA 适配（TTMP/waitcnt/TargetCaps 完成；64x64 k64 数值 bug 已隔离待修） |
 
 ---
 
