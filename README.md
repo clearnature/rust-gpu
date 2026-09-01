@@ -459,16 +459,3 @@ at your option.
 | 峰值算力 / Peak Compute | 165 TFLOPS (bf16 WMMA, 2.5 GHz boost) |
 
 ---
-
-## 支持与赞助 / Support & Sponsor
-
-T0-GPU 是我在失业期间独立开发的个人开源项目。如果你觉得这个项目不仅硬核，而且对你的研究或工作有启发，欢迎支持。
-
-T0-GPU is an independent open-source project developed entirely during my unemployment. If you find this bare-metal approach inspiring, consider supporting its ongoing development.
-
-**🪙 Crypto:**
-- **ETH / ERC20**: `0x5C28A5e66302800ba4Cc8950055715f7119562C4`
-- **BTC**: `bc1q0844xxw9s3r4usu96l8rs6j82er0sce7p7yg8t`
-
-**☕️ 微信 / 支付宝 (For supporters in mainland China):**
-如果你在国内，请查看 [**DONATE.md**](./DONATE.md) 获取赞助二维码。
