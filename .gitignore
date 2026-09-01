@@ -5,3 +5,13 @@ Cargo.lock
 *.swp
 *~
 .DS_Store
+# 工具/插件本地目录（不共享）
+.qwen/
+.reasonix/
+.archive/
+# dsh-memoir 插件维护的项目记忆（个人插件本地维护）
+PROJECT_MEMORY.md
+# 会话复查报告（一次性分析，非项目交付物）
+doublecheck-*.md
+# 误创建的编译产物
+1
