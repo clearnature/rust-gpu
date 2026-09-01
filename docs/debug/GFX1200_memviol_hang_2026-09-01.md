@@ -78,3 +78,34 @@ amdgpu: sq_intr: error, detail 0x00180000, type 2, sh 0, priv 1, wave_id 5-14, s
 1. **kernel 地址计算的 GPU 侧哨兵**（地址计算处插入范围检查 + trap）——不依赖复现（静态注入）
 2. **对照 therock/LLVM 生成的 64x64 k64 kernel** 的 prologue/TGID/地址计算（ABI 遗漏排查）
 3. **tile_auto_select 禁用 split_k>1**（sk>1 数值错误 + 偶发卡——正确性优先的防御性选择，需性能权衡）
+
+## 八、flash_attn 精度检查清单（参考 ROCm 方案 2026-09-01）
+
+来源：外部方案《gfx1200 flash_attn 绑定层传参与精度问题排查及修复方案》
+（ROCm 10.0 + gfx1200——PyTorch C++ 扩展层）。技术栈不同（ROCm CK vs
+我们的 KFD 直驱），但**精度方法论可借鉴**——供 `src/t0/flash_attn.rs`
+（自己的 online softmax/causal 实现，未 GPU 验证）后续验证时对照。
+
+### 检查清单（GPU 验证 flash_attn 时逐项对照）
+
+1. **WMMA 累加器强制 FP32**：`v_wmma_f32_16x16x16_bf16`（acc 恒 f32——
+   我们已遵循）——缩放因子（scale_softmax）、softmax LSE、点积中间结果
+   全部 FP32，仅写 Global Memory 时降精度。
+2. **Softmax LSE 精度提升**：LSE 不存 FP16/BF16 中间态——显式 FP32——
+   防长序列注意力概率归一化溢出与梯度下溢。
+3. **workspace/缓冲异步清零**：复用缓冲 hand-out 前 zero（我们已做：
+   `buf.zero()`——kernarg slot 与 buffer 池）——防脏数据被 WMMA 读为
+   Subnormal 参与累加 → 随机 NaN/Inf。
+4. **内存对齐**：buffer 4KB/8KB 对齐（我们已做）——256-bit 矢量化的
+   物理首地址/Stride 对齐校验（防局部截断与访存异常）。
+5. **反向梯度精度**（bwd 时）：中间标量 D（dO∘O 的 Head 维累加）强制
+   FP32——防 dS=P∘(dP−D) 下溢漂移。
+6. **测试门槛**（GPU 验证标准）：|ε|≤1e-3 且 |η|≤1e-3、无 NaN/Inf、
+   梯度余弦相似度 ≥0.9999（FP32 参考对比）。
+
+### 与本项目的关系
+
+- 方案的"FP32 累加/清零/对齐/异步"**我们已实践**（方向一致——排除
+  "累加器精度"作为 k64 数值 bug 的嫌疑——k64 是全错垃圾，非精度漂移）。
+- flash_attn.rs 的 GPU 验证（待做）时，用本清单对照其 softmax/LSE/累加
+  的精度路径。
