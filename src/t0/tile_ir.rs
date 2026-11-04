@@ -1766,6 +1766,59 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     if std::env::var("T0_FULL_VMCNT_WAIT").is_ok() {
         k.wait_vmcnt(0);
     }
+    // 2026-11-08 T0_LDS_DUMP（acc_swap 列块 0 嫌疑判据）：每 lane 读自己负责的
+    // LDS X 区 64B（4×b128），global_store 到 Y+32768。32 lane × 64B = 2KB =
+    // 全 X tile。对拍 X 输入：列块 0（每 16B 偶数块）垃圾 → coop store bug；
+    // 全对 → read 侧 lanes 0-15 列块 0 地址错（lane_mapping 公式）。
+    if std::env::var("T0_LDS_DUMP").is_ok() {
+        let lane_id_v = k.alloc_vreg();
+        k.v_and_b32_imm(lane_id_v, VReg(0), 31);
+        let lane64 = k.alloc_vreg();
+        k.v_lshlrev_b32(lane64, 6, lane_id_v); // lane * 64
+        let tmp4 = k.alloc_vreg_array(4, Alignment::Align4);
+        // 4 条 ds_load：vaddr 必须用 **store 侧 swizzle 公式**（lane_mapping::store_lds_addr
+        // = (row*stride + chunk*16) ^ ((row&7)<<4)）——线性地址读 swizzle 写的数据会"错"
+        //（2026-11-08 判据设计错误教训：置换后逐字节对拍必然 mismatch，非真实坏）
+        // lane l 负责行 [l*2, l*2+1]（64 行/32 lane=2 行每 lane），chunk j%2
+        // lane l: 行 = l*2 + (j/2)，chunk = j%2，stride=32（64x64_k16 X tile）
+        for j in 0..4u32 {
+            let row_step = (j / 2) as i32 * 2; // 0 或 2（lane 内第二行）
+            let chunk = ((j % 2) * 16) as i32;
+            let va = k.alloc_vreg();
+            // row_abs = lane*2 + row_step；raw = row_abs*32 + chunk；swz = ((row_abs)&7)<<4
+            let lane2 = k.alloc_vreg();
+            k.v_lshlrev_b32(lane2, 1, lane_id_v); // lane*2
+            let row_abs = k.alloc_vreg();
+            k.v_mov_imm(row_abs, row_step);
+            k.v_add_u32(row_abs, row_abs, lane2);
+            let row7 = k.alloc_vreg();
+            k.v_and_b32_imm(row7, row_abs, 7);
+            let swz = k.alloc_vreg();
+            k.v_lshlrev_b32(swz, 4, row7);
+            let raw = k.alloc_vreg();
+            k.v_mov_imm(raw, row_step * 32 + chunk);
+            k.v_add_u32(raw, raw, lane64);
+            k.v_xor_b32(va, Operand::VReg(raw), Operand::VReg(swz));
+            k.ds_load_b128(VReg(tmp4.0 + j), va, 0);
+        }
+        k.wait_lgkmcnt(0);
+        // 4 条 global_store：gaddr = Y + 32768 + lane*64 + j*16
+        for j in 0..4u32 {
+            let (ga, gah) = k.alloc_addr_pair();
+            // 地址序列：ga = y_ptr + (32768 + lane*64 + j*16)
+            // （2026-11-08 修 probe 自身 bug：v_mov_imm 曾覆盖 y_ptr 低 32 位 →
+            //  store 写到错误地址 → CPU 读回"未写"区域 → 判据全失真）
+            k.v_mov_from_sgpr(ga, SReg(y_ptr.0));
+            k.v_mov_from_sgpr(gah, SReg(y_ptr.0 + 1));
+            let off = k.alloc_vreg();
+            k.v_mov_imm(off, (32768 + j * 16) as i32);
+            k.v_add_u32(off, off, lane64); // lane64 = lane*64（VGPR）
+            k.v_add_u32(ga, ga, off);
+            k.v_add_co_ci(gah, gah);
+            k.global_store(ga, VReg(tmp4.0 + j), Width::B128, 0);
+        }
+        k.wait_vscnt(0);
+    }
     // 2026-11-08 附录修复（线C 勘探定位）：prologue 回填 buf0 后是**裸边界**——
     // 之前无 barrier/global_inv 直进 k_loop 首个 Phase A。多 wave 时 wave0 的
     // ds_store 未必对其它 wave 可见（tile(0,0) 首块竞态位，EXTRA_BARRIER 注释
@@ -3848,12 +3901,24 @@ fn emit_acc_swap(
             }
         } else {
             // 新路径：store acc → wait → load 直达 acc
+            // T0_SWAP_BARRIER=1（诊断）：swap 前后补 barrier——验证 2-wave 下
+            // "每 lane 独立槽无 cross-wave 依赖"假设（漂移 nan 残差的判别）
             k.ds_store_b128(swap_addr, acc[c], store_off);
             k.ds_store_b128(swap_addr, VReg(acc[c].0 + 4), store_off + 16);
             k.wait_lgkmcnt(0);
+            if std::env::var("T0_SWAP_BARRIER").is_ok() {
+                k.s_barrier();
+            }
+            // T0_SWAP_NOP=K（2026-11-08 时序余量判别）：ds_load 后插 K 条 s_nop，
+            // nan/巨数随 K 单调下降 = 硬件管线时序余量问题；不变 = 映射/依赖错。
+            let swap_nop: u32 = std::env::var("T0_SWAP_NOP").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(0);
             k.ds_load_b128(acc[c], swap_addr, load_off);
             k.ds_load_b128(VReg(acc[c].0 + 4), swap_addr, load_off + 16);
             k.wait_lgkmcnt(0);
+            for _ in 0..swap_nop {
+                k.raw_asm("s_nop 0");
+            }
         }
     }
 }
@@ -5186,9 +5251,29 @@ mod gpu_tests {
             let wt_f32: Vec<f32> = (0..n*k).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
             let x_bf16: Vec<u16> = x_f32.iter().map(|&v| f32_to_bf16(v)).collect();
             let wt_bf16: Vec<u16> = wt_f32.iter().map(|&v| f32_to_bf16(v)).collect();
-            let x_buf = upload_bf16(rt, &x_bf16);
-            let wt_buf = upload_bf16(rt, &wt_bf16);
-            let y_buf = rt.alloc_zero(m * n * 4).expect("alloc Y");
+            // 2026-11-08 一致性判别：GTT（主存共享映射）vs cached VRAM——
+            // 若 GTT 全对而 VRAM 坏 → CPU 读 cached VRAM 的 L2 一致性问题
+            //（GPU 写进 L2 未刷出，CPU 经 PCIe 读旧数据）→ 全项目读回路径需审计。
+            let use_gtt = std::env::var("T0_GTT").is_ok();
+            let put_buf = |bytes: &Vec<u8>| -> crate::kfd::GpuBuffer {
+                if use_gtt {
+                    let buf = rt.device.alloc_gtt(bytes.len()).expect("gtt alloc");
+                    buf.write(bytes); buf
+                } else {
+                    let buf = rt.device.alloc_vram(bytes.len()).expect("vram alloc");
+                    buf.write(bytes); buf
+                }
+            };
+            let x_buf = put_buf(&x_bf16.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            let wt_buf = put_buf(&wt_bf16.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            let y_buf = if use_gtt {
+                let buf = rt.device.alloc_gtt((m * n * 4 + 40960) as usize).expect("alloc");
+                buf.zero(); buf
+            } else {
+                let y_alloc = if std::env::var("T0_FRAGPROBE").is_ok()
+                    || std::env::var("T0_LDS_DUMP").is_ok() { m * n * 4 + 40960 } else { m * n * 4 };
+                rt.alloc_zero(y_alloc).expect("alloc Y")
+            };
 
             let kernel = rt.ensure_kernel_t0(
                 &spec.name(),
@@ -5242,7 +5327,8 @@ mod gpu_tests {
             let x_buf = upload_bf16(rt, &x_bf16);
             let wt_buf = upload_bf16(rt, &wt_bf16);
             // T0_FRAGPROBE 需要额外探针区（Y+32768）
-            let y_alloc = if std::env::var("T0_FRAGPROBE").is_ok() { m * n * 4 + 40960 } else { m * n * 4 };
+            let y_alloc = if std::env::var("T0_FRAGPROBE").is_ok()
+                || std::env::var("T0_LDS_DUMP").is_ok() { m * n * 4 + 40960 } else { m * n * 4 };
             let y_buf = rt.alloc_zero(y_alloc).expect("alloc Y");
             // Fill Y with NaN to detect whether store phase actually writes
             let nan_val: u32 = 0x7FC00000; // quiet NaN
@@ -5299,6 +5385,89 @@ mod gpu_tests {
             let nan_count = result.iter().filter(|&&v| v.is_nan()).count();
             let zero_count = result.iter().filter(|&&v| v == 0.0).count();
             eprintln!("[acc_swap] nonzero={}, nan={}, zeros={}, max_err={:.6}", nonzero, nan_count, zero_count, max_err);
+            // T1 分桶（2026-11-08 三假设判据）：
+            //   H-wg（wave 调度依赖）：nan 集中在 n==1 的行 → 按 n 维分桶
+            //   H-rb（swap/K 边界交错）：nan 按 32 行（rb）整块分布 → 按 (row/32) 分桶
+            //   H-lane（lane_hi/列块残留）：nan 按 lane 列块（col%32 <16 vs >=16）分布
+            // 矩阵 64×64：rb = row/32（0..2），wave 即 rb 维（wave 负责各自 32 行块）
+            let mut by_rb = [0usize; 2];
+            let mut by_rowband = [0usize; 4]; // row%32 的四个 8 行带
+            let mut by_colhalf = [0usize; 2]; // col<32 / col>=32
+            for (i, &v) in result.iter().enumerate() {
+                if !v.is_nan() { continue; }
+                let (r, c) = (i / 64, i % 64);
+                by_rb[(r / 32).min(1)] += 1;
+                by_rowband[((r % 32) / 8).min(3)] += 1;
+                by_colhalf[(c / 32).min(1)] += 1;
+            }
+            eprintln!("[acc_swap][bucket] by_rb(row/32)={by_rb:?} by_rowband(row%32/8)={by_rowband:?} by_colhalf={by_colhalf:?}");
+            // T0_LDS_DUMP 读回对拍（列块 0/1 判据）：Y+32768 的 2KB = LDS X 区全 dump。
+            // 与 x_bf16（1024 bf16 = 2048B）逐字节比： mism 块序号偶数=col chunk0 坏（coop store bug），
+            // 奇数=chunk1；全对 → read 侧 lanes 0-15 列块 0 地址错。
+            if std::env::var("T0_LDS_DUMP").is_ok() {
+                let dump = y_buf.read_bytes(32768, 2048);
+                let x_bytes: Vec<u8> = x_bf16.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let mut n_mism = 0usize;
+                let mut first = None;
+                for (i, (d, x)) in dump.iter().zip(x_bytes.iter()).enumerate() {
+                    if d != x {
+                        n_mism += 1;
+                        if first.is_none() { first = Some((i, *d, *x)); }
+                    }
+                }
+                // 按 16B 块聚合（块 b = col_chunk b%2，行 b/2）
+                let mut cb0 = 0usize; let mut cb1 = 0usize;
+                for b in 0..128usize {
+                    let seg = &dump[b*16..(b+1)*16];
+                    let xseg = &x_bytes[b*16..(b+1)*16];
+                    if seg != xseg { if b % 2 == 0 { cb0 += 1; } else { cb1 += 1; } }
+                }
+                eprintln!("[acc_swap][ldsdump] byte_mism={n_mism}/2048 first={first:?} bad16B: chunk0={cb0} chunk1={cb1}");
+                // 落盘供 CPU 端穷举对拍（下轮分析：dump 数据 vs 两种公式模拟的排列）
+                let _ = std::fs::write("/tmp/accswap_lds_dump.bin", &dump);
+                let _ = std::fs::write("/tmp/accswap_x_input.bin", &x_bytes);
+                eprintln!("[acc_swap][ldsdump] dump→/tmp/accswap_lds_dump.bin x_input→/tmp/accswap_x_input.bin");
+            }
+            // T2 决定性对拍（2026-11-08）：GPU 值 → CPU 参考矩阵搜索匹配。
+            //   home     = 原位匹配（值对位置对）
+            //   elsewhere= 异位匹配（值对位置错——映射模式揭示错位类型）
+            //   unmatched= 无匹配（计算本身错——K 累加/时序问题，非映射）
+            // 判据：全 elsewhere → 静态映射 bug（lane_mapping 可数学定位）；
+            //       有 unmatched → 运行时依赖/时序（kernel_debugger 单步）。
+            let mut n_home = 0usize;
+            let mut n_elsewhere = 0usize;
+            let mut n_unmatched = 0usize;
+            let mut n_zero_or_nan = 0usize;
+            let mut map_samples: Vec<(usize, usize, usize, usize, f32)> = Vec::new(); // (r,c,r',c',gpu_v)
+            let mut row_delta_hist: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+            for (i, &v) in result.iter().enumerate() {
+                if v.is_nan() || v == 0.0 { n_zero_or_nan += 1; continue; }
+                let (r, c) = (i / 64, i % 64);
+                let mut hit: Option<(usize, usize)> = None;
+                for (j, &e) in expected.iter().enumerate() {
+                    if (v - e).abs() <= 0.05 * e.abs().max(0.05) {
+                        hit = Some((j / 64, j % 64));
+                        break;
+                    }
+                }
+                match hit {
+                    Some((r2, c2)) if (r2, c2) == (r, c) => n_home += 1,
+                    Some((r2, c2)) => {
+                        n_elsewhere += 1;
+                        if map_samples.len() < 12 {
+                            map_samples.push((r, c, r2, c2, v));
+                        }
+                        let rd = ((r2 as i64 - r as i64) + 64) % 64;
+                        *row_delta_hist.entry(rd).or_insert(0) += 1;
+                    }
+                    None => n_unmatched += 1,
+                }
+            }
+            let mut hist: Vec<(i64, usize)> = row_delta_hist.into_iter().collect();
+            hist.sort_by_key(|x| std::cmp::Reverse(x.1));
+            eprintln!("[acc_swap][match] home={n_home} elsewhere={n_elsewhere} unmatched={n_unmatched} zero/nan={n_zero_or_nan}");
+            eprintln!("[acc_swap][match] row_delta(top): {hist:?}");
+            eprintln!("[acc_swap][match] samples (r,c)->(r',c') v: {map_samples:?}");
             eprintln!("[acc_swap] Y[0..16] = {:?}", &result[..16.min(result.len())]);
             
             // Use kernel debugger to analyze execution
