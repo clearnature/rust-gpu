@@ -28,11 +28,11 @@ mod robustness_tests {
     fn test_single_wmma() {
         let mut kb = T0Kernel::new("single_wmma");
         let _p = kb.arg_ptr("p");
-        let d = kb.alloc_vreg();
-        let a = kb.alloc_vreg();
-        let b = kb.alloc_vreg();
-        let c = kb.alloc_vreg();
-        kb.wmma_bf16_f32(d, a, b, c);
+        // [A 类家族] WMMA frag 须登记：d/c (8,Align8)、a/b (4,Align4)
+        let d = kb.alloc_vreg_array(8, t0_gpu::t0::ir::Alignment::Align8);
+        let a = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        let b = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        kb.wmma_bf16_f32(d, a, b, d);
         kb.endpgm();
         let result = kb.compile(Target::GFX1200);
         assert!(result.is_ok(), "Single WMMA should compile: {:?}", result.err());
@@ -57,11 +57,11 @@ mod robustness_tests {
         let mut kb = T0Kernel::new("many_wmma");
         let _p = kb.arg_ptr("p");
         for _ in 0..32 {
-            let d = kb.alloc_vreg();
-            let a = kb.alloc_vreg();
-            let b = kb.alloc_vreg();
-            let c = kb.alloc_vreg();
-            kb.wmma_bf16_f32(d, a, b, c);
+            // [A 类家族] WMMA frag 登记（d/c 8、a/b 4）
+            let d = kb.alloc_vreg_array(8, t0_gpu::t0::ir::Alignment::Align8);
+            let a = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+            let b = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+            kb.wmma_bf16_f32(d, a, b, d);
         }
         kb.endpgm();
         let result = kb.compile(Target::GFX1200);
@@ -73,11 +73,11 @@ mod robustness_tests {
     fn test_f16_wmma() {
         let mut kb = T0Kernel::new("f16_wmma");
         let _p = kb.arg_ptr("p");
-        let d = kb.alloc_vreg();
-        let a = kb.alloc_vreg();
-        let b = kb.alloc_vreg();
-        let c = kb.alloc_vreg();
-        kb.wmma_f16_f32(d, a, b, c);
+        // [A 类家族] WMMA frag 须登记：d/c (8,Align8)、a/b (4,Align4)
+        let d = kb.alloc_vreg_array(8, t0_gpu::t0::ir::Alignment::Align8);
+        let a = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        let b = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        kb.wmma_f16_f32(d, a, b, d);
         kb.endpgm();
         let result = kb.compile(Target::GFX1200);
         assert!(result.is_ok(), "F16 WMMA should compile: {:?}", result.err());
@@ -88,11 +88,11 @@ mod robustness_tests {
     fn test_bf16_bf16_wmma() {
         let mut kb = T0Kernel::new("bf16_bf16");
         let _p = kb.arg_ptr("p");
-        let d = kb.alloc_vreg();
-        let a = kb.alloc_vreg();
-        let b = kb.alloc_vreg();
-        let c = kb.alloc_vreg();
-        kb.wmma_bf16_bf16(d, a, b, c);
+        // [A 类家族] WMMA frag 须登记：d/c (8,Align8)、a/b (4,Align4)
+        let d = kb.alloc_vreg_array(8, t0_gpu::t0::ir::Alignment::Align8);
+        let a = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        let b = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        kb.wmma_bf16_bf16(d, a, b, d);
         kb.endpgm();
         let result = kb.compile(Target::GFX1200);
         assert!(result.is_ok(), "BF16→BF16 WMMA should compile: {:?}", result.err());
@@ -105,11 +105,11 @@ mod robustness_tests {
     fn test_gfx1100_target() {
         let mut kb = T0Kernel::new("gfx1100_test");
         let _p = kb.arg_ptr("p");
-        let d = kb.alloc_vreg();
-        let a = kb.alloc_vreg();
-        let b = kb.alloc_vreg();
-        let c = kb.alloc_vreg();
-        kb.wmma_bf16_f32(d, a, b, c);
+        // [A 类家族] WMMA frag 须登记：d/c (8,Align8)、a/b (4,Align4)
+        let d = kb.alloc_vreg_array(8, t0_gpu::t0::ir::Alignment::Align8);
+        let a = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        let b = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        kb.wmma_bf16_f32(d, a, b, d);
         kb.endpgm();
         let result = kb.compile(Target::GFX1100);
         assert!(result.is_ok(), "GFX1100 should compile: {:?}", result.err());
@@ -125,11 +125,11 @@ mod robustness_tests {
         for i in 0..8 {
             let _s = kb.arg_u32(&format!("scalar_{}", i));
         }
-        let d = kb.alloc_vreg();
-        let a = kb.alloc_vreg();
-        let b = kb.alloc_vreg();
-        let c = kb.alloc_vreg();
-        kb.wmma_bf16_f32(d, a, b, c);
+        // [A 类家族] WMMA frag 须登记：d/c (8,Align8)、a/b (4,Align4)
+        let d = kb.alloc_vreg_array(8, t0_gpu::t0::ir::Alignment::Align8);
+        let a = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        let b = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        kb.wmma_bf16_f32(d, a, b, d);
         kb.endpgm();
         let result = kb.compile(Target::GFX1200);
         assert!(result.is_ok(), "Many args should compile: {:?}", result.err());
@@ -140,11 +140,11 @@ mod robustness_tests {
     fn test_output_nonempty() {
         let mut kb = T0Kernel::new("nonempty");
         let _p = kb.arg_ptr("p");
-        let d = kb.alloc_vreg();
-        let a = kb.alloc_vreg();
-        let b = kb.alloc_vreg();
-        let c = kb.alloc_vreg();
-        kb.wmma_bf16_f32(d, a, b, c);
+        // [A 类家族] WMMA frag 须登记：d/c (8,Align8)、a/b (4,Align4)
+        let d = kb.alloc_vreg_array(8, t0_gpu::t0::ir::Alignment::Align8);
+        let a = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        let b = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        kb.wmma_bf16_f32(d, a, b, d);
         kb.endpgm();
         let elf = kb.compile(Target::GFX1200).unwrap();
         assert!(!elf.is_empty(), "ELF should not be empty");
@@ -156,11 +156,11 @@ mod robustness_tests {
     fn test_elf_magic() {
         let mut kb = T0Kernel::new("magic");
         let _p = kb.arg_ptr("p");
-        let d = kb.alloc_vreg();
-        let a = kb.alloc_vreg();
-        let b = kb.alloc_vreg();
-        let c = kb.alloc_vreg();
-        kb.wmma_bf16_f32(d, a, b, c);
+        // [A 类家族] WMMA frag 须登记：d/c (8,Align8)、a/b (4,Align4)
+        let d = kb.alloc_vreg_array(8, t0_gpu::t0::ir::Alignment::Align8);
+        let a = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        let b = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        kb.wmma_bf16_f32(d, a, b, d);
         kb.endpgm();
         let elf = kb.compile(Target::GFX1200).unwrap();
         assert!(elf.len() >= 4, "ELF too short");
@@ -234,11 +234,11 @@ mod smem_batch_tests {
         let _p3 = kb.arg_ptr("c");
         let _p4 = kb.arg_ptr("d");
         let _n = kb.arg_u32("n");
-        let d = kb.alloc_vreg();
-        let a = kb.alloc_vreg();
-        let b = kb.alloc_vreg();
-        let c = kb.alloc_vreg();
-        kb.wmma_bf16_f32(d, a, b, c);
+        // [A 类家族] WMMA frag 须登记：d/c (8,Align8)、a/b (4,Align4)
+        let d = kb.alloc_vreg_array(8, t0_gpu::t0::ir::Alignment::Align8);
+        let a = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        let b = kb.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+        kb.wmma_bf16_f32(d, a, b, d);
         kb.endpgm();
 
         let elf = kb.compile(Target::GFX1200).unwrap();

@@ -516,7 +516,14 @@ pub fn allocate_ssa(
     }
 
     // ── VGPR allocation ──
-    let mut pool = FreePool::new(super::regs::VGPR0_TID + 1, max_vgprs); // v0 reserved (regs.rs)
+    // [2026-11-05 spill-press 回归抓获] probe 保留 [PROBE_VGPR_BASE, +COUNT)
+    // 依合同排除（regs.rs:49「分配器跳过」）——旧代码 pool 上限直接用 max_vgprs，
+    // 压力下把真实值分到 probe 物理寄存器，被 arch-fix-A 校验拦成编译失败。
+    // 收紧到 min(max_vgprs, PROBE_VGPR_BASE) - 1：最高位置留给 spill scratch
+    //（next_free ≤ 249，避开 probe 250+）。需要 >248 的内核从此走 spill
+    // 路径（已验证可用），而不是撞死在保留寄存器校验上。
+    let pool_max = max_vgprs.min(super::regs::PROBE_VGPR_BASE) - 1;
+    let mut pool = FreePool::new(super::regs::VGPR0_TID + 1, pool_max); // v0 reserved (regs.rs)
     let mut vgpr_map: HashMap<MVal, u8> = HashMap::new();
     let mut spills: Vec<SpillRecord> = Vec::new();
 
@@ -527,6 +534,10 @@ pub fn allocate_ssa(
     // Group tracking: group_id → allocated phys_base
     // All MVals in the same group share the same base register.
     let mut group_base: HashMap<u32, u8> = HashMap::new();
+
+    // [2026-11-05 spill-press 回归抓获] 被 spill 的 incoming interval 统一记到
+    // spill scratch（循环后映射）——禁止硬编码保留寄存器。
+    let mut spill_dummy_mvals: Vec<MVal> = Vec::new();
 
     // 2026-11-08 H1 修正②：组级 max last_use（全组同步退役的依据）。
     // 分片条目若用成员自身 last_use，跨 K 回边的迟使用（WMMA RMW dst=c）
@@ -700,6 +711,18 @@ pub fn allocate_ssa(
                 // spill 牺牲品 → 一半被复用/reload = 地址撕裂（页错误 A 类指纹：
                 // 高半真实/低半常数、0xf8 填充入地址半）。多寄存器组（group_size>1）
                 // 的分片禁止单独 spill——只允许单值（group_size<=1）。
+                // [2026-11-05 spill-press 回归抓获] 组/多寄存器分配在池耗尽下
+                // 不 sound：victim 只交接 1 个寄存器，而组需要 count 个连续——
+                // 组级 spill/reload 未实现前显式拒绝（否则 leader 拿 1 个寄存器、
+                // 成员经 group_base 踩进他人活跃寄存器 = 静默破坏）。
+                if count > 1 {
+                    panic!(
+                        "[T0 SSA RegAlloc] 多寄存器分配（count={count}, vreg={:?}）在寄存器池耗尽下不受支持\
+                         （组级 spill/reload 未实现）。请减小内核寄存器压力。\
+                         （登记：PROJECT_MEMORY 2026-11-05 spill-press 项）",
+                        interval.vreg
+                    );
+                }
                 if let Some(spill_pos) = active.iter().enumerate()
                     .filter(|(_, a)| a.count == 1)
                     .filter(|(_, a)| intervals[a.interval_idx].group_size <= 1)
@@ -746,7 +769,14 @@ pub fn allocate_ssa(
 
                         // Assign a dummy register (will be reloaded from LDS)
                         // The spill/reload insertion pass will handle this.
-                        vgpr_map.insert(interval.mval, 0);
+                        // [2026-11-05 spill-press 回归抓获] 旧代码硬编码 0 = 硬件
+                        // WORKITEM_ID_X——reload 的 ds_load_b32 dst 走原 vreg 映射，
+                        // 直接摧毁线程 ID（被 arch-fix-A 校验拦在编译期，未上硬件）。
+                        // 正确做法：先记账，循环后统一映射到 spill scratch
+                        //（高水位外一档，无人占用；同指令多 spilled use 由
+                        // insert_spill_reloads fail-fast 把关）。
+                        vgpr_map.insert(interval.mval, u8::MAX); // 临时哨兵
+                        spill_dummy_mvals.push(interval.mval);
                     }
                 } else {
                     // No spillable interval found — this is a hard error
@@ -762,7 +792,17 @@ pub fn allocate_ssa(
         }
     }
 
-    // Compute total VGPRs used
+    // Compute total VGPRs used.
+    // [2026-11-05 spill-press 回归抓获] spill scratch = 高水位位置（无人占用）。
+    // 与 to_legacy 的 fallback_scratch **共享同一槽**：fallback 是死定义（永不
+    // 读），reload→消费相邻无间隙——共享安全。这样 total_vgprs = next_free 恰好
+    // 是 fallback 的语义位，两套机制一槽两用，预算不超 probe 基（250）。
+    // 同一指令 ≥2 个不同 spilled use 会静默错值——由 insert_spill_reloads
+    // fail-fast 拦截（见该函数）。
+    let spill_scratch = pool.next_free;
+    for mv in &spill_dummy_mvals {
+        vgpr_map.insert(*mv, spill_scratch);
+    }
     let total_vgprs = pool.next_free;
 
     // Occupancy — MEASURED 2026-08-23: GFX1200 (RDNA4) has 256 VGPRs/SIMD
@@ -1018,6 +1058,18 @@ pub fn insert_spill_reloads(
         }
 
         // Insert reload loads BEFORE the current instruction
+        // [2026-11-05 spill-press 回归锁] 所有 spilled 值共享同一 spill scratch
+        //（allocate_ssa 统一映射到高水位外一档）。单指令串行「reload→消费」安全；
+        // 但 ≥2 个不同 spilled use 会互相覆盖 scratch → 静默错值——fail-fast。
+        if load_insertions.len() > 1 {
+            panic!(
+                "[T0 Spill] 单指令含 {} 个不同 spilled use（{:?}）——共享 spill scratch \
+                 会静默错值。请减小内核寄存器压力或拆分该指令。\
+                 （登记：PROJECT_MEMORY 2026-11-05 spill-press 项）",
+                load_insertions.len(),
+                load_insertions.iter().map(|(v, _)| v.0).collect::<Vec<_>>()
+            );
+        }
         if !load_insertions.is_empty() {
             let mut inserted = 0;
             for (vreg, lds_off) in &load_insertions {
@@ -1225,16 +1277,19 @@ mod tests {
 
     #[test]
     fn test_spill_reload_insertion() {
-        // Same ops as test_ssa_alloc_spill — force spills, then verify code insertion
+        // [2026-11-05 spill-press 契约更新] 每条指令**结构上保证单 spilled use**：
+        // 旧内核 v_add(6, v3, v4) 双 spilled use 在共享 scratch 下是静默错值
+        // （旧 dummy-0 时代两次 reload 都写 v0，后读的覆盖先读的——测试只查
+        // 插入结构从未暴露）。新契约由 insert_spill_reloads fail-fast 把关。
         let ops = vec![
             Op::VMov { dst: VReg(1), src: Operand::InlineFloat(1.0) },
             Op::VMov { dst: VReg(2), src: Operand::InlineFloat(2.0) },
             Op::VMov { dst: VReg(3), src: Operand::InlineFloat(3.0) },
             Op::VMov { dst: VReg(4), src: Operand::InlineFloat(4.0) },
-            Op::VAddF32 { dst: VReg(5), src0: Operand::VReg(VReg(1)), src1: Operand::VReg(VReg(2)) },
-            Op::VAddF32 { dst: VReg(6), src0: Operand::VReg(VReg(3)), src1: Operand::VReg(VReg(4)) },
-            Op::GlobalStore { addr: VReg(10), src: VReg(5), width: Width::B32, offset: 0 },
-            Op::GlobalStore { addr: VReg(10), src: VReg(6), width: Width::B32, offset: 4 },
+            Op::GlobalStore { addr: VReg(10), src: VReg(1), width: Width::B32, offset: 0 },
+            Op::GlobalStore { addr: VReg(10), src: VReg(2), width: Width::B32, offset: 4 },
+            Op::GlobalStore { addr: VReg(10), src: VReg(3), width: Width::B32, offset: 8 },
+            Op::GlobalStore { addr: VReg(10), src: VReg(4), width: Width::B32, offset: 12 },
             Op::Endpgm,
         ];
 
@@ -1244,13 +1299,13 @@ mod tests {
             VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: RegClass::Normal },
             VRegAlloc { vreg: VReg(3), count: 1, alignment: Alignment::None, class: RegClass::Normal },
             VRegAlloc { vreg: VReg(4), count: 1, alignment: Alignment::None, class: RegClass::Normal },
-            VRegAlloc { vreg: VReg(5), count: 1, alignment: Alignment::None, class: RegClass::Normal },
-            VRegAlloc { vreg: VReg(6), count: 1, alignment: Alignment::None, class: RegClass::Normal },
         ];
         let intervals = compute_live_intervals(&func, &allocs);
 
         // Force spills with low VGPR limit
-        let ssa_alloc = allocate_ssa(&intervals, &[], &func, 4);
+        // [2026-11-05] 池上限 = min(L, 250) - 1（probe/scratch 预留）——L=3 给
+        // 1 个可用槽 + 3 个 incoming spill，且首分配不撞 FATAL panic
+        let ssa_alloc = allocate_ssa(&intervals, &[], &func, 3);
         assert!(!ssa_alloc.spills.is_empty(), "need spills for this test");
 
         // Run spill/reload insertion
