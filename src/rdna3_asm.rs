@@ -2078,7 +2078,12 @@ pub mod gfx11 {
     
     /// ds_bpermute_b32 v_dst, v_index, v_src - byte permute (cross-lane read)
     pub fn ds_bpermute_b32(vdst: u8, vindex: u8, vsrc: u8) -> [u32; 2] {
-        let word0 = 0xD8D00000u32;
+        // [2026-11-05 金标准修复] 旧编码 0xD8D00000（RDNA3 DS opcode 52）在
+        // GFX1200 上被 llvm-mc 判 invalid——RDNA4 的 ds_bpermute_b32 opcode
+        // 变更，clang -mcpu=gfx1200 权威编码 = 0xDACC0000（v_max 同族案）。
+        // clang: ds_bpermute_b32 v3, v1, v2 → [DACC0000, 03000201]
+        // word1 布局不变：[7:0]=vindex, [15:8]=vsrc, [31:24]=vdst。
+        let word0 = 0xDACC0000u32;
         let word1 = (vindex as u32) | ((vsrc as u32) << 8) | ((vdst as u32) << 24);
         [word0, word1]
     }
@@ -2253,10 +2258,14 @@ pub mod gfx11 {
     /// LLVM verified (VOP3e): v_max_f32_e64 v0, v0, 0 → [0x00,0x00,0x10,0xd5,0x00,0x01,0x01,0x00]
     /// word0 = 0xD5100000 | vdst, word1 = (256+vsrc) | (0x80 << 9)
     pub fn v_max_f32_imm0(vdst: u8, vsrc: u8) -> [u32; 2] {
-        let word0 = 0xD5100000u32 | (vdst as u32);
+        // [2026-11-05 金标准修复] GFX1200 上 v_max_f32 的汇编名 = v_max_num_f32，
+        // e64 编码由 clang 权威：v_max_f32 v4, v3, 0 → [D5160004, 02010103]。
+        // 旧编码 0xD5100000（RDNA3 opcode）被 llvm-mc 判 invalid。
+        // word1 高位 0x02010000 = clang 对立即数 0 操作数的固定标志位。
+        let word0 = 0xD5160000u32 | (vdst as u32);
         let src0_enc = 256 + vsrc as u32;
         let src1_enc = 0x80u32; // inline constant 0
-        let word1 = src0_enc | (src1_enc << 9);
+        let word1 = 0x02010000u32 | src0_enc | (src1_enc << 9);
         [word0, word1]
     }
 
