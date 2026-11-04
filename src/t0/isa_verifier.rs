@@ -404,6 +404,16 @@ pub fn verify_frag_coverage(
             }
             Op::DsLoadB64 { dst, .. } => demands.push(("DsLoadB64", *dst, 2)),
             Op::DsLoadB128 { dst, .. } => demands.push(("DsLoadB128", *dst, 4)),
+            // [2026-11-05 store 侧补全] store 的 src 同按 vreg_range_str 打印
+            // v[s:s+n-1]——读侧范围与写侧同一族假设，之前只查 load 漏了 store
+            Op::GlobalStore { src, width, .. } => {
+                demands.push(("GlobalStore.src", *src, width.vreg_count()))
+            }
+            Op::BufferStore { src, width, .. } => {
+                demands.push(("BufferStore.src", *src, width.vreg_count()))
+            }
+            Op::DsStoreB64 { src, .. } => demands.push(("DsStoreB64.src", *src, 2)),
+            Op::DsStoreB128 { src, .. } => demands.push(("DsStoreB128.src", *src, 4)),
             Op::Wmma { a, b, dst, ab_width, .. } => {
                 let w = *ab_width as u32;
                 demands.push(("Wmma.a", *a, w));
@@ -1131,6 +1141,38 @@ mod tests {
         ];
         let errs64 = verify_sreg_ranges(&ops64, &sallocs(&[(12, 1)]), &mk_alloc(&[]));
         assert_eq!(errs64.len(), 1, "B64 dst 仍须检查: {errs64:?}");
+    }
+
+    /// [store 侧补全] GlobalStore B128 src count:1 → 拦截（读侧同族假设）
+    #[test]
+    fn frag_coverage_store_src_count1_detected() {
+        let ops = vec![
+            Op::GlobalStore { addr: VReg(8), src: VReg(4), width: Width::B128, offset: 0 },
+            Op::WaitVscnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_frag_coverage(
+            &ops,
+            &allocs(&[(4, 1), (8, 2)]),
+            &mk_alloc(&[(4, 10), (8, 20), (9, 21)]),
+        );
+        assert_eq!(errs.len(), 1, "store src B128 须 4 连覆盖: {errs:?}");
+        assert!(errs[0].contains("GlobalStore.src"), "报错须标明 store 侧: {}", errs[0]);
+    }
+
+    /// [store 侧补全] DsStoreB128 src 正确登记 → 放行
+    #[test]
+    fn frag_coverage_dsstore_src_proper_passes() {
+        let ops = vec![
+            Op::DsStoreB128 { vaddr: VReg(8), src: VReg(4), offset: 0 },
+            Op::Endpgm,
+        ];
+        let errs = verify_frag_coverage(
+            &ops,
+            &allocs(&[(4, 4), (8, 1)]),
+            &mk_alloc(&[(4, 10), (5, 11), (6, 12), (7, 13), (8, 20)]),
+        );
+        assert!(errs.is_empty(), "合法 store src 不应报: {errs:?}");
     }
 
     /// [SMEM 合并族] x4 合并组 dst 只登记 count:1 → 拦截
