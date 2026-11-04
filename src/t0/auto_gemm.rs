@@ -681,6 +681,10 @@ mod tests {
         // 判别水位 >2 TF（坏/半跑内核 <1，健康降频 >5）；正确性由下方
         // tune-correctness 门保证（它抓住了 41.1 伪影与 uniform-48 值错误）。
         // 性能回归追踪用 examples/gemm_scaling_probe 同窗口成对测。
+        // 目标阶梯（2026-11-08，厂家规格：FP16 矩阵 103TF@3130MHz（WMMA 吞吐 32cyc/条，
+        //   FP8 205TF=2×）、Triton FA 实测 91.6（=标称 89%）/ 我们 15-32 TF=30%）：
+        //   P1=60 TF（三窗热循环）→ P2=91.6（流水深度+RSRC3 扫描）→ P3>91.6（超越+FP8 化 205）
+        // 当前阈值 2 TF 仅守"内核活着"——每完成一个性能阶段提升一档（45/75）。
         assert!(result.best_tflops > 2.0,
             "Expected > 2 TFLOPS (kernel alive check), got {:.1}", result.best_tflops);
         // 2026-11-08 D 布局修复后 gemm_gen 128x64 fullcheck n_bad=0（双 wgp 模式）

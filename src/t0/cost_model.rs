@@ -75,6 +75,19 @@ impl GFX1100Limits {
     /// 32 CU、GDDR6 322 GB/s、boost ~2.6 GHz。
     /// max_vgprs/sgprs/LDS/WG 与 GFX1100 等价（64KB/WG、256 VGPR、wave32）。
     /// wmma_cycles 未在 GFX1200 probe 校准（沿用 4）。
+    ///
+    /// 厂家完整规格（RX 9060 XT 官方，tests/isa_facts.rs 可加核算锁）：
+    ///   32 CU / AI 加速器 64 / SP 2048 / boost 3130 MHz / 游戏 2530 MHz / 29.7B 晶体管
+    ///   FP32 矢量 25.6 TF ｜ FP16 矢量 25.6 / FP16 矩阵 103（稀疏 205）
+    ///   FP8 矩阵 205（稀疏 410）｜ INT8 205（410）｜ INT4 410（821）
+    ///   WMMA 吞吐标称 = 32 cycles/条（FP16 矩阵 @3130 自洽核算 ✓）
+    /// 同卡峰值参照体系（2026-11-08 目标阶梯，厂家规格+实测锚）：
+    ///   Triton FA 实测 91.6 TF（fp16 causal，调优栈）= 标称的 89%
+    ///   t0-gpu 当前 30.8 TF → 目标阶梯 P1=60（三窗+扫描）/ P2=91.6（流水深度）/ P3>91.6（超越）
+    ///   **FP8 矩阵 205 TF = 2×FP16**：wmma_db 已有 FP8 路径——模型 FP8 化是 P3 算力倍增器
+    ///   Triton AMD 专有调优面（waves_per_eu/matrix_instr_nonkdim/kpack）
+    ///   对应我们的 RSRC1 bit29(WGP)/RSRC3 inst_pref_lines/ LDS sizing——
+    ///   性能调优时优先扫这些位域（tune_triton_gfx1200.py 的扫描清单）。
     pub fn for_gfx1200() -> Self {
         Self {
             n_cus: 32,
