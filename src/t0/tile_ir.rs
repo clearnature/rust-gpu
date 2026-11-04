@@ -3873,6 +3873,11 @@ fn emit_acc_swap(
     current_rb: usize,  // which row_block acc currently holds
     target_rb: usize,   // which row_block to swap to
 ) {
+    // 2026-11-08 M1b 修（C2 红灯靶点，tests/lgkm_counter_contract.rs）：swap 前
+    // 排空所有未完成 LGKM 操作——覆盖前序 frag_a 加载链的 lgkmcnt 债务和
+    // prologue coop store 的 dscnt 债务。不含此 wait 时，swap 的 ds_load 读
+    // swap 区可能命中未刷出的前序操作数据（acc_swap NaN 候选根因）。
+    k.wait_lgkmcnt(0);
     // Each row_block occupies n_col_tiles * 32 bytes per lane in LDS swap region.
     // offset = rb * (n_col_tiles * 32) + col * 32
     let load_base = (target_rb as u16) * (n_col_tiles as u16) * 32;
