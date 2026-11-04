@@ -905,6 +905,21 @@ pub fn dce_mach_func(func: &mut MachFunc) -> usize {
     }
 
     // Step 4: Remove non-live instructions from blocks
+    // [2026-11-05 DCE 正确性依赖排查] T0_DBG_DCE=1 列出被删 op——no-DCE 下
+    // 它们是 NaN 嫌疑（exec-mask 区 LDS 写假说，PROJECT_MEMORY 2026-11-05）。
+    if std::env::var("T0_DBG_DCE").is_ok() {
+        for &idx in &all_inst_indices {
+            if !live.contains(&idx) {
+                eprintln!("[T0 DCE] remove op[{}]: {:?}", idx, func.insts[idx].op);
+                // ±4 邻域上下文（Debug 全打印——format_op_short 有占位盲区）
+                for nb in all_inst_indices.iter().filter(|&&i| {
+                    i.abs_diff(idx) <= 4 && i != idx
+                }) {
+                    eprintln!("[T0 DCE]   ctx op[{}]: {:?}", nb, func.insts[*nb].op);
+                }
+            }
+        }
+    }
     let mut total_removed = 0;
     for blk in &mut func.blocks {
         let original_len = blk.insts.len();
@@ -2590,12 +2605,36 @@ pub fn compute_live_intervals(
     // We achieve this by merging all intervals for the same VReg into one
     // interval with def_point = min(all defs), last_use = max(all uses).
     // This is equivalent to "coalescing" the SSA versions.
+    //
+    // [2026-11-05 死写 clobber 修复] merge 必须纳入**同 VReg 的全部 def
+    //（含死 def）的最早 seq**。死 def = 无 use 的重定义前初始化写（masked-load
+    // 的 zero-init、wave-reduce 的 -inf padding——值随后被同 vreg 的
+    // masked load 无条件覆盖）。它真实执行、真实写寄存器，但 SSA 死值
+    // 不建 interval → 该 VReg 的 interval 起点晚于死写 → 分配器把它与
+    // 区间实际含死写的活值判「不重叠」→ 共享寄存器 → 死写 clobber 活值。
+    // 实证：softmax no-DCE 下 lane_id(v16)[31,41] 与 partial(v17)[42,46]
+    // 共享 p5，死写 mov 在 seq38 → lane_id 被写成 -8388608 → cmp 恒真 →
+    // 掩码全开 → LDS 越界槽 → NaN（14 个 GPU 测试）。DCE 删死写才让
+    // 现实与区间一致——「优化器兜正确性」的本末倒置，本修复拔掉该依赖。
+    let mut earliest_def: HashMap<VReg, u32> = HashMap::new();
+    for (inst_idx, inst) in func.insts.iter().enumerate() {
+        let seq = match inst_to_seq.get(&inst_idx) {
+            Some(&s) => s,
+            None => continue,
+        };
+        for vreg in inst.op.vreg_defs() {
+            let e = earliest_def.entry(vreg).or_insert(seq);
+            if seq < *e {
+                *e = seq;
+            }
+        }
+    }
     let mut vreg_merged: HashMap<VReg, usize> = HashMap::new(); // VReg → index in merged
     let mut merged: Vec<LiveInterval> = Vec::new();
 
     for interval in &intervals {
         if interval.vreg.0 == u32::MAX { continue; } // skip unresolved
-        
+
         if let Some(&merged_idx) = vreg_merged.get(&interval.vreg) {
             // Merge: widen the existing interval
             let m = &mut merged[merged_idx];
@@ -2605,6 +2644,19 @@ pub fn compute_live_intervals(
             // First interval for this VReg
             vreg_merged.insert(interval.vreg, merged.len());
             merged.push(interval.clone());
+        }
+    }
+
+    // [2026-11-05 死写 clobber 修复] 把死 def 的最早 seq 纳入 def_point
+    //（见上方 Step 6 注释——死写真实执行，区间必须覆盖它）
+    for m in &mut merged {
+        if let Some(&d) = earliest_def.get(&m.vreg) {
+            if d < m.def_point {
+                m.def_point = d;
+            }
+            if m.last_use < d {
+                m.last_use = d;
+            }
         }
     }
 
@@ -2746,6 +2798,38 @@ impl MachFunc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [2026-11-05 死写 clobber 回归锁] 同 VReg 死 def 必须把 interval 起点
+    /// 提前到最早 def。softmax no-DCE NaN 实证：v17 = -inf 初始化写（死 def，
+    /// seq 38）+ masked ds_load 重定义（seq 42）——死写不建 interval 时
+    /// v17 区间=[42,…]，与 lane_id(v16)[31,41] 「不重叠」→ 共享寄存器 →
+    /// 死写真实执行 clobber lane_id → NaN。修复后 v17 区间必须从 38 起。
+    #[test]
+    fn test_dead_def_extends_vreg_interval() {
+        // v1 = -inf 初始化（将被重定义，死 def）
+        // v1 = masked ds_load 重定义（无 IR use 链到 mov）
+        // 中间夹 lane 类活值 v2（def 3, use 5）——与死写区间 [2,2] 重叠
+        let ops = vec![
+            Op::VMov { dst: VReg(1), src: Operand::InlineInt(-8388608) }, // seq0: 死写
+            Op::VMov { dst: VReg(2), src: Operand::InlineFloat(1.0) },    // seq1: 活值 def
+            Op::VMov { dst: VReg(2), src: Operand::InlineFloat(2.0) },    // seq2: v2 重定义
+            Op::GlobalLoad { dst: VReg(1), addr: VReg(3), width: Width::B32, offset: 0 }, // seq3: v1 重定义
+            Op::VCmpLtU32 { src0: Operand::VReg(VReg(2)), src1: Operand::InlineInt(8) },  // seq4: v2 use
+            Op::GlobalStore { addr: VReg(3), src: VReg(1), width: Width::B32, offset: 0 },// seq5: v1 use
+            Op::Endpgm,
+        ];
+        let allocs = vec![
+            super::super::ir::VRegAlloc { vreg: VReg(1), count: 1, alignment: Alignment::None, class: super::super::ir::RegClass::Normal },
+            super::super::ir::VRegAlloc { vreg: VReg(2), count: 1, alignment: Alignment::None, class: super::super::ir::RegClass::Normal },
+        ];
+        let func = lift_to_ssa(&ops);
+        let intervals = compute_live_intervals(&func, &allocs);
+        let v1 = intervals.iter().find(|i| i.vreg.0 == 1).expect("v1 interval");
+        // 修复前：v1 interval 只从 ds_load 的 def 起（seq3），死写 seq0 被无视
+        assert_eq!(v1.def_point, 0,
+            "同 VReg 死 def（seq0 的 -inf 初始化写）必须把区间起点提前到 0——\
+             否则分配器会把它与 [1,4] 的活值判不重叠而共享寄存器，死写 clobber 活值");
+    }
 
     #[test]
     fn test_lift_basic() {

@@ -31,15 +31,24 @@ pub fn optimize(
     coalesced_groups: &[super::compile::CoalescedGroup],
     addr_vregs: &std::collections::HashSet<u32>,
 ) -> (Vec<Op>, OptStats) {
-    let mut stats = OptStats::default();
-    let original_len = ops.len();
-
     // T0_OPT_LEVEL: 0=none, 1=Phase A, 2=A+B, 3=A+B+C, 4=all (default)
     let opt_level: u32 = std::env::var("T0_OPT_LEVEL")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
-    
+    optimize_with_level(ops, coalesced_groups, addr_vregs, opt_level)
+}
+
+/// 显式档位版本——测试/诊断用，不依赖进程环境变量（env 全局态竞态）。
+pub fn optimize_with_level(
+    ops: Vec<Op>,
+    coalesced_groups: &[super::compile::CoalescedGroup],
+    addr_vregs: &std::collections::HashSet<u32>,
+    opt_level: u32,
+) -> (Vec<Op>, OptStats) {
+    let mut stats = OptStats::default();
+    let original_len = ops.len();
+
     if opt_level == 0 {
         return (ops, stats);
     }
@@ -1191,7 +1200,9 @@ mod tests {
             Op::Endpgm,
         ];
 
-        let (_result, stats) = optimize(ops, &[], &std::collections::HashSet::new());
+        // [2026-11-05] 显式档位——本测试验证折叠管线本身，不随 T0_OPT_LEVEL
+        // 环境变量假红（opt-level 全档扫描发现）
+        let (_result, stats) = optimize_with_level(ops, &[], &std::collections::HashSet::new(), 4);
         assert!(stats.consts_folded >= 1, "should fold at least 1 op");
         assert!(stats.dead_ops_removed >= 1, "should remove at least 1 dead op");
     }
