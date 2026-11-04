@@ -5306,6 +5306,36 @@ mod gpu_tests {
 
             eprintln!("[gpu_write_visibility] max_err={:.6}", max_err);
             eprintln!("[gpu_write_visibility] Y[0..4] = {:?}", &result[..4]);
+            // T2 对拍分类器（同 128x128_swap_correctness 模式）
+            {
+                let mut n_home = 0usize; let mut n_else = 0usize;
+                let mut n_unmatch = 0usize; let mut n_nan = 0usize;
+                let mut samples: Vec<(usize, usize, usize, usize)> = Vec::new();
+                let mut row_d: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+                for (i, &v) in result.iter().enumerate() {
+                    if v.is_nan() { n_nan += 1; continue; }
+                    let (r, c) = (i / 64, i % 64);
+                    let mut hit: Option<(usize, usize)> = None;
+                    for (j, &e) in expected.iter().enumerate() {
+                        if (v - e).abs() <= 0.05 * e.abs().max(0.05) { hit = Some((j / 64, j % 64)); break; }
+                    }
+                    match hit {
+                        Some((r2, c2)) if (r2, c2) == (r, c) => n_home += 1,
+                        Some((r2, c2)) => {
+                            n_else += 1;
+                            if samples.len() < 8 { samples.push((r, c, r2, c2)); }
+                            let rd = ((r2 as i64 - r as i64) + 64) % 64;
+                            *row_d.entry(rd).or_insert(0) += 1;
+                        }
+                        None => n_unmatch += 1,
+                    }
+                }
+                let mut hd: Vec<(i64, usize)> = row_d.into_iter().collect();
+                hd.sort_by_key(|x| std::cmp::Reverse(x.1));
+                eprintln!("[acc_swap][match2] home={n_home} elsewhere={n_else} unmatched={n_unmatch} nan={n_nan}");
+                eprintln!("[acc_swap][match2] row_delta(top3): {hd:?}");
+                eprintln!("[acc_swap][match2] samples (r,c)->(r',c'): {samples:?}");
+            }
 
             // This should work for non-acc_swap
             assert!(max_err < 0.1, "Non-acc_swap GEMM should work, max_err={:.6}", max_err);
@@ -5390,6 +5420,25 @@ mod gpu_tests {
             let nan_count = result.iter().filter(|&&v| v.is_nan()).count();
             let zero_count = result.iter().filter(|&&v| v == 0.0).count();
             eprintln!("[acc_swap] nonzero={}, nan={}, zeros={}, max_err={:.6}", nonzero, nan_count, zero_count, max_err);
+            // T2 对拍分类器（M1c）：值→CPU 参考搜索→home/elsewhere/unmatched
+            {
+                let mut n_h = 0usize; let mut n_e = 0usize; let mut n_u = 0usize;
+                let mut samples: Vec<(usize, usize, usize, usize)> = Vec::new();
+                for (i, &v) in result.iter().enumerate() {
+                    if v.is_nan() || v == 0.0 { continue; }
+                    let (r, c) = (i / 64, i % 64);
+                    let mut hit: Option<(usize, usize)> = None;
+                    for (j, &e) in expected.iter().enumerate() {
+                        if (v - e).abs() <= 0.05 * e.abs().max(0.05) { hit = Some((j / 64, j % 64)); break; }
+                    }
+                    match hit {
+                        Some((r2, c2)) if (r2, c2) == (r, c) => n_h += 1,
+                        Some((r2, c2)) => { n_e += 1; if samples.len() < 8 { samples.push((r, c, r2, c2)); } }
+                        None => n_u += 1,
+                    }
+                }
+                eprintln!("[acc_swap][match3] home={n_h} elsewhere={n_e} unmatched={n_u} samples={samples:?}");
+            }
             // T1 分桶（2026-11-08 三假设判据）：
             //   H-wg（wave 调度依赖）：nan 集中在 n==1 的行 → 按 n 维分桶
             //   H-rb（swap/K 边界交错）：nan 按 32 行（rb）整块分布 → 按 (row/32) 分桶
