@@ -7724,8 +7724,10 @@ mod gpu_tests {
             k.label(&exit_label);
 
             // Store s_counter to output[0]
-            let addr_vlo = k.alloc_vreg();
-            let addr_vhi = k.alloc_vreg();
+            // [A 类页错误家族] 地址对须 count≥2 登记（两个独立 alloc_vreg 无相邻保证）
+            let addr_pair = k.alloc_vreg_array(2, Alignment::Align2);
+            let addr_vlo = addr_pair;
+            let addr_vhi = VReg(addr_pair.0 + 1);
             k.v_mov_from_sgpr(addr_vlo, SReg(out_ptr.0));
             k.v_mov_from_sgpr(addr_vhi, SReg(out_ptr.0 + 1));
             let val_v = k.alloc_vreg();
@@ -7811,8 +7813,10 @@ mod gpu_tests {
             k.branch_scc1(&exit_label);
 
             // Reload counter ptr from SGPR
-            let cnt_vlo = k.alloc_vreg();
-            let cnt_vhi = k.alloc_vreg();
+            // [A 类页错误家族] 地址对须 count≥2 登记（持久计数器原子读）
+            let cnt_pair = k.alloc_vreg_array(2, Alignment::Align2);
+            let cnt_vlo = cnt_pair;
+            let cnt_vhi = VReg(cnt_pair.0 + 1);
             k.v_mov_from_sgpr(cnt_vlo, SReg(counter_ptr.0));
             k.v_mov_from_sgpr(cnt_vhi, SReg(counter_ptr.0 + 1));
 
@@ -7833,16 +7837,20 @@ mod gpu_tests {
             // Store test value to counter buffer (bypass atomicAdd for debugging)
             let cnt_test_v = k.alloc_vreg();
             k.v_mov_imm(cnt_test_v, 42);
-            let cnt_addr_vlo = k.alloc_vreg();
-            let cnt_addr_vhi = k.alloc_vreg();
+            // [A 类页错误家族] 地址对须 count≥2 登记
+            let cnt_addr_pair = k.alloc_vreg_array(2, Alignment::Align2);
+            let cnt_addr_vlo = cnt_addr_pair;
+            let cnt_addr_vhi = VReg(cnt_addr_pair.0 + 1);
             k.v_mov_from_sgpr(cnt_addr_vlo, SReg(counter_ptr.0));
             k.v_mov_from_sgpr(cnt_addr_vhi, SReg(counter_ptr.0 + 1));
             k.global_store(cnt_addr_vlo, cnt_test_v, Width::B32, 0);
             k.wait_vscnt(0);
 
             // Store iter to output[iter-1]: reload out_ptr, compute byte offset
-            let addr_vlo = k.alloc_vreg();
-            let addr_vhi = k.alloc_vreg();
+            // [A 类页错误家族] 地址对须 count≥2 登记
+            let addr_pair = k.alloc_vreg_array(2, Alignment::Align2);
+            let addr_vlo = addr_pair;
+            let addr_vhi = VReg(addr_pair.0 + 1);
             k.v_mov_from_sgpr(addr_vlo, SReg(out_ptr.0));
             k.v_mov_from_sgpr(addr_vhi, SReg(out_ptr.0 + 1));
             let iter_m1_s = k.alloc_sreg();
@@ -8020,8 +8028,10 @@ mod gpu_tests {
             k.push(Op::VReadfirstlane { dst: rd_s, src: rd });
 
             // lane 0 of each wave writes rd_s to out[wave_id]
-            let o_lo = k.alloc_vreg();
-            let o_hi = k.alloc_vreg();
+            // [A 类页错误家族] 地址对须 count≥2 登记
+            let o_pair = k.alloc_vreg_array(2, Alignment::Align2);
+            let o_lo = o_pair;
+            let o_hi = VReg(o_pair.0 + 1);
             k.v_mov_from_sgpr(o_lo, SReg(out_ptr.0));
             k.v_mov_from_sgpr(o_hi, SReg(out_ptr.0 + 1));
             let wv = k.alloc_vreg();
