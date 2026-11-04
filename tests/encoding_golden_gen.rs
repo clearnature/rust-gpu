@@ -1,6 +1,11 @@
-//! 金标准生成器（临时）——产出字序列供 llvm-mc 反汇编对拍
+//! 金标准生成器——产出字序列供 llvm-mc 反汇编对拍
+//!
+//! 流程：本测试产出 `/tmp/enc_words.txt`（name|word0,word1,...）→
+//! 脚本用 /opt/rocm llvm-mc 字节流反汇编 → bake 进 tests/encoding_golden.rs。
+//! 扩展金标准锁：在本文件加 push 行（调用编码函数 + 代表性参数）→
+//! 运行本测试 → 重跑 bake 脚本。
+//!
 //! 运行：cargo test --release --features rocm --test encoding_golden_gen -- --nocapture
-//! 生成后由脚本 bake 进 tests/encoding_golden.rs，本文件删除。
 
 use t0_gpu::rdna3_asm::gfx11;
 
@@ -22,8 +27,10 @@ fn gen_golden_words() {
     push("ds_load_u16(1,2,0)", &gfx11::ds_load_u16(1, 2, 0));
     push("ds_bpermute_b32(1,2,3)", &gfx11::ds_bpermute_b32(1, 2, 3));
     push("ds_swizzle_b32(4,3,0x401F)", &gfx11::ds_swizzle_b32(4, 3, 0x401F));
+    push("ds_add_f32(2,3,0)", &gfx11::ds_add_f32(2, 3, 0));
+    push("ds_max_f32(2,3,0)", &gfx11::ds_max_f32(2, 3, 0));
 
-    // ── 转换/掩码/进位族 ──
+    // ── 掩码/进位/VOP3 族 ──
     push("v_cndmask_b32(4,1,2)", &[gfx11::v_cndmask_b32(4, 1, 2)]);
     push("v_cmp_lt_u32(1,2)", &[gfx11::v_cmp_lt_u32(1, 2)]);
     push("v_add_co_u32(3,10,1,2)", &gfx11::v_add_co_u32(3, 10, 1, 2));

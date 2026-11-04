@@ -2095,7 +2095,10 @@ pub mod gfx11 {
     /// ds_add_f32 v_addr, v_data - atomic float add to LDS
     pub fn ds_add_f32(vaddr: u8, vdata: u8, offset: u16) -> [u32; 2] {
         // DS atomic add float
-        let word0 = 0xD8580000u32 | (offset as u32);
+        // [2026-11-05 金标准修复] 旧 0xD8580000 = opcode 22 + **GDS=1**——
+        // 会打到全局数据存储而非 LDS！clang 权威：ds_add_f32 v1, v2 →
+        // [D8540000, 00000201]（opcode 21, GDS=0）。
+        let word0 = 0xD8540000u32 | (offset as u32);
         let word1 = (vaddr as u32) | ((vdata as u32) << 8);
         [word0, word1]
     }
@@ -2103,7 +2106,10 @@ pub mod gfx11 {
     /// ds_max_f32 v_addr, v_data - atomic float max to LDS
     pub fn ds_max_f32(vaddr: u8, vdata: u8, offset: u16) -> [u32; 2] {
         // DS atomic max float
-        let word0 = 0xD85A0000u32 | (offset as u32);
+        // [2026-11-05 金标准修复] 旧 0xD85A0000 = ds_add_f32 的 opcode +
+        // GDS=1（双重错误）——GFX12 汇编名 ds_max_num_f32，clang 权威：
+        // ds_max_f32 v1, v2 → [D84C0000, 00000201]（opcode 19, GDS=0）。
+        let word0 = 0xD84C0000u32 | (offset as u32);
         let word1 = (vaddr as u32) | ((vdata as u32) << 8);
         [word0, word1]
     }
