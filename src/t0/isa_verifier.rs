@@ -467,6 +467,48 @@ pub fn verify_frag_coverage(
     errors
 }
 
+/// [SMEM 合并族] 复刻 asm_emitter::optimize_smem_loads 的合并判定，
+/// 返回合并组 dst 的覆盖需求（x4→4 连、x2→2 连）。判定条件与发射器
+/// 逐一对应：同 base、dst vreg 相邻、offsets 0/4/(8/12)。
+fn smem_merge_demands(ops: &[Op]) -> Vec<(&'static str, SReg, u32)> {
+    let mut demands = Vec::new();
+    let mut i = 0;
+    while i < ops.len() {
+        if i + 3 < ops.len() {
+            if let (
+                Op::SMemLoadDword { dst: d0, offset: o0, .. },
+                Op::SMemLoadDword { dst: d1, offset: o1, .. },
+                Op::SMemLoadDword { dst: d2, offset: o2, .. },
+                Op::SMemLoadDword { dst: d3, offset: o3, .. },
+            ) = (&ops[i], &ops[i + 1], &ops[i + 2], &ops[i + 3])
+            {
+                if d0.0 + 1 == d1.0 && d0.0 + 2 == d2.0 && d0.0 + 3 == d3.0
+                    && *o0 == 0 && *o1 == 4 && *o2 == 8 && *o3 == 12
+                {
+                    demands.push(("SMemLoadDwordx4.dst", *d0, 4));
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        if i + 1 < ops.len() {
+            if let (
+                Op::SMemLoadDword { dst: d0, offset: o0, .. },
+                Op::SMemLoadDword { dst: d1, offset: o1, .. },
+            ) = (&ops[i], &ops[i + 1])
+            {
+                if d0.0 + 1 == d1.0 && *o0 == 0 && *o1 == 4 {
+                    demands.push(("SMemLoadDwordx2.dst", *d0, 2));
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    demands
+}
+
 /// [2026-11-05 SGPR 域同族检查] 多寄存器 SGPR 假设的完整性。
 /// 发射器的 SGPR 范围打印：
 ///   BufferLoad/BufferStore → `s[srsrc:srsrc+3]`（4 连描述符，被
@@ -484,6 +526,11 @@ pub fn verify_sreg_ranges(
     let sentinel_floor = super::compile::T0Kernel::KERNARG_BASE_SENTINEL - 100;
     let mut errors = Vec::new();
     let mut demands: Vec<(&'static str, SReg, u32)> = Vec::new();
+    // [2026-11-05 SMEM 合并族] 发射期 optimize_smem_loads 把连续同基
+    // SMemLoadDword 合并成 x2/x4——dst 打印 s[d:d+1]/s[d:d+3]，但合并条件
+    // 只查 **vreg 相邻**，不查物理相邻（sreg 分配跳保留号时 vreg 相邻 ≠
+    // 物理相邻），dst 覆盖也无检查。这里复刻合并判定，对合并组提出要求。
+    demands.extend(smem_merge_demands(ops));
     for op in ops {
         match op {
             Op::BufferLoad { srsrc, .. } | Op::BufferStore { srsrc, .. } => {
@@ -1084,5 +1131,62 @@ mod tests {
         ];
         let errs64 = verify_sreg_ranges(&ops64, &sallocs(&[(12, 1)]), &mk_alloc(&[]));
         assert_eq!(errs64.len(), 1, "B64 dst 仍须检查: {errs64:?}");
+    }
+
+    /// [SMEM 合并族] x4 合并组 dst 只登记 count:1 → 拦截
+    #[test]
+    fn sreg_smem_x4_dst_count1_detected() {
+        let ops = vec![
+            Op::SMemLoadDword { dst: SReg(6), base_lo: SReg(2), base_hi: SReg(3), offset: 0 },
+            Op::SMemLoadDword { dst: SReg(7), base_lo: SReg(2), base_hi: SReg(3), offset: 4 },
+            Op::SMemLoadDword { dst: SReg(8), base_lo: SReg(2), base_hi: SReg(3), offset: 8 },
+            Op::SMemLoadDword { dst: SReg(9), base_lo: SReg(2), base_hi: SReg(3), offset: 12 },
+            Op::Endpgm,
+        ];
+        let errs = verify_sreg_ranges(&ops, &sallocs(&[(6, 1), (7, 1), (8, 1), (9, 1)]), &mk_alloc(&[]));
+        assert_eq!(errs.len(), 1, "x4 合并组 dst 须 4 连覆盖: {errs:?}");
+        assert!(errs[0].contains("SMemLoadDwordx4.dst"), "报错须标明来源: {}", errs[0]);
+    }
+
+    /// [SMEM 合并族] 结构覆盖但物理跳号（sreg 分配插保留号）→ 拦截
+    #[test]
+    fn sreg_smem_x4_physical_gap_detected() {
+        let ops = vec![
+            Op::SMemLoadDword { dst: SReg(6), base_lo: SReg(2), base_hi: SReg(3), offset: 0 },
+            Op::SMemLoadDword { dst: SReg(7), base_lo: SReg(2), base_hi: SReg(3), offset: 4 },
+            Op::SMemLoadDword { dst: SReg(8), base_lo: SReg(2), base_hi: SReg(3), offset: 8 },
+            Op::SMemLoadDword { dst: SReg(9), base_lo: SReg(2), base_hi: SReg(3), offset: 12 },
+            Op::Endpgm,
+        ];
+        let mut map = HashMap::new();
+        // vreg 6..9 连续但物理 10,11,12,20——跳号
+        for (v, p) in [(6u32, 10u8), (7, 11), (8, 12), (9, 20)] {
+            map.insert(SReg(v), p);
+        }
+        let alloc = RegAlloc { vgpr_map: HashMap::new(), sgpr_map: map, total_vgprs: 255, total_sgprs: 100 };
+        let errs = verify_sreg_ranges(&ops, &sallocs(&[(6, 4)]), &alloc);
+        assert_eq!(errs.len(), 1, "vreg 相邻≠物理相邻，跳号必须被抓: {errs:?}");
+        assert!(errs[0].contains("物理不连续"), "报错须点明撕裂: {}", errs[0]);
+    }
+
+    /// [SMEM 合并族] 正常 quad + 物理连续 → 放行；不成组的单条不误报
+    #[test]
+    fn sreg_smem_normal_groups_pass() {
+        let ops = vec![
+            Op::SMemLoadDword { dst: SReg(6), base_lo: SReg(2), base_hi: SReg(3), offset: 0 },
+            Op::SMemLoadDword { dst: SReg(7), base_lo: SReg(2), base_hi: SReg(3), offset: 4 },
+            Op::SMemLoadDword { dst: SReg(8), base_lo: SReg(2), base_hi: SReg(3), offset: 8 },
+            Op::SMemLoadDword { dst: SReg(9), base_lo: SReg(2), base_hi: SReg(3), offset: 12 },
+            // 单条（offset 非 0/4 模式）不成组——dst count:1 合法
+            Op::SMemLoadDword { dst: SReg(20), base_lo: SReg(2), base_hi: SReg(3), offset: 100 },
+            Op::Endpgm,
+        ];
+        let mut map = HashMap::new();
+        for (v, p) in [(6u32, 10u8), (7, 11), (8, 12), (9, 13), (20, 14)] {
+            map.insert(SReg(v), p);
+        }
+        let alloc = RegAlloc { vgpr_map: HashMap::new(), sgpr_map: map, total_vgprs: 255, total_sgprs: 100 };
+        let errs = verify_sreg_ranges(&ops, &sallocs(&[(6, 4), (20, 1)]), &alloc);
+        assert!(errs.is_empty(), "正常 quad 与单条不应报: {errs:?}");
     }
 }
