@@ -1183,6 +1183,9 @@ impl T0Kernel {
         gate_errors.extend(super::isa_verifier::verify_frag_coverage(
             &optimized_ops, &filtered_allocs, &alloc,
         ));
+        gate_errors.extend(super::isa_verifier::verify_sreg_ranges(
+            &optimized_ops, &self.sreg_allocs, &alloc,
+        ));
         if !gate_errors.is_empty() {
             return Err(format!(
                 "寄存器完整性校验失败 for '{}'（{} 条，A 类页错误家族防线）:\n  {}",

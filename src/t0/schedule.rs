@@ -260,7 +260,14 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
     k.v_add_co(x_addr, x_addr, k_byte_off);
     k.v_add_co_ci(VReg(x_addr.0 + 1), VReg(x_addr.0 + 1));
     k.global_load(x_frag, x_addr, Width::B128, 0);
-    k.global_load(VReg(x_frag.0 + 4), x_addr, Width::B128, 16);
+    // [A 类家族·死 load 清除] GFX1200 WMMA A frag = 4 VGPR（8 bf16/lane，
+    // 每行 16 个 K 值由每行 2 个 lane 各持一半覆盖）——第二 b128（K 8..15
+    // 的同 lane 值）从不被消费，且写入 RSRC 分配外的 VGPR（越界写 UB）。
+    // GFX1100 8-VGPR frag（16 值/lane）才需要它。与 gemm_gen load_ab_hi
+    // /tile_ir 门控对齐。
+    if k.wmma_ab_frag_size() >= 8 {
+        k.global_load(VReg(x_frag.0 + 4), x_addr, Width::B128, 16);
+    }
 
     // Load WT fragments: n_tiles × 2× global_load_b128
     let wt_addr = k.alloc_vreg_array(2, Alignment::Align2);
@@ -278,7 +285,10 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
 
     for t in 0..n_tiles {
         k.global_load(wt_frags[t], wt_addr, Width::B128, 0);
-        k.global_load(VReg(wt_frags[t].0 + 4), wt_addr, Width::B128, 16);
+        // [A 类家族·死 load 清除] 同 x_frag：GFX1200 只消费前 4 VGPR
+        if k.wmma_ab_frag_size() >= 8 {
+            k.global_load(VReg(wt_frags[t].0 + 4), wt_addr, Width::B128, 16);
+        }
         if t + 1 < n_tiles {
             k.v_add_co(wt_addr, wt_addr, tile_stride);
             k.v_add_co_ci(VReg(wt_addr.0 + 1), VReg(wt_addr.0 + 1));
@@ -460,6 +470,24 @@ mod tests {
         assert!(asm.contains("s_cbranch_scc1"));
         assert!(asm.contains("s_mov_b32"));  // TGID capture
         eprintln!("--- GEMM Forward (T0-mid) ---\n{}", asm);
+    }
+
+    /// [A 类家族·死 load 清除回归锁] GFX1200 上 frag 第二 b128（offset:16）
+    /// 从不被 WMMA 消费且写 RSRC 分配外的 VGPR——必须被门控清除
+    #[test]
+    fn test_gemm_forward_no_dead_second_frag_load_on_gfx1200() {
+        let sched = GFX1100Schedule;
+        let kernel = build_gemm_forward(&sched);
+        let asm = kernel.to_assembly(Target::detect()).unwrap();
+        let dead = asm.lines()
+            .filter(|l| l.contains("global_load_b128") && l.contains("offset:16"))
+            .count();
+        assert_eq!(dead, 0,
+            "GFX1200 不应发射 frag 第二 b128 load（死代码 + 越界写 UB）:\n{}",
+            asm.lines().filter(|l| l.contains("global_load_b128")).take(4).collect::<Vec<_>>().join("\n"));
+        // 前半 load 仍在（每 WMMA tile 1 条 X + n_tiles 条 WT）
+        let first_half = asm.lines().filter(|l| l.contains("global_load_b128")).count();
+        assert!(first_half > 0, "frag 前半 load 不应被误杀");
     }
 
     #[cfg(feature = "rocm")]

@@ -421,12 +421,13 @@ fn test_e2e_buffer_load() {
 fn test_e2e_smem_all_widths() {
     compile_and_check("smem_widths", |k| {
         let base = k.alloc_sreg_pair();
+        // [A 类家族·SGPR 域] 标量 dst 宽度族须登记：B64=2、B128=4
         let d32 = k.alloc_sreg();
-        let d64 = k.alloc_sreg();
-        let d128 = k.alloc_sreg();
+        let d64 = k.alloc_sreg_pair();
+        let d128 = k.alloc_sreg_quad();
         k.scalar_load(d32, base, 0, Width::B32);
-        k.scalar_load(d64, base, 8, Width::B64);
-        k.scalar_load(d128, base, 16, Width::B128);
+        k.scalar_load(SReg(d64.0), base, 8, Width::B64);
+        k.scalar_load(SReg(d128.0), base, 16, Width::B128);
         k.endpgm();
     }, &[
         "s_load_b32",

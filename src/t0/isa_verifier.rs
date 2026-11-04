@@ -9,7 +9,7 @@
 //! Runs automatically during T0Kernel::compile() when `KFD_VERIFY=1` or debug_assertions.
 //! Zero cost in release builds unless opted in.
 
-use super::ir::{Op, VReg, WmmaFormat};
+use super::ir::{Op, SReg, VReg, WmmaFormat};
 
 /// Verification result
 #[derive(Debug)]
@@ -467,6 +467,83 @@ pub fn verify_frag_coverage(
     errors
 }
 
+/// [2026-11-05 SGPR 域同族检查] 多寄存器 SGPR 假设的完整性。
+/// 发射器的 SGPR 范围打印：
+///   BufferLoad/BufferStore → `s[srsrc:srsrc+3]`（4 连描述符，被
+///     s_load_b128 dst 语义填充——与地址对同构，两段都要保证）
+///   ScalarLoad → base `s[sb:sb+1]`（64 位基址对；KERNARG_BASE_SENTINEL
+///     硬件 s[0:1] 豁免）+ dst `sreg_range_str(sd, width.vreg_count())`
+/// SGPR 是构建期静态分配（无 spill/fallback），故物理连续**必查**；
+/// 结构层抓 count:1 裸配对（与 VGPR 地址对同款错法）。
+pub fn verify_sreg_ranges(
+    ops: &[Op],
+    sreg_allocs: &[super::ir::SRegAlloc],
+    alloc: &super::regalloc::RegAlloc,
+) -> Vec<String> {
+    use super::ir::Width;
+    let sentinel_floor = super::compile::T0Kernel::KERNARG_BASE_SENTINEL - 100;
+    let mut errors = Vec::new();
+    let mut demands: Vec<(&'static str, SReg, u32)> = Vec::new();
+    for op in ops {
+        match op {
+            Op::BufferLoad { srsrc, .. } | Op::BufferStore { srsrc, .. } => {
+                demands.push(("srsrc", *srsrc, 4));
+            }
+            Op::ScalarLoad { dst, base, width, .. } => {
+                if base.0 < sentinel_floor {
+                    demands.push(("ScalarLoad.base", SReg(base.0), 2));
+                }
+                let need = width.vreg_count();
+                if need > 1 {
+                    demands.push(("ScalarLoad.dst", *dst, need));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (what, s, need) in demands {
+        // 结构层：须存在覆盖 [s, s+need) 的 SGPR 分配
+        let covered = sreg_allocs.iter().any(|sa| {
+            sa.sreg.0 <= s.0 && s.0 + need <= sa.sreg.0 + sa.count
+        });
+        if !covered {
+            errors.push(format!(
+                "{what}=SReg({}) 需要 {need} 连续 SGPR 但无 count≥{need} 分配覆盖 \
+                 （发射器按 s[s:s+{}] 打印）——须用 alloc_sreg_pair()/alloc_sreg_quad() 登记",
+                s.0,
+                need - 1
+            ));
+            continue;
+        }
+        // 物理层：SGPR 静态分配——映射必须齐全且严格连续
+        let mut phys = Vec::with_capacity(need as usize);
+        for i in 0..need {
+            match alloc.sgpr_map.get(&SReg(s.0 + i)) {
+                Some(&p) => phys.push(p),
+                None => {
+                    errors.push(format!(
+                        "{what}=SReg({}) 需求范围含未映射 SGPR SReg({})（分配器缺口）",
+                        s.0,
+                        s.0 + i
+                    ));
+                    phys.clear();
+                    break;
+                }
+            }
+        }
+        if phys.is_empty() {
+            continue;
+        }
+        if !phys.windows(2).all(|w| w[1] == w[0] + 1) {
+            errors.push(format!(
+                "{what}=SReg({}) 物理不连续 {:?}（需 {need} 连续）—— SGPR 分配器撕裂",
+                s.0, phys
+            ));
+        }
+    }
+    errors
+}
+
 /// Run verification and dump Op listing for debugging.
 /// Activate with `T0_VERIFY_DUMP=1` environment variable.
 pub fn verify_and_dump(ops: &[Op], kernel_name: &str) -> VerifyResult {
@@ -901,5 +978,111 @@ mod tests {
             &mk_alloc(&[(4, 80), (5, 81), (7, 90), (2, 40)]),
         );
         assert_eq!(errs2.len(), 1, "组语义破坏（90≠80+3）必须被抓: {errs2:?}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SGPR 域多寄存器假设单元测试（verify_sreg_ranges）
+    // ═══════════════════════════════════════════════════════════════
+
+    use super::super::ir::{SRegAlloc, SReg, SRegPair, Width as SWidth};
+
+    fn sallocs(spec: &[(u32, u32)]) -> Vec<SRegAlloc> {
+        spec.iter()
+            .map(|&(s, c)| SRegAlloc {
+                sreg: SReg(s),
+                count: c,
+                alignment: if c >= 4 {
+                    Alignment::Align4
+                } else if c >= 2 {
+                    Alignment::Align2
+                } else {
+                    Alignment::None
+                },
+            })
+            .collect()
+    }
+
+    /// BufferLoad srsrc 用 count:1 → 结构拦截
+    #[test]
+    fn sreg_srsrc_count1_detected() {
+        let ops = vec![
+            Op::BufferLoad { dst: VReg(4), voffset: VReg(0), srsrc: SReg(6), width: SWidth::B32, offset: 0, soffset: SReg(20) },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_sreg_ranges(&ops, &sallocs(&[(6, 1), (20, 1)]), &mk_alloc(&[]));
+        assert_eq!(errs.len(), 1, "count:1 srsrc 必须被抓: {errs:?}");
+        assert!(errs[0].contains("alloc_sreg_quad"), "报错须给修复指引: {}", errs[0]);
+    }
+
+    /// 正确登记 quad + 物理连续 → 放行
+    #[test]
+    fn sreg_srsrc_proper_quad_passes() {
+        let ops = vec![
+            Op::BufferLoad { dst: VReg(4), voffset: VReg(0), srsrc: SReg(6), width: SWidth::B32, offset: 0, soffset: SReg(20) },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        let mut map = HashMap::new();
+        for (v, p) in [(6u32, 8u8), (7, 9), (8, 10), (9, 11), (20, 12), (0, 0)] {
+            map.insert(SReg(v), p);
+        }
+        let alloc = RegAlloc { vgpr_map: HashMap::new(), sgpr_map: map, total_vgprs: 255, total_sgprs: 100 };
+        let errs = verify_sreg_ranges(&ops, &sallocs(&[(6, 4), (20, 1)]), &alloc);
+        assert!(errs.is_empty(), "合法 quad 不应报: {errs:?}");
+    }
+
+    /// 结构覆盖但物理撕裂（SGPR 静态分配，物理必查）→ 必须爆
+    #[test]
+    fn sreg_srsrc_physical_tear_detected() {
+        let ops = vec![
+            Op::BufferLoad { dst: VReg(4), voffset: VReg(0), srsrc: SReg(6), width: SWidth::B32, offset: 0, soffset: SReg(20) },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        let mut map = HashMap::new();
+        for (v, p) in [(6u32, 8u8), (7, 9), (8, 10), (9, 20), (20, 12)] {
+            map.insert(SReg(v), p);
+        }
+        let alloc = RegAlloc { vgpr_map: HashMap::new(), sgpr_map: map, total_vgprs: 255, total_sgprs: 100 };
+        let errs = verify_sreg_ranges(&ops, &sallocs(&[(6, 4), (20, 1)]), &alloc);
+        assert_eq!(errs.len(), 1, "SGPR 撕裂必须被抓: {errs:?}");
+        assert!(errs[0].contains("物理不连续"), "报错须点明撕裂: {}", errs[0]);
+    }
+
+    /// ScalarLoad base 用 count:1 对 → 拦截；B128 dst count:1 → 拦截
+    #[test]
+    fn sreg_scalarload_pair_and_dst_detected() {
+        let ops = vec![
+            Op::ScalarLoad { dst: SReg(12), base: SRegPair(6), offset: 0, width: SWidth::B128 },
+            Op::WaitLgkmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_sreg_ranges(&ops, &sallocs(&[(6, 1), (12, 1)]), &mk_alloc(&[]));
+        assert_eq!(errs.len(), 2, "base 对与 B128 dst 都必须被抓: {errs:?}");
+        assert!(errs.iter().any(|e| e.contains("ScalarLoad.base")), "base 对: {errs:?}");
+        assert!(errs.iter().any(|e| e.contains("ScalarLoad.dst")), "dst 宽度: {errs:?}");
+    }
+
+    /// KERNARG_BASE_SENTINEL base（硬件 s[0:1]）豁免，dst 正常检查
+    #[test]
+    fn sreg_sentinel_base_exempt() {
+        let sentinel = super::super::compile::T0Kernel::KERNARG_BASE_SENTINEL;
+        let ops = vec![
+            Op::ScalarLoad { dst: SReg(12), base: SRegPair(sentinel), offset: 0, width: SWidth::B32 },
+            Op::WaitLgkmcnt(0),
+            Op::Endpgm,
+        ];
+        // dst B32 单寄存器不查；sentinel base 不查 → 0 条
+        let errs = verify_sreg_ranges(&ops, &sallocs(&[(12, 1)]), &mk_alloc(&[]));
+        assert!(errs.is_empty(), "sentinel base 须豁免: {errs:?}");
+        // 对照：B64 dst 未登记 → 1 条
+        let ops64 = vec![
+            Op::ScalarLoad { dst: SReg(12), base: SRegPair(sentinel), offset: 0, width: SWidth::B64 },
+            Op::WaitLgkmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs64 = verify_sreg_ranges(&ops64, &sallocs(&[(12, 1)]), &mk_alloc(&[]));
+        assert_eq!(errs64.len(), 1, "B64 dst 仍须检查: {errs64:?}");
     }
 }
