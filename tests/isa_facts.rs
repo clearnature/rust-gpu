@@ -220,6 +220,33 @@ fn kernarg_builder_matches_kernel_declaration() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// 组 5b：厂家规格核算锁 [RX 9060 XT 官方规格 @3130MHz]
+//   WMMA 吞吐 32 cycles/条（FP16 f32_16x16x16 = 8192 FLOP）→ 103.6 TF
+//   数据宽度减半吞吐翻倍：FP8/INT8=2×FP16=205，INT4/稀疏=4×=410/821
+#[test]
+fn vendor_spec_tflops_self_consistent() {
+    let simd: u64 = 128;                 // 32 CU × 4
+    let clk: u64 = 3130 * 1_000_000;     // boost MHz
+    let wmma_flop: u64 = 16 * 16 * 16 * 2; // 8192
+    // 厂家标称反推吞吐周期（103 为取整标称：精确值 31.9 ≈ 32）
+    let fp16_cyc = simd * wmma_flop * clk / (103 * 1_000_000_000_000);
+    assert!((31..=32).contains(&fp16_cyc),
+        "FP16 矩阵标称 ↔ ~32 cycles/WMMA @3130MHz，实测 {fp16_cyc}");
+    // 宽度减半吞吐翻倍规律：FP8/INT8 标称 205 TF → cycles = FP16 的一半（±2）
+    let fp8_cyc = simd * wmma_flop * clk / (205 * 1_000_000_000_000);
+    let int4_cyc = simd * wmma_flop * clk / (410 * 1_000_000_000_000);
+    assert!((14..=18).contains(&fp8_cyc), "FP8 cycles 应为 FP16 的一半（≈16），实测 {fp8_cyc}");
+    assert!((7..=9).contains(&int4_cyc), "INT4 cycles 应为 FP16 的 1/4（≈8），实测 {int4_cyc}");
+    assert!((fp8_cyc * 2 - 1..=fp8_cyc * 2 + 1).contains(&fp16_cyc),
+        "FP8 = 2×FP16 吞吐（fp16={fp16_cyc} fp8={fp8_cyc}，取整边界）");
+    assert!((int4_cyc * 2 - 1..=int4_cyc * 2 + 1).contains(&fp8_cyc),
+        "INT4 = 2×FP8（fp8={fp8_cyc} int4={int4_cyc}）");
+    // 正向核算：32 cyc 吞吐 → 103.6 TF（厂家标称 103 取整）
+    let tf_at_32cyc = simd * wmma_flop * clk / 32 / 1_000_000_000_000;
+    assert!((102..=104).contains(&tf_at_32cyc), "32cyc 吞吐核算 = {tf_at_32cyc} TF（标称 103 取整）");
+}
+
+// ═══════════════════════════════════════════════════════════════
 // 组 6：ELF/CodeObject 事实 [ROCm 工具链兼容]
 //   HSACO 必须含 NT_AMD note 的 target 描述符（.amdgpu_metadata 生成）——
 //   KFD 裸加载不读 note，但 ROCr/rocprof 等标准工具链需要。
