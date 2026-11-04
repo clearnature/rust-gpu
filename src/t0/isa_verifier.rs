@@ -378,6 +378,95 @@ pub fn verify_addr_pairs(
     errors
 }
 
+/// [2026-11-04 A 类家族的姊妹缺口] 多寄存器 dst 完整性检查。
+/// 发射器对宽 dst 同样按 `v[d:d+n-1]` 打印（vreg_range_str）：
+///   GlobalLoad/BufferLoad → width.vreg_count()（B64=2、B128=4）
+///   DsLoadB64 → 2、DsLoadB128 → 4
+///   Wmma → a/b 各 ab_width、dst/c 各 8
+/// dst 落在 count 不足的分配里（或物理断裂）与地址对撕裂同族——
+/// 编译期爆出来，不打到硬件上。
+pub fn verify_frag_coverage(
+    ops: &[Op],
+    vreg_allocs: &[super::ir::VRegAlloc],
+    alloc: &super::regalloc::RegAlloc,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    // (op 描述, dst, 需要的连续 VGPR 数)
+    let mut demands: Vec<(&'static str, VReg, u32)> = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let _ = i;
+        match op {
+            Op::GlobalLoad { dst, width, .. } => {
+                demands.push(("GlobalLoad", *dst, width.vreg_count()))
+            }
+            Op::BufferLoad { dst, width, .. } => {
+                demands.push(("BufferLoad", *dst, width.vreg_count()))
+            }
+            Op::DsLoadB64 { dst, .. } => demands.push(("DsLoadB64", *dst, 2)),
+            Op::DsLoadB128 { dst, .. } => demands.push(("DsLoadB128", *dst, 4)),
+            Op::Wmma { a, b, dst, ab_width, .. } => {
+                let w = *ab_width as u32;
+                demands.push(("Wmma.a", *a, w));
+                demands.push(("Wmma.b", *b, w));
+                demands.push(("Wmma.dst", *dst, 8));
+            }
+            _ => {}
+        }
+    }
+    for (what, dst, need) in demands {
+        if need <= 1 {
+            continue; // 单寄存器 dst 无连续性要求
+        }
+        // 结构层：必须存在覆盖 [dst, dst+need) 的分配
+        let covered = vreg_allocs.iter().any(|va| {
+            va.vreg.0 <= dst.0 && dst.0 + need <= va.vreg.0 + va.count
+        });
+        if !covered {
+            errors.push(format!(
+                "{what} dst=VReg({}) 需要 {need} 连续 VGPR 但无 count≥{need} 分配覆盖 \
+                 （发射器按 v[d:d+{}] 打印）——须用 alloc_vreg_array({need}, …) 登记",
+                dst.0,
+                need - 1
+            ));
+            continue;
+        }
+        // 物理层：跨需求范围连续。
+        // [语义区分] dst 范围与地址对不同：发射器对 dst 只读 map[base] 并算术
+        // 打印 v[base:base+n-1]——成员 vreg 的 map 条目不被发射器消费。死定义
+        // 成员（如 GFX1200 上 WMMA 不读的 frag 后半，GFX1100 遗留死 load）经
+        // to_legacy_regalloc fallback 全别名到同一 scratch——这是无害痕迹，放行。
+        // 地址对的半是语义消费的（v_add_co_ci 写到 map[a+1] 指向的物理寄存器），
+        // 半落 fallback = 高半算到别处 = 野地址——那边必须严格（verify_addr_pairs）。
+        let mut mapped: Vec<(u32, u8)> = Vec::new(); // (offset i, phys)
+        for i in 0..need {
+            if let Some(&p) = alloc.vgpr_map.get(&VReg(dst.0 + i)) {
+                mapped.push((i, p));
+            }
+        }
+        if mapped.len() < 2 {
+            continue; // 全未映射或单点：结构性检查已把关；死范围发射无害
+        }
+        // fallback 签名：任意两成员同物理 = fallback scratch 别名（死范围痕迹）→ 放行
+        let has_duplicate = (0..mapped.len())
+            .any(|a| mapped[a + 1..].iter().any(|(_, p)| *p == mapped[a].1));
+        if has_duplicate {
+            continue;
+        }
+        // 组一致：每个已映射成员须落在 min_phys + (i - min_i)（组分配 base+gidx 语义）
+        let (min_i, min_p) = mapped[0];
+        let torn = mapped.iter().any(|&(i, p)| p != min_p + (i - min_i) as u8);
+        if torn {
+            let phys_list: Vec<u8> = mapped.iter().map(|&(_, p)| p).collect();
+            errors.push(format!(
+                "{what} dst=VReg({}) 已映射成员物理撕裂 {:?}（组语义 base+i 不成立）\
+                 —— spill 撕裂多寄存器 frag（全同值 fallback 痕迹已放行，互异跳变=真撕裂）",
+                dst.0, phys_list
+            ));
+        }
+    }
+    errors
+}
+
 /// Run verification and dump Op listing for debugging.
 /// Activate with `T0_VERIFY_DUMP=1` environment variable.
 pub fn verify_and_dump(ops: &[Op], kernel_name: &str) -> VerifyResult {
@@ -681,5 +770,136 @@ mod tests {
         ];
         let errs = verify_addr_pairs(&ops, &allocs(&[]), &mk_alloc(&[]));
         assert!(errs.is_empty(), "DS 单 VGPR 寻址不是 64 位地址对，不应报: {errs:?}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 多寄存器 dst 覆盖（frag coverage）单元测试
+    // ═══════════════════════════════════════════════════════════════
+
+    /// B128 load dst 只登记 count:1 → 必须爆（姊妹家族经典错法）
+    #[test]
+    fn frag_coverage_b128_on_count1_detected() {
+        let ops = vec![
+            Op::GlobalLoad { dst: VReg(4), addr: VReg(8), width: Width::B128, offset: 0 },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_frag_coverage(
+            &ops,
+            &allocs(&[(4, 1), (8, 2)]),
+            &mk_alloc(&[(4, 10), (8, 20), (9, 21)]),
+        );
+        assert_eq!(errs.len(), 1, "B128 dst on count:1 必须被抓: {errs:?}");
+        assert!(errs[0].contains("count≥4"), "报错须点明需求: {}", errs[0]);
+    }
+
+    /// B128 dst 由 count≥4 分配覆盖 + 物理连续 → 通过
+    #[test]
+    fn frag_coverage_b128_proper_alloc_passes() {
+        let ops = vec![
+            Op::GlobalLoad { dst: VReg(4), addr: VReg(8), width: Width::B128, offset: 0 },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_frag_coverage(
+            &ops,
+            &allocs(&[(4, 4), (8, 2)]),
+            &mk_alloc(&[(4, 10), (5, 11), (6, 12), (7, 13), (8, 20), (9, 21)]),
+        );
+        assert!(errs.is_empty(), "合法 B128 dst 不应报: {errs:?}");
+    }
+
+    /// 结构覆盖但物理断裂（spill 撕裂 frag）→ 必须爆
+    #[test]
+    fn frag_coverage_physical_gap_detected() {
+        let ops = vec![
+            Op::DsLoadB128 { dst: VReg(4), vaddr: VReg(2), offset: 0 },
+            Op::Endpgm,
+        ];
+        let errs = verify_frag_coverage(
+            &ops,
+            &allocs(&[(4, 4)]),
+            &mk_alloc(&[(4, 10), (5, 11), (6, 12), (7, 20)]),
+        );
+        assert_eq!(errs.len(), 1, "物理断裂必须被抓: {errs:?}");
+        assert!(errs[0].contains("物理撕裂"), "报错须点明撕裂: {}", errs[0]);
+    }
+
+    /// 大数组中的子范围 B64 load：覆盖判定按需求范围算（正确用法不误报）
+    #[test]
+    fn frag_coverage_subrange_of_larger_array_passes() {
+        let ops = vec![
+            Op::GlobalLoad { dst: VReg(5), addr: VReg(12), width: Width::B64, offset: 0 },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        // x_frags 是 8 寄存器数组，B64 落在其中 [5,7)——合法
+        let errs = verify_frag_coverage(
+            &ops,
+            &allocs(&[(4, 8), (12, 2)]),
+            &mk_alloc(&[(4, 10), (5, 11), (6, 12), (7, 13), (8, 14), (9, 15), (10, 16), (11, 17), (12, 20), (13, 21)]),
+        );
+        assert!(errs.is_empty(), "大数组的子范围 load 不应报: {errs:?}");
+    }
+
+    /// WMMA：a/b 按 ab_width、dst 按 8 检查
+    #[test]
+    fn frag_coverage_wmma_ab_and_dst() {
+        let ops = vec![
+            Op::Wmma {
+                dst: VReg(20), a: VReg(4), b: VReg(8), c: VReg(20),
+                format: WmmaFormat::BF16_F32, ab_width: 4, sparse_idx: None,
+            },
+            Op::Endpgm,
+        ];
+        // a/b 有 4 覆盖；dst 有 8 覆盖但成员 3 物理撕裂（40 ≠ 30+3）→ 1 条错
+        let errs = verify_frag_coverage(
+            &ops,
+            &allocs(&[(4, 4), (8, 4), (20, 8)]),
+            &mk_alloc(&[(4, 10), (5, 11), (6, 12), (7, 13), (8, 14), (9, 15), (10, 16), (11, 17),
+                        (20, 30), (21, 31), (22, 32), (23, 40), (24, 34), (25, 35), (26, 36), (27, 37)]),
+        );
+        assert_eq!(errs.len(), 1, "WMMA dst 撕裂须被抓: {errs:?}");
+        assert!(errs[0].contains("Wmma.dst"), "报错须标明来源: {}", errs[0]);
+    }
+
+    /// [fallback 痕迹放行] 死范围的 fallback 全别名签名（全同值）→ 不报
+    /// （GFX1200 上 WMMA 不读 frag 后半——GFX1100 遗留死 load 的 dst 属此类）
+    #[test]
+    fn frag_coverage_fallback_signature_passes() {
+        let ops = vec![
+            Op::GlobalLoad { dst: VReg(47), addr: VReg(90), width: Width::B128, offset: 16 },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_frag_coverage(
+            &ops,
+            &allocs(&[(47, 4), (90, 2)]),
+            &mk_alloc(&[(47, 80), (48, 80), (49, 80), (50, 80), (90, 20), (91, 21)]),
+        );
+        assert!(errs.is_empty(), "fallback 全别名痕迹（死范围）不应报: {errs:?}");
+    }
+
+    /// [组一致] 已映射成员须满足 base+i 组语义：部分映射时按相对位置判
+    #[test]
+    fn frag_coverage_partial_mapped_group_semantics() {
+        let ops = vec![
+            Op::DsLoadB128 { dst: VReg(4), vaddr: VReg(2), offset: 0 },
+            Op::Endpgm,
+        ];
+        // 成员 0,1,3 映射 [80,81,83]，成员 2 未映射（死）——83 == 80+3 ✓ 组一致 → 放行
+        let errs = verify_frag_coverage(
+            &ops,
+            &allocs(&[(4, 4)]),
+            &mk_alloc(&[(4, 80), (5, 81), (7, 83), (2, 40)]),
+        );
+        assert!(errs.is_empty(), "组一致的部分映射不应报: {errs:?}");
+        // 对照：成员 3 在 90（≠80+3）→ 撕裂
+        let errs2 = verify_frag_coverage(
+            &ops,
+            &allocs(&[(4, 4)]),
+            &mk_alloc(&[(4, 80), (5, 81), (7, 90), (2, 40)]),
+        );
+        assert_eq!(errs2.len(), 1, "组语义破坏（90≠80+3）必须被抓: {errs2:?}");
     }
 }

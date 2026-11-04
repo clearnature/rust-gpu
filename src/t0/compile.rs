@@ -1175,16 +1175,20 @@ impl T0Kernel {
 
         // [2026-11-04 A 类页错误家族 · 25 事件/169 页] 地址对完整性门禁：
         // 发射器强制 v[a:a+1]（asm_emitter），分配侧必须结构性保证 count≥2 + 物理相邻。
+        // 姊妹检查：多寄存器 dst（B64/B128/DsLoad/Wmma frag）同样须 count 覆盖 + 物理连续。
         // 违规 = 编译失败（编译期爆出来，不打到硬件上整卡复位）。
-        let addr_pair_errors = super::isa_verifier::verify_addr_pairs(
+        let mut gate_errors = super::isa_verifier::verify_addr_pairs(
             &optimized_ops, &filtered_allocs, &alloc,
         );
-        if !addr_pair_errors.is_empty() {
+        gate_errors.extend(super::isa_verifier::verify_frag_coverage(
+            &optimized_ops, &filtered_allocs, &alloc,
+        ));
+        if !gate_errors.is_empty() {
             return Err(format!(
-                "地址对完整性校验失败 for '{}'（{} 条，A 类页错误家族防线）:\n  {}",
+                "寄存器完整性校验失败 for '{}'（{} 条，A 类页错误家族防线）:\n  {}",
                 self.name,
-                addr_pair_errors.len(),
-                addr_pair_errors.join("\n  ")
+                gate_errors.len(),
+                gate_errors.join("\n  ")
             ));
         }
 

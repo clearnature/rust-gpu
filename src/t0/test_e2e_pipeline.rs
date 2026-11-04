@@ -141,11 +141,15 @@ fn test_e2e_lds_load_store() {
 #[test]
 fn test_e2e_wmma() {
     compile_and_check("wmma_test", |k| {
+        // [A 类家族] WMMA frag 须登记：a/b 按 ab_width(4)、dst/c 按 8
+        let a = k.alloc_vreg_array(4, Alignment::Align4);
+        let b = k.alloc_vreg_array(4, Alignment::Align4);
+        let d = k.alloc_vreg_array(8, Alignment::Align8);
         k.push(Op::Wmma {
-            dst: VReg(8),
-            a: VReg(112),
-            b: VReg(128),
-            c: VReg(8),
+            dst: d,
+            a,
+            b,
+            c: d,
             format: WmmaFormat::BF16_F32,
             ab_width: 4, // GFX1200: 4 VGPRs for A/B fragments
             sparse_idx: None,
@@ -400,7 +404,8 @@ fn test_e2e_compile_to_elf_gfx1200() {
 fn test_e2e_buffer_load() {
     compile_and_check("buffer_test", |k| {
         let srsrc = k.alloc_sreg_quad();
-        k.buffer_load(VReg(1), VReg(0), srsrc, Width::B128, 0);
+        let dst = k.alloc_vreg_array(4, Alignment::Align4); // [A 类家族] B128 dst 须 count≥4
+        k.buffer_load(dst, VReg(0), srsrc, Width::B128, 0);
         k.wait_vmcnt(0);
         k.endpgm();
     }, &[

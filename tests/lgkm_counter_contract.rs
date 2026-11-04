@@ -25,10 +25,11 @@ use t0_gpu::t0::ir::{Target, VReg, Width};
 fn c1_wait_zero_never_elided_in_swap_context() {
     let mut k = T0Kernel::new("lgkm_swap_ctx");
     // 模拟 acc_swap 的最小序列：ds_store → wait(0) → ds_load → wait(0)
-    let va = k.alloc_vreg();
+    // [A 类家族] B128 数据须 count≥4 分配（DsLoadB128 dst/DsStoreB128 src 按 v[s:s+3] 发射）
+    let va = k.alloc_vreg(); // LDS 单 VGPR 寻址，无范围要求
     k.v_mov_imm(va, 0);
-    let v = k.alloc_vreg();
-    k.v_mov_imm(v, 1);
+    let v = k.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
+    for i in 0..4 { k.v_mov_imm(VReg(v.0 + i), 1); }
     k.ds_store_b128(va, v, 0);
     k.wait_lgkmcnt(0);
     k.ds_load_b128(v, va, 0);
@@ -105,7 +106,8 @@ fn c3_wait_in_branch_does_not_leak_shadow() {
     });
     k.label(&skip);
     // 分支外：ds_load → wait_lgkmcnt(0)——此 wait 必须发射（不 elide）
-    let tmp = k.alloc_vreg();
+    // [A 类家族] B128 dst 须 count≥4 分配
+    let tmp = k.alloc_vreg_array(4, t0_gpu::t0::ir::Alignment::Align4);
     k.ds_load_b128(tmp, va, 0);
     k.wait_lgkmcnt(0);
     k.endpgm();

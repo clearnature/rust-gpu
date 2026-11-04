@@ -95,7 +95,11 @@ fn gfx1200_vmem_form_is_global_not_flat() {
 #[test]
 fn gfx1200_atomic_rtn_uses_th_field() {
     let mut k = T0Kernel::new("isa_atomic_rtn");
-    k.push(Op::GlobalAtomicAddU32Rtn { dst: VReg(4), addr: VReg(0), src: VReg(2) });
+    // [A 类家族] 地址对登记 count≥2 并定义两半
+    let addr = k.alloc_vreg_array(2, t0_gpu::t0::ir::Alignment::Align2);
+    k.v_mov_imm(addr, 0);
+    k.v_mov_imm(VReg(addr.0 + 1), 0);
+    k.push(Op::GlobalAtomicAddU32Rtn { dst: VReg(4), addr, src: VReg(2) });
     k.endpgm();
     let asm = k.to_assembly(Target::GFX1200).expect("asm");
     assert!(asm.contains("th:TH_ATOMIC_RETURN"), "原子返回必须带 th 字段:\n{asm}");
@@ -281,7 +285,11 @@ fn gfx1100_uses_unified_waitcnt_and_global_vmem() {
 #[test]
 fn gfx1100_atomic_rtn_uses_glc() {
     let mut k = T0Kernel::new("isa_atomic_glc");
-    k.push(Op::GlobalAtomicAddU32Rtn { dst: VReg(4), addr: VReg(0), src: VReg(2) });
+    // [A 类家族] 地址对登记 count≥2 并定义两半
+    let addr = k.alloc_vreg_array(2, t0_gpu::t0::ir::Alignment::Align2);
+    k.v_mov_imm(addr, 0);
+    k.v_mov_imm(VReg(addr.0 + 1), 0);
+    k.push(Op::GlobalAtomicAddU32Rtn { dst: VReg(4), addr, src: VReg(2) });
     k.endpgm();
     let asm = k.to_assembly(Target::GFX1100).expect("asm");
     assert!(asm.contains(" glc"), "GFX1100 原子返回必须用 glc:\n{asm}");
