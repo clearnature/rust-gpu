@@ -693,8 +693,11 @@ pub fn allocate_ssa(
 
                 // Find the active interval with the farthest last_use.
                 // If it's farther than the current interval, spill it instead.
+                // 2026-11-08 P0-A 回退：group_id.is_none() 过滤使小内核 spill 路径
+                // panic（所有 active 都是 groups，无非 group 候选）→ 回退原始 filter。
+                // P0-A 改进（组分片不被 spill）留为未来项，需同步实现组级 spill/reload。
                 if let Some(spill_pos) = active.iter().enumerate()
-                    .filter(|(_, a)| a.count == 1) // only spill non-group scalars for safety
+                    .filter(|(_, a)| a.count == 1)
                     .max_by_key(|(_, a)| a.last_use)
                     .map(|(i, _)| i)
                 {

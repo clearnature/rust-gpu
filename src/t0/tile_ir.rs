@@ -3882,48 +3882,44 @@ fn emit_acc_swap(
     // offset = rb * (n_col_tiles * 32) + col * 32
     let load_base = (target_rb as u16) * (n_col_tiles as u16) * 32;
     let store_base = (current_rb as u16) * (n_col_tiles as u16) * 32;
-    for c in 0..n_col_tiles {
-        let load_off = load_base + (c as u16) * 32;
-        let store_off = store_base + (c as u16) * 32;
-        // 2026-11-08 去 temp 化（acc_swap H2，勘探单 top 修法）：
-        // 旧路径 load→temp + 8×v_mov + store——v_mov 链是 regalloc 身份断裂的
-        // 温床（8/26 旧案：acc[0] 物理寄存器被 v_mov 覆盖；探针实证"WMMA 输入
-        // frag=0 但 acc 输出 NaN"= 同一机制）。直达搬运绕开整个 bug 类：
-        //   ds_store acc → LDS[cur]；wait；ds_load acc ← LDS[target]
-        // WMMA acc 是 read-modify-write（dst=c 同寄存器），ds_load 直写 acc[c]
-        // 语义不变；省 8 条 v_mov/swap + temp VGPR 组（8 个）释放分配压力。
-        // T0_SWAP_TEMP=1 恢复旧 temp 路径（对照开关）。
-        if std::env::var("T0_SWAP_TEMP").is_ok() {
-            // 旧路径：load→temp → store acc → v_mov temp→acc
-            k.ds_load_b128(temp, swap_addr, load_off);
-            k.ds_load_b128(VReg(temp.0 + 4), swap_addr, load_off + 16);
-            k.wait_lgkmcnt(0);
+
+    // 2026-11-08 P0-B（Agent B 判别：XDL 取 C 操作数与 LGKM 回写的时序窗口）：
+    // 旧逐列交错模式（store col0 → load col0 → store col1 → load col1...）中，
+    // ds_load 的 VGPR 写回与下一条 WMMA 的 C 操作数读取存在时序窗口——
+    // s_wait_dscnt 0 可能未覆盖 GFX1200 的 DS→XDL 数据转发路径。
+    // 改为 **bulk 式**（全部 store → 全排空 → 全部 load → 全排空），
+    // 确保 LGKM 回写完全结束后才发起读取。T0_SWAP_INTERLEAVE=1 恢复旧模式。
+    let bulk = std::env::var("T0_SWAP_INTERLEAVE").is_err();
+
+    if bulk {
+        // ── Bulk 式：全部 store → 全排空 → 全部 load → 全排空 ──
+        // 阶段 1：所有列的 ds_store（保存当前 acc 到 current_rb 槽）
+        for c in 0..n_col_tiles {
+            let store_off = store_base + (c as u16) * 32;
+            k.ds_store_b128(swap_addr, acc[c], store_off);
+            k.ds_store_b128(swap_addr, VReg(acc[c].0 + 4), store_off + 16);
+        }
+        // 阶段 2：全排空——确保所有 DS store 落地
+        k.wait_lgkmcnt(0);
+        // 阶段 3：所有列的 ds_load（读取 target_rb 槽的 acc）
+        for c in 0..n_col_tiles {
+            let load_off = load_base + (c as u16) * 32;
+            k.ds_load_b128(acc[c], swap_addr, load_off);
+            k.ds_load_b128(VReg(acc[c].0 + 4), swap_addr, load_off + 16);
+        }
+        // 阶段 4：全排空——确保所有 DS load 完成（VGPR 写回）
+        k.wait_lgkmcnt(0);
+    } else {
+        // ── 旧逐列交错模式（对照开关 T0_SWAP_INTERLEAVE=1）──
+        for c in 0..n_col_tiles {
+            let store_off = store_base + (c as u16) * 32;
+            let load_off = load_base + (c as u16) * 32;
             k.ds_store_b128(swap_addr, acc[c], store_off);
             k.ds_store_b128(swap_addr, VReg(acc[c].0 + 4), store_off + 16);
             k.wait_lgkmcnt(0);
-            for v in 0..8u32 {
-                k.v_mov(VReg(acc[c].0 + v), VReg(temp.0 + v));
-            }
-        } else {
-            // 新路径：store acc → wait → load 直达 acc
-            // T0_SWAP_BARRIER=1（诊断）：swap 前后补 barrier——验证 2-wave 下
-            // "每 lane 独立槽无 cross-wave 依赖"假设（漂移 nan 残差的判别）
-            k.ds_store_b128(swap_addr, acc[c], store_off);
-            k.ds_store_b128(swap_addr, VReg(acc[c].0 + 4), store_off + 16);
-            k.wait_lgkmcnt(0);
-            if std::env::var("T0_SWAP_BARRIER").is_ok() {
-                k.s_barrier();
-            }
-            // T0_SWAP_NOP=K（2026-11-08 时序余量判别）：ds_load 后插 K 条 s_nop，
-            // nan/巨数随 K 单调下降 = 硬件管线时序余量问题；不变 = 映射/依赖错。
-            let swap_nop: u32 = std::env::var("T0_SWAP_NOP").ok()
-                .and_then(|v| v.parse().ok()).unwrap_or(0);
             k.ds_load_b128(acc[c], swap_addr, load_off);
             k.ds_load_b128(VReg(acc[c].0 + 4), swap_addr, load_off + 16);
             k.wait_lgkmcnt(0);
-            for _ in 0..swap_nop {
-                k.raw_asm("s_nop 0");
-            }
         }
     }
 }
