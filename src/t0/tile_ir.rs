@@ -3438,7 +3438,8 @@ fn emit_epilogue_on_vreg(
                 k.push(Op::VMulF32 {
                     dst: scaled,
                     src0: Operand::VReg(neg_x),
-                    src1: Operand::InlineFloat(1.4426950),  // log2(e)
+                    // log2(e)：std 常量与字面量 1.4426950 舍入到同一 f32 位型，发射 asm 逐字节不变
+                    src1: Operand::InlineFloat(std::f32::consts::LOG2_E),
                 });
                 // step 3: exp2(scaled) = exp(-x)
                 let exp_neg = k.alloc_vreg();
@@ -3475,7 +3476,7 @@ fn emit_epilogue_on_vreg(
                 k.push(Op::VMulF32 {
                     dst: log2e_sx,
                     src0: Operand::VReg(neg_sx),
-                    src1: Operand::InlineFloat(1.4426950),
+                    src1: Operand::InlineFloat(std::f32::consts::LOG2_E), // log2(e)
                 });
                 let exp_neg = k.alloc_vreg();
                 k.v_exp_f32(exp_neg, log2e_sx);

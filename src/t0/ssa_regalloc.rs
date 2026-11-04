@@ -695,9 +695,14 @@ pub fn allocate_ssa(
                 // If it's farther than the current interval, spill it instead.
                 // 2026-11-08 P0-A 回退：group_id.is_none() 过滤使小内核 spill 路径
                 // panic（所有 active 都是 groups，无非 group 候选）→ 回退原始 filter。
-                // P0-A 改进（组分片不被 spill）留为未来项，需同步实现组级 spill/reload。
+                // [2026-11-04 A 类页错误家族 · 25 事件/169 页] H1 分片后组成员全是
+                // count==1，仅按 count 过滤会把**地址对/WMMA frag 的单分片**选为
+                // spill 牺牲品 → 一半被复用/reload = 地址撕裂（页错误 A 类指纹：
+                // 高半真实/低半常数、0xf8 填充入地址半）。多寄存器组（group_size>1）
+                // 的分片禁止单独 spill——只允许单值（group_size<=1）。
                 if let Some(spill_pos) = active.iter().enumerate()
                     .filter(|(_, a)| a.count == 1)
+                    .filter(|(_, a)| intervals[a.interval_idx].group_size <= 1)
                     .max_by_key(|(_, a)| a.last_use)
                     .map(|(i, _)| i)
                 {

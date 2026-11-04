@@ -1096,8 +1096,12 @@ impl T0Kernel {
             // Arch fix B (2026-08-27): address-class VRegs must never be
             // algebraically rewritten by optimization (CSE folds the lane_hi
             // address component → K 8-15 never read, C_RAND 156 vs 168).
+            // [2026-11-04 A 类页错误家族] 扩展到一切 count≥2 多寄存器分配：
+            // 地址对（Normal Align2×57 处）与 WMMA frag 的分量同样不可被代数
+            // 改写/折叠——发射器按 v[a:a+1] 相邻语义消费它们，分量独立性是
+            // 地址对完整性的前提。
             let addr_vregs: std::collections::HashSet<u32> = self.vreg_allocs.iter()
-                .filter(|va| va.class == RegClass::Address)
+                .filter(|va| va.class == RegClass::Address || va.count >= 2)
                 .flat_map(|va| (0..va.count).map(move |i| va.vreg.0 + i))
                 .collect();
             super::opt_passes::optimize(self.ops.clone(), &self.coalesced_groups, &addr_vregs)
@@ -1168,6 +1172,21 @@ impl T0Kernel {
         } else {
             regalloc::allocate(&filtered_allocs, &self.sreg_allocs, &optimized_ops)
         };
+
+        // [2026-11-04 A 类页错误家族 · 25 事件/169 页] 地址对完整性门禁：
+        // 发射器强制 v[a:a+1]（asm_emitter），分配侧必须结构性保证 count≥2 + 物理相邻。
+        // 违规 = 编译失败（编译期爆出来，不打到硬件上整卡复位）。
+        let addr_pair_errors = super::isa_verifier::verify_addr_pairs(
+            &optimized_ops, &filtered_allocs, &alloc,
+        );
+        if !addr_pair_errors.is_empty() {
+            return Err(format!(
+                "地址对完整性校验失败 for '{}'（{} 条，A 类页错误家族防线）:\n  {}",
+                self.name,
+                addr_pair_errors.len(),
+                addr_pair_errors.join("\n  ")
+            ));
+        }
 
         // Arch fix A (2026-08-27): reserved-register contract on the allocator
         // output — no virtual register may land on v0/s0-4/s63 (hardware

@@ -193,8 +193,12 @@ fn gfx1100_barrier_merged_form() {
 fn gfx1200_atomic_th_vs_gfx1100_glc() {
     let make = |target: Target| {
         let mut k = T0Kernel::new("audit_atomic");
+        // [A 类页错误家族] 地址对登记 count≥2 并定义（use-only 对无法分配）
+        let addr = k.alloc_vreg_array(2, t0_gpu::t0::ir::Alignment::Align2);
+        k.v_mov_imm(addr, 0);
+        k.v_mov_imm(VReg(addr.0 + 1), 0);
         k.push(t0_gpu::t0::ir::Op::GlobalAtomicAddU32Rtn {
-            dst: VReg(4), addr: VReg(0), src: VReg(2),
+            dst: VReg(4), addr, src: VReg(2),
         });
         k.endpgm();
         k.to_assembly(target).expect("asm")

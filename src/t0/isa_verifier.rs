@@ -9,7 +9,7 @@
 //! Runs automatically during T0Kernel::compile() when `KFD_VERIFY=1` or debug_assertions.
 //! Zero cost in release builds unless opted in.
 
-use super::ir::{Op, WmmaFormat};
+use super::ir::{Op, VReg, WmmaFormat};
 
 /// Verification result
 #[derive(Debug)]
@@ -322,6 +322,62 @@ pub fn verify_ops(ops: &[Op]) -> VerifyResult {
     result
 }
 
+/// [2026-11-04 A 类页错误家族 · 25 事件/169 页/4 次整卡复位]
+/// 64 位地址对完整性检查——发射器（asm_emitter.rs）对 global_load/store/atomic
+/// **无条件打印 v[a:a+1]**（物理相邻假设），因此不变量必须由分配侧结构性保证：
+///
+///   结构层：内存操作 addr 必须是 count≥2 分配的 base。
+///           alloc_vreg() + 手工 VReg(x.0+1)（count:1）毫无保证——高半 = 紧邻
+///           寄存器的任意活跃值（指纹：高 32 位真实 ASLR / 低 32 位恒小常数）。
+///   物理层：分配后 phys(addr+1) == phys(addr)+1。
+///           H1 分片 + spill 半撕裂（多寄存器组分片被单独 spill → 一半被复用）、
+///           死定义 fallback 单寄存器别名（ssa_regalloc to_legacy_regalloc）都
+///           可能拆散分配正确的对（指纹：0xf8 填充图案入地址半、0x2400000000 递增计数器）。
+///
+/// 违规返回 error，调用方必须编译失败——编译期爆出来，不打到硬件上。
+pub fn verify_addr_pairs(
+    ops: &[Op],
+    vreg_allocs: &[super::ir::VRegAlloc],
+    alloc: &super::regalloc::RegAlloc,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let addr = match op {
+            Op::GlobalLoad { addr, .. }
+            | Op::GlobalStore { addr, .. }
+            | Op::GlobalAtomicAddF32 { addr, .. }
+            | Op::GlobalAtomicAddU32Rtn { addr, .. } => *addr,
+            _ => continue,
+        };
+        // 结构层：addr 必须是 count≥2 分配的 base
+        let struct_ok = vreg_allocs.iter().any(|va| va.vreg == addr && va.count >= 2);
+        if !struct_ok {
+            errors.push(format!(
+                "Op[{}]: 内存操作 addr=VReg({}) 不是 count≥2 分配的 base \
+                 （发射器强制 v[a:a+1]；须改用 alloc_addr_pair()/alloc_vreg_array(2, Align2)）",
+                i, addr.0
+            ));
+            continue; // 半对本身非法，物理层无从谈起
+        }
+        // 物理层：两半都必须有映射且物理相邻
+        let p0 = alloc.vgpr_map.get(&addr);
+        let p1 = alloc.vgpr_map.get(&VReg(addr.0 + 1));
+        match (p0, p1) {
+            (Some(&a0), Some(&a1)) if a1 == a0 + 1 => {}
+            (Some(&a0), Some(&a1)) => errors.push(format!(
+                "Op[{}]: addr 对 VReg({})/VReg({}) 物理不相邻 v{}:v{} —— 分配器撕裂地址对 \
+                 （spill 半撕裂 / fallback 别名）",
+                i, addr.0, addr.0 + 1, a0, a1
+            )),
+            (p0, p1) => errors.push(format!(
+                "Op[{}]: addr 对 VReg({}) 有半未映射 p0={:?} p1={:?} —— 死定义 fallback 别名或 spill 撕裂",
+                i, addr.0, p0, p1
+            )),
+        }
+    }
+    errors
+}
+
 /// Run verification and dump Op listing for debugging.
 /// Activate with `T0_VERIFY_DUMP=1` environment variable.
 pub fn verify_and_dump(ops: &[Op], kernel_name: &str) -> VerifyResult {
@@ -505,5 +561,125 @@ mod tests {
         // the warning should appear on later passes in a real scenario.
         // This test verifies the verifier runs without panic.
         result.report();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // [2026-11-04 A 类页错误家族] 地址对完整性单元测试
+    // 不变量：内存操作 addr 必须是 count≥2 分配 base + 物理相邻
+    // ═══════════════════════════════════════════════════════════════
+
+    use super::super::regalloc::RegAlloc;
+    use std::collections::HashMap;
+
+    fn mk_alloc(map: &[(u32, u8)]) -> RegAlloc {
+        RegAlloc {
+            vgpr_map: map.iter().map(|&(v, p)| (VReg(v), p)).collect::<HashMap<_, _>>(),
+            sgpr_map: HashMap::new(),
+            total_vgprs: 255,
+            total_sgprs: 100,
+        }
+    }
+
+    fn allocs(spec: &[(u32, u32)]) -> Vec<super::super::ir::VRegAlloc> {
+        spec.iter()
+            .map(|&(v, c)| super::super::ir::VRegAlloc {
+                vreg: VReg(v),
+                count: c,
+                alignment: if c >= 2 { Alignment::Align2 } else { Alignment::None },
+                class: RegClass::Normal,
+            })
+            .collect()
+    }
+
+    /// [红→绿锚] count:1 分配当地址 = 结构违规（alloc_vreg + 手工 +1 的经典错法）
+    #[test]
+    fn addr_pair_structural_violation_count1_detected() {
+        let ops = vec![
+            Op::GlobalLoad { dst: VReg(9), addr: VReg(4), width: Width::B32, offset: 0 },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_addr_pairs(&ops, &allocs(&[(4, 1), (5, 1)]), &mk_alloc(&[(4, 10), (5, 11)]));
+        assert_eq!(errs.len(), 1, "count:1 地址必须被抓: {errs:?}");
+        assert!(errs[0].contains("count≥2"), "报错必须点明结构性根因: {}", errs[0]);
+    }
+
+    /// 正确用法：alloc_vreg_array(2, Align2) + 物理相邻 → 通过
+    #[test]
+    fn addr_pair_correct_pair_passes() {
+        let ops = vec![
+            Op::GlobalLoad { dst: VReg(9), addr: VReg(4), width: Width::B32, offset: 0 },
+            Op::WaitVmcnt(0),
+            Op::GlobalStore { addr: VReg(4), src: VReg(9), width: Width::B32, offset: 0 },
+            Op::WaitVscnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_addr_pairs(&ops, &allocs(&[(4, 2)]), &mk_alloc(&[(4, 10), (5, 11)]));
+        assert!(errs.is_empty(), "合法地址对不应报错: {errs:?}");
+    }
+
+    /// [撕裂指纹] 分配正确但物理不相邻（spill 半撕裂/fallback 别名）→ 必须爆
+    #[test]
+    fn addr_pair_physical_tear_detected() {
+        let ops = vec![
+            Op::GlobalStore { addr: VReg(4), src: VReg(9), width: Width::B32, offset: 0 },
+            Op::WaitVscnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_addr_pairs(&ops, &allocs(&[(4, 2)]), &mk_alloc(&[(4, 10), (5, 13)]));
+        assert_eq!(errs.len(), 1, "物理撕裂必须被抓: {errs:?}");
+        assert!(errs[0].contains("物理不相邻"), "报错必须点明撕裂: {}", errs[0]);
+    }
+
+    /// [fallback 别名] 两半映射到同一物理寄存器 → 必须爆
+    #[test]
+    fn addr_pair_fallback_alias_detected() {
+        let ops = vec![
+            Op::GlobalLoad { dst: VReg(9), addr: VReg(4), width: Width::B64, offset: 0 },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_addr_pairs(&ops, &allocs(&[(4, 2)]), &mk_alloc(&[(4, 20), (5, 20)]));
+        assert_eq!(errs.len(), 1, "两半同寄存器必须被抓: {errs:?}");
+    }
+
+    /// [半未映射] spill 后 reload 半丢失 → 必须爆
+    #[test]
+    fn addr_pair_half_unmapped_detected() {
+        let ops = vec![
+            Op::GlobalAtomicAddU32Rtn { dst: VReg(9), addr: VReg(4), src: VReg(8) },
+            Op::WaitVmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_addr_pairs(&ops, &allocs(&[(4, 2)]), &mk_alloc(&[(4, 10)]));
+        assert_eq!(errs.len(), 1, "半未映射必须被抓: {errs:?}");
+    }
+
+    /// 四种内存操作全覆盖（GlobalLoad/Store/AtomicF32/AtomicU32Rtn）
+    #[test]
+    fn addr_pair_covers_all_memory_ops() {
+        let ops = vec![
+            Op::GlobalLoad { dst: VReg(9), addr: VReg(4), width: Width::B32, offset: 0 },
+            Op::GlobalStore { addr: VReg(6), src: VReg(9), width: Width::B32, offset: 0 },
+            Op::GlobalAtomicAddF32 { addr: VReg(8), src: VReg(9), offset: 0 },
+            Op::GlobalAtomicAddU32Rtn { dst: VReg(9), addr: VReg(12), src: VReg(8) },
+            Op::Endpgm,
+        ];
+        // 四个 addr 全是 count:1 → 4 条结构违规
+        let errs = verify_addr_pairs(&ops, &allocs(&[]), &mk_alloc(&[]));
+        assert_eq!(errs.len(), 4, "四种内存操作都必须检查: {errs:?}");
+    }
+
+    /// RawAsm / DS 操作不涉及 64 位地址对 → 不误报
+    #[test]
+    fn addr_pair_ignores_non_global_ops() {
+        let ops = vec![
+            Op::DsStoreB32 { vaddr: VReg(4), src: VReg(9), offset: 0 },
+            Op::DsLoadB32 { dst: VReg(9), vaddr: VReg(4), offset: 0 },
+            Op::WaitLgkmcnt(0),
+            Op::Endpgm,
+        ];
+        let errs = verify_addr_pairs(&ops, &allocs(&[]), &mk_alloc(&[]));
+        assert!(errs.is_empty(), "DS 单 VGPR 寻址不是 64 位地址对，不应报: {errs:?}");
     }
 }

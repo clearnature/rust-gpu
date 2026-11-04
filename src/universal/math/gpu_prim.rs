@@ -51,7 +51,8 @@ impl PrimLib for GpuPrimLib {
     ) -> Result<(), String> {
         // GPU exclusive scan kernel
         // 算法: 所有线程加载到 LDS → barrier → thread 0 顺序 scan → barrier → 读回
-        let wg_size = 64u32.min(n.next_power_of_two().max(64));
+        // wg_size 恒为 64：内层 max(npot(n),64) ≥ 64，外层 min(64,·) 恒取 64（clippy min_max 判常量，改写为直值，行为不变）
+        let wg_size = 64u32;
         let grid_x = 1u32;
 
         let target = crate::t0::ir::Target::detect();
@@ -151,7 +152,8 @@ impl PrimLib for GpuPrimLib {
         // GPU 并行归约 kernel (安全版)
         // 算法: 所有线程加载到 LDS → barrier → thread 0 顺序归约
         // 避免 barrier 死锁 (不需要条件 EXEC mask)
-        let wg_size = 64u32.min(n.next_power_of_two().max(64));
+        // wg_size 恒为 64：内层 max(npot(n),64) ≥ 64，外层 min(64,·) 恒取 64（clippy min_max 判常量，改写为直值，行为不变）
+        let wg_size = 64u32;
         let grid_x = 1u32;
 
         let target = crate::t0::ir::Target::detect();
@@ -231,7 +233,8 @@ impl PrimLib for GpuPrimLib {
         // GPU Bitonic Sort kernel (简化版)
         // 算法: 所有元素加载到 LDS → 比较-交换网络 → 写回
         // 限制: n <= 64 (单工作组, 展开的 bitonic 网络)
-        let wg_size = 64u32.min(n.next_power_of_two().max(64));
+        // wg_size 恒为 64：内层 max(npot(n),64) ≥ 64，外层 min(64,·) 恒取 64（clippy min_max 判常量，改写为直值，行为不变）
+        let wg_size = 64u32;
         let grid_x = 1u32;
 
         let target = crate::t0::ir::Target::detect();

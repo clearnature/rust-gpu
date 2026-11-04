@@ -4,7 +4,7 @@
 //! Covers SMEM + FLAT + Atomic + WMMA + VOP3P instruction combinations.
 
 use super::compile::T0Kernel;
-use super::ir::{Op, Target, Width, VReg, SReg, WmmaFormat};
+use super::ir::{Alignment, Op, Target, Width, VReg, SReg, WmmaFormat};
 use crate::rdna3_disasm;
 
 /// Helper: compile kernel to ASM text for GFX1200 and verify it contains expected patterns.
@@ -43,12 +43,19 @@ fn test_e2e_smem_load() {
 #[test]
 fn test_e2e_global_load_store_all_widths() {
     compile_and_check("flat_test", |k| {
-        k.global_load(VReg(1), VReg(0), Width::B32, 0);
-        k.global_load(VReg(3), VReg(0), Width::B64, 0);
-        k.global_load(VReg(5), VReg(0), Width::B128, 0);
-        k.global_store(VReg(0), VReg(1), Width::B32, 0);
-        k.global_store(VReg(0), VReg(3), Width::B64, 0);
-        k.global_store(VReg(0), VReg(5), Width::B128, 0);
+        // [A 类页错误家族] 地址对必须登记 count≥2 分配（发射器强制 v[a:a+1]）
+        let addr = k.alloc_vreg_array(2, Alignment::Align2);
+        k.v_mov_imm(addr, 0);
+        k.v_mov_imm(VReg(addr.0 + 1), 0);
+        let d32 = k.alloc_vreg();
+        let d64 = k.alloc_vreg_array(2, Alignment::Align2);
+        let d128 = k.alloc_vreg_array(4, Alignment::Align4);
+        k.global_load(d32, addr, Width::B32, 0);
+        k.global_load(d64, addr, Width::B64, 0);
+        k.global_load(d128, addr, Width::B128, 0);
+        k.global_store(addr, d32, Width::B32, 0);
+        k.global_store(addr, d64, Width::B64, 0);
+        k.global_store(addr, d128, Width::B128, 0);
         k.endpgm();
     }, &[
         "global_load_b32",
@@ -67,9 +74,14 @@ fn test_e2e_global_load_store_all_widths() {
 #[test]
 fn test_e2e_atomic_add() {
     compile_and_check("atomic_test", |k| {
+        let addr = k.alloc_vreg_array(2, Alignment::Align2); // [A 类页错误家族] 登记
+        k.v_mov_imm(addr, 0);                                // 定义两半（use-only 对无法分配）
+        k.v_mov_imm(VReg(addr.0 + 1), 0);
+        let src = k.alloc_vreg();
+        k.v_mov_imm(src, 0);
         k.push(Op::GlobalAtomicAddF32 {
-            addr: VReg(0),
-            src: VReg(2),
+            addr,
+            src,
             offset: 0,
         });
         k.endpgm();
@@ -81,10 +93,16 @@ fn test_e2e_atomic_add() {
 #[test]
 fn test_e2e_atomic_add_rtn() {
     compile_and_check("atomic_rtn_test", |k| {
+        let addr = k.alloc_vreg_array(2, Alignment::Align2); // [A 类页错误家族] 登记
+        k.v_mov_imm(addr, 0);                                // 定义两半
+        k.v_mov_imm(VReg(addr.0 + 1), 0);
+        let src = k.alloc_vreg();
+        k.v_mov_imm(src, 0);
+        let dst = k.alloc_vreg();
         k.push(Op::GlobalAtomicAddU32Rtn {
-            dst: VReg(4),
-            addr: VReg(0),
-            src: VReg(2),
+            dst,
+            addr,
+            src,
         });
         k.endpgm();
     }, &[
@@ -145,9 +163,13 @@ fn test_e2e_wmma() {
 #[test]
 fn test_e2e_waitcnt_barrier() {
     compile_and_check("waitcnt_barrier_test", |k| {
-        k.global_load(VReg(1), VReg(0), Width::B32, 0);
+        let addr = k.alloc_vreg_array(2, Alignment::Align2); // [A 类页错误家族] 登记
+        k.v_mov_imm(addr, 0);                                // 定义两半
+        k.v_mov_imm(VReg(addr.0 + 1), 0);
+        let v = k.alloc_vreg();
+        k.global_load(v, addr, Width::B32, 0);
         k.wait_vmcnt(0);
-        k.lds_store(VReg(0), VReg(1), Width::B32, 0);
+        k.lds_store(VReg(0), v, Width::B32, 0);
         k.barrier();
         k.endpgm();
     }, &[
@@ -189,12 +211,16 @@ fn test_e2e_mixed_instruction_sequence() {
         let arg_val = k.alloc_sreg();
         k.scalar_load(arg_val, base, 0, Width::B32);
 
-        // 2. FLAT global load
-        k.global_load(VReg(1), VReg(0), Width::B128, 0);
+        // 2. FLAT global load（[A 类页错误家族] 地址对登记 count≥2 并定义）
+        let gaddr = k.alloc_vreg_array(2, Alignment::Align2);
+        k.v_mov_imm(gaddr, 0);
+        k.v_mov_imm(VReg(gaddr.0 + 1), 0);
+        let d128 = k.alloc_vreg_array(4, Alignment::Align4);
+        k.global_load(d128, gaddr, Width::B128, 0);
         k.wait_vmcnt(0);
 
         // 3. LDS store + barrier
-        k.lds_store(VReg(0), VReg(1), Width::B128, 0);
+        k.lds_store(VReg(0), d128, Width::B128, 0);
         k.barrier();
 
         // 4. LDS load
@@ -205,11 +231,14 @@ fn test_e2e_mixed_instruction_sequence() {
         k.v_mul_f32(VReg(6), VReg(5), VReg(3));
 
         // 6. Global store
-        k.global_store(VReg(0), VReg(6), Width::B32, 0);
+        k.global_store(gaddr, VReg(6), Width::B32, 0);
 
-        // 7. Atomic
+        // 7. Atomic（第二个地址对，同样登记并定义）
+        let aaddr = k.alloc_vreg_array(2, Alignment::Align2);
+        k.v_mov_imm(aaddr, 0);
+        k.v_mov_imm(VReg(aaddr.0 + 1), 0);
         k.push(Op::GlobalAtomicAddF32 {
-            addr: VReg(8),
+            addr: aaddr,
             src: VReg(6),
             offset: 0,
         });
@@ -336,14 +365,18 @@ fn test_e2e_round_trip_disasm() {
 #[cfg(feature = "rocm")]
 fn test_e2e_compile_to_elf_gfx1200() {
     let mut k = T0Kernel::new("e2e_gfx1200");
-    k.global_load(VReg(1), VReg(0), Width::B128, 0);
+    let gaddr = k.alloc_vreg_array(2, Alignment::Align2); // [A 类页错误家族] 登记并定义
+    k.v_mov_imm(gaddr, 0);
+    k.v_mov_imm(VReg(gaddr.0 + 1), 0);
+    let d = k.alloc_vreg_array(4, Alignment::Align4);
+    k.global_load(d, gaddr, Width::B128, 0);
     k.wait_vmcnt(0);
-    k.lds_store(VReg(0), VReg(1), Width::B128, 0);
+    k.lds_store(VReg(0), d, Width::B128, 0);
     k.wait_lgkmcnt(0);
     k.barrier();
     k.lds_load(VReg(3), VReg(0), Width::B128, 0);
     k.wait_lgkmcnt(0);
-    k.global_store(VReg(0), VReg(3), Width::B128, 0);
+    k.global_store(gaddr, VReg(3), Width::B128, 0);
     k.endpgm();
 
     let elf = k.compile(Target::GFX1200)

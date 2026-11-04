@@ -302,7 +302,7 @@ pub fn allocate(
     let max_vgpr_total = max_vgpr.max(addr_high);
 
     // ── Overflow and occupancy diagnostics ──
-    #[allow(unused_comparisons)]  // max_vgpr_total is u8 so >255 is always false, but documents intent
+    #[allow(unused_comparisons, clippy::absurd_extreme_comparisons)]  // u8 > 255 恒 false，但记录设计意图
     if max_vgpr_total > 255 {
         // Fatal: cannot fit in hardware
         panic!(
