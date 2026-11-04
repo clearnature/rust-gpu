@@ -907,7 +907,8 @@ fn proptest_gfx1200_scratch_load_b32() {
             let offset = rng.next_u32() as i32;
             let [w0, w1, w2] = gfx11::scratch_load_b32_gfx1200(vdst, vaddr, offset);
             assert_vglobal_word0_prefix(w0, 0xED, "scratch_load_b32");
-            assert_eq!(w1, vdst as u32, "scratch_load_b32 vdst");
+            // [2026-11-05 clang 权威] word1 = vdst | ADDR_EN(bit17)
+            assert_eq!(w1, (vdst as u32) | 0x2_0000, "scratch_load_b32 vdst+ADDR_EN");
         }
     });
 }
@@ -1750,16 +1751,16 @@ fn proptest_gfx1200_global_atomic_add_u32_rtn() {
             let offset = rng.next_u32() as i32;
             let [w0, w1, w2] = gfx11::global_atomic_add_u32_gfx1200(vdst, vaddr, vdata, offset);
             assert_vglobal_word0_prefix(w0, 0xEE, "global_atomic_add_u32_rtn");
-            // Atomics encode vdata in word0 at (vdata << 1), OR'd with 0x7C
-            // So saddr field is NOT simply 0x7C — verify the full word0
-            let expected_w0 = 0xEE0D4000u32 | ((vdata as u32) << 1) | 0x7C;
-            assert_eq!(w0, expected_w0,
-                "global_atomic_add_u32_rtn: word0 mismatch for vdata={}", vdata);
-            // word1: TH_ATOMIC_RETURN flag at bit 16, plus vdst at bits[6:0]
-            assert_eq!(w1 & 0x7F, vdst as u32 & 0x7F,
-                "global_atomic_add_u32_rtn: vdst low bits");
-            assert_eq!(w1 & (1 << 16), 1 << 16,
-                "global_atomic_add_u32_rtn: TH_ATOMIC_RETURN bit");
+            // [2026-11-05 clang 权威重写] word0 = base|0x7C（vdata 不在 word0）
+            assert_eq!(w0, 0xEE0D407Cu32,
+                "global_atomic_add_u32_rtn: word0 (clang)");
+            // word1 = vdst | TH(bit20) | vdata<<23
+            assert_eq!(w1 & 0x1FF, vdst as u32,
+                "global_atomic_add_u32_rtn: vdst @ [8:0]");
+            assert_eq!(w1 & 0x10_0000, 0x10_0000,
+                "global_atomic_add_u32_rtn: TH bit20");
+            assert_eq!(w1 >> 23, vdata as u32,
+                "global_atomic_add_u32_rtn: vdata<<23");
         }
     });
 }
@@ -1773,7 +1774,11 @@ fn proptest_gfx1200_global_atomic_add_u32_nortn() {
             let offset = rng.next_u32() as i32;
             let [w0, w1, w2] = gfx11::global_atomic_add_u32_no_rtn_gfx1200(vaddr, vdata, offset);
             assert_vglobal_word0_prefix(w0, 0xEE, "global_atomic_add_u32_nortn");
-            assert_eq!(w1, 0, "global_atomic_add_u32_nortn: word1=0 (no return)");
+            // [2026-11-05 clang 权威] word0 与 rtn 同 base；word1 = vdata<<23
+            assert_eq!(w0, 0xEE0D407Cu32, "global_atomic_add_u32_nortn: word0");
+            assert_eq!(w1 >> 23, vdata as u32,
+                "global_atomic_add_u32_nortn: vdata<<23");
+            assert_eq!(w1 & 0x10_0000, 0, "nortn: 无 TH 位");
         }
     });
 }

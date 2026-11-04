@@ -1,7 +1,7 @@
 //! 金标准生成器——产出字序列供 llvm-mc 反汇编对拍
 //!
 //! 流程：本测试产出 `/tmp/enc_words.txt`（name|word0,word1,...）→
-//! 脚本用 /opt/rocm llvm-mc 字节流反汇编 → bake 进 tests/encoding_golden.rs。
+//! 脚本与 clang/llvm-mc 金标准逐条比对 → bake 进 tests/encoding_golden.rs。
 //! 扩展金标准锁：在本文件加 push 行（调用编码函数 + 代表性参数）→
 //! 运行本测试 → 重跑 bake 脚本。
 //!
@@ -29,6 +29,9 @@ fn gen_golden_words() {
     push("ds_swizzle_b32(4,3,0x401F)", &gfx11::ds_swizzle_b32(4, 3, 0x401F));
     push("ds_add_f32(2,3,0)", &gfx11::ds_add_f32(2, 3, 0));
     push("ds_max_f32(2,3,0)", &gfx11::ds_max_f32(2, 3, 0));
+    push("ds_load_u16_d16(1,2,0)", &gfx11::ds_load_u16_d16(1, 2, 0));
+    push("ds_load_u16_d16_hi(1,2,0)", &gfx11::ds_load_u16_d16_hi(1, 2, 0));
+    push("ds_load_2addr_b32(1,2,0,4)", &gfx11::ds_load_2addr_b32(1, 2, 0, 4));
 
     // ── 掩码/进位/VOP3 族 ──
     push("v_cndmask_b32(4,1,2)", &[gfx11::v_cndmask_b32(4, 1, 2)]);
@@ -36,14 +39,63 @@ fn gen_golden_words() {
     push("v_add_co_u32(3,10,1,2)", &gfx11::v_add_co_u32(3, 10, 1, 2));
     push("v_add_co_ci_u32(3,10,1,2,11)", &gfx11::v_add_co_ci_u32(3, 10, 1, 2, 11));
     push("v_max_f32_imm0(4,3)", &gfx11::v_max_f32_imm0(4, 3));
+    push("v_add_co_u32_vcc(3,1,2)", &gfx11::v_add_co_u32_vcc(3, 1, 2));
+    push("v_add_co_ci_u32_zero_vcc(3,1)", &gfx11::v_add_co_ci_u32_zero_vcc(3, 1));
+    push("v_and_or_b32(4,1,7,2)", &gfx11::v_and_or_b32(4, 1, 7, 2));
+    push("v_cmp_eq_u32_imm(1,5)", &[gfx11::v_cmp_eq_u32_imm(1, 5)]);
+    push("v_cmp_gt_f32(1,2)", &[gfx11::v_cmp_gt_f32(1, 2)]);
+    push("v_cmp_gt_u32_imm(1,5)", &[gfx11::v_cmp_gt_u32_imm(1, 5)]);
+    push("v_cmp_lt_f32(1,2)", &[gfx11::v_cmp_lt_f32(1, 2)]);
+    push("v_dot2_f32_f16(4,1,2,3)", &gfx11::v_dot2_f32_f16(4, 1, 2, 3));
+    push("v_lshrrev_b32(1,4,2)", &[gfx11::v_lshrrev_b32(1, 4, 2)]);
+    push("v_mov_b32_imm(1,42)", &[gfx11::v_mov_b32_imm(1, 42)]);
+    push("v_mov_b32_literal(1,0x12345678)", &gfx11::v_mov_b32_literal(1, 0x12345678));
+    push("v_or_b32(4,1,2)", &[gfx11::v_or_b32(4, 1, 2)]);
+    push("v_perm_b32(4,1,2,0x03020100)", &gfx11::v_perm_b32(4, 1, 2, 0x03020100));
+    push("v_permlane16_b32(4,1,2,3)", &gfx11::v_permlane16_b32(4, 1, 2, 3));
+    push("v_permlanex16_b32(4,1,2,3)", &gfx11::v_permlanex16_b32(4, 1, 2, 3));
+    push("v_mbcnt_lo_u32_b32(1,true)", &gfx11::v_mbcnt_lo_u32_b32(1, true));
 
     // ── 双发射族（性能路径）──
     push("v_dual_add_f32_mul_f32(0,1,2,3,4,5)",
          &gfx11::v_dual_add_f32_mul_f32(0, 1, 2, 3, 4, 5));
+    push("v_dual_add_f32_add_f32(0,1,2,3,4,5)",
+         &gfx11::v_dual_add_f32_add_f32(0, 1, 2, 3, 4, 5));
+    push("v_dual_mul_f32_mul_f32(0,1,2,3,4,5)",
+         &gfx11::v_dual_mul_f32_mul_f32(0, 1, 2, 3, 4, 5));
+    push("v_dual_sub_f32_sub_f32(0,1,2,3,4,5)",
+         &gfx11::v_dual_sub_f32_sub_f32(0, 1, 2, 3, 4, 5));
 
-    // ── 协同加载/spill 通路 ──
-    push("global_load_async_to_lds_b128(4,2,0)", &gfx11::global_load_async_to_lds_b128(4, 2, 0));
+    // ── 全局/scratch 数据通路（GFX1200 位段）──
+    push("global_load_dwordx2(1,2,0)", &gfx11::global_load_dwordx2(1, 2, 0));
+    push("global_store_dwordx2(2,1,0)", &gfx11::global_store_dwordx2(2, 1, 0));
+    push("global_load_dwordx4(4,2,0)", &gfx11::global_load_dwordx4(4, 2, 0));
+    push("global_store_dwordx4(2,4,0)", &gfx11::global_store_dwordx4(2, 4, 0));
+    push("global_load_ushort_gfx1200(1,2,0)", &gfx11::global_load_ushort_gfx1200(1, 2, 0));
+    push("global_store_short_gfx1200(2,1,0)", &gfx11::global_store_short_gfx1200(2, 1, 0));
+    push("global_load_dword_gfx1200_ht(1,2,0)", &gfx11::global_load_dword_gfx1200_ht(1, 2, 0));
+    push("global_load_dword_gfx1200_lu(1,2,0)", &gfx11::global_load_dword_gfx1200_lu(1, 2, 0));
+    push("global_load_dwordx4_gfx1200_nt(4,2,0)", &gfx11::global_load_dwordx4_gfx1200_nt(4, 2, 0));
+    push("scratch_load_b64_gfx1200(1,2,0)", &gfx11::scratch_load_b64_gfx1200(1, 2, 0));
     push("scratch_load_b128_gfx1200(4,2,0)", &gfx11::scratch_load_b128_gfx1200(4, 2, 0));
+    push("scratch_store_b64_gfx1200(2,1,0)", &gfx11::scratch_store_b64_gfx1200(2, 1, 0));
+    push("scratch_store_b128_gfx1200(2,4,0)", &gfx11::scratch_store_b128_gfx1200(2, 4, 0));
+
+    // ── 原子族（训练优化器实弹路径）──
+    push("global_atomic_add_f32_gfx1200(1,2,3,0)", &gfx11::global_atomic_add_f32_gfx1200(1, 2, 3, 0));
+    push("global_atomic_add_f32_no_rtn(2,3,0)", &gfx11::global_atomic_add_f32_no_rtn(2, 3, 0));
+    push("global_atomic_add_f32_no_rtn_gfx1200(2,3,0)",
+         &gfx11::global_atomic_add_f32_no_rtn_gfx1200(2, 3, 0));
+    push("global_atomic_and_b32_gfx1200(1,2,3,0)", &gfx11::global_atomic_and_b32_gfx1200(1, 2, 3, 0));
+    push("global_atomic_or_b32_gfx1200(1,2,3,0)", &gfx11::global_atomic_or_b32_gfx1200(1, 2, 3, 0));
+    push("global_atomic_sub_u32_gfx1200(1,2,3,0)", &gfx11::global_atomic_sub_u32_gfx1200(1, 2, 3, 0));
+    push("global_atomic_xor_b32_gfx1200(1,2,3,0)", &gfx11::global_atomic_xor_b32_gfx1200(1, 2, 3, 0));
+
+    // ── 等待族 ──
+    push("s_waitcnt_vmcnt(3)", &[gfx11::s_waitcnt_vmcnt(3)]);
+    push("s_waitcnt_lgkmcnt(5)", &[gfx11::s_waitcnt_lgkmcnt(5)]);
+    push("s_waitcnt_vscnt(2)", &[gfx11::s_waitcnt_vscnt(2)]);
+    push("s_sub_i32(1,2,3)", &[gfx11::s_sub_i32(1, 2, 3)]);
 
     let text = out.join("\n");
     std::fs::write("/tmp/enc_words.txt", text).unwrap();

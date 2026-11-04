@@ -73,21 +73,12 @@ pub mod gfx11 {
     ///   vmcnt(8) = 0xBF8923F7
     /// Pattern: 0xBF89 | (vmcnt << 8) | 0xF7 (lgkmcnt maxed)
     pub fn s_waitcnt_vmcnt(n: u8) -> u32 {
-        // GFX11 s_waitcnt encoding:
-        // bits [3:0] = vmcnt[3:0]
-        // bits [5:4] = reserved
-        // bits [13:10] = vmcnt[5:4] (high bits)
-        // For n <= 15, only low bits needed
-        // LLVM pattern: 0xBF89 | ((n & 0x30) << 6) | ((n & 0x0F) << 0) | 0x03F0
-        // Simplified for n <= 15: 0xBF8903F0 | n
-        if n <= 15 {
-            0xBF8903F0 | (n as u32) | 0x07  // +0x07 = expcnt(7) = no wait on exports
-        } else {
-            // For n > 15, use high bits at [13:10]
-            let lo = (n & 0x0F) as u32;
-            let hi = ((n >> 4) & 0x03) as u32;
-            0xBF8903F0 | lo | (hi << 10) | 0x07  // +0x07 = expcnt(7)
-        }
+        // [2026-11-05 金标准修复] 旧公式把 n 编进 [3:0]（lgkm 低位域）——
+        // 恒 vmcnt(0) 且污染 LGKM。clang gfx1100 差分实证：
+        //   vmcnt(1)=0x07F7, vmcnt(3)=0x0FF7 → VMCNT = imm[15:10]（6 位）
+        //   公式 = 0x03F7 | (n << 10)；vmcnt(63)=0xFFF7 验证 ✓
+        let n = n.min(63) as u32;
+        0xBF890000u32 | (0x03F7 | (n << 10))
     }
     
     /// s_waitcnt lgkmcnt(N) - wait for N or fewer outstanding scalar memory ops
@@ -615,10 +606,15 @@ pub mod gfx11 {
     ///   atomic_add_f32_nortn:  0xEE0D4000
     #[inline]
     fn gfx12_vglobal_atomic(base_op: u32, vaddr: u8, vdata: u8, offset: i32, vdst: Option<u8>) -> [u32; 3] {
-        let word0 = base_op | ((vdata as u32) << 1) | 0x7C;
+        // [2026-11-05 金标准重写] clang 差分实证（vdata 0-8 扫描 + 16 变体）：
+        //   VDATA @ word1[25:23]、TH_ATOMIC_RETURN @ word1[12]、vdst @ word1[7:0]、
+        //   vaddr @ word2[7:0]。word0 = base_op | 0x7C（rtn/no_rtn 共用同
+        //   base_op，区别只在 word1 TH 位）。旧布局（vdata@word0<<1、TH@bit16）
+        //   在 gfx1200/gfx1100 双双无法解码。
+        let word0 = base_op | 0x7C;
         let word1 = match vdst {
-            Some(vd) => (vd as u32) | (1u32 << 16),  // TH_ATOMIC_RETURN
-            None => 0u32,
+            Some(vd) => (vd as u32) | 0x10_0000 | ((vdata as u32) << 23), // TH_RETURN @ bit20
+            None => (vdata as u32) << 23,
         };
         let word2 = ((offset as u32) << 8) | (vaddr as u32);
         [word0, word1, word2]
@@ -913,7 +909,7 @@ pub mod gfx11 {
 
     /// GFX1200 global_atomic_add_u32 v[addr:addr+1], vdata, off (no return)
     pub fn global_atomic_add_u32_no_rtn_gfx1200(vaddr: u8, vdata: u8, offset: i32) -> [u32; 3] {
-        gfx12_vglobal_atomic(0xEE054000, vaddr, vdata, offset, None)
+        gfx12_vglobal_atomic(0xEE0D4000, vaddr, vdata, offset, None) // [金标准] 与 rtn 同 base（clang）
     }
 
     /// GFX1200 global_atomic_sub_u32 vdst, v[addr:addr+1], vdata, off th:TH_ATOMIC_RETURN
@@ -958,12 +954,12 @@ pub mod gfx11 {
 
     /// GFX1200 global_atomic_add_f32 vdst, v[addr:addr+1], vdata, off th:TH_ATOMIC_RETURN
     pub fn global_atomic_add_f32_gfx1200(vdst: u8, vaddr: u8, vdata: u8, offset: i32) -> [u32; 3] {
-        gfx12_vglobal_atomic(0xEE154000, vaddr, vdata, offset, Some(vdst))
+        gfx12_vglobal_atomic(0xEE158000, vaddr, vdata, offset, Some(vdst))
     }
 
     /// GFX1200 global_atomic_add_f32 v[addr:addr+1], vdata, off (no return, fire-and-forget)
     pub fn global_atomic_add_f32_no_rtn_gfx1200(vaddr: u8, vdata: u8, offset: i32) -> [u32; 3] {
-        gfx12_vglobal_atomic(0xEE0D4000, vaddr, vdata, offset, None)
+        gfx12_vglobal_atomic(0xEE158000, vaddr, vdata, offset, None)
     }
 
     // =========================================================================
@@ -983,32 +979,45 @@ pub mod gfx11 {
 
     /// GFX1200 scratch_load_b32 vdst, vaddr, soffset [offset:N]
     pub fn scratch_load_b32_gfx1200(vdst: u8, vaddr: u8, offset: i32) -> [u32; 3] {
-        gfx12_vglobal_load(0xED050000, vdst, vaddr, offset)
+        // [2026-11-05 金标准修复] word1[17]=ADDR_EN 必须置位（clang 权威
+        // ED05007C/00020001/00000002）——缺失则硬件读 off，spill 寻址全坏
+        let [w0, w1, w2] = gfx12_vglobal_load(0xED050000, vdst, vaddr, offset);
+        [w0, w1 | 0x2_0000, w2]
     }
 
     /// GFX1200 scratch_load_b64 v[dst:dst+1], vaddr, soffset [offset:N]
     pub fn scratch_load_b64_gfx1200(vdst: u8, vaddr: u8, offset: i32) -> [u32; 3] {
-        gfx12_vglobal_load(0xED054000, vdst, vaddr, offset)
+        // [2026-11-05 金标准修复] 同上：ADDR_EN（clang: 00020001）
+        let [w0, w1, w2] = gfx12_vglobal_load(0xED054000, vdst, vaddr, offset);
+        [w0, w1 | 0x2_0000, w2]
     }
 
     /// GFX1200 scratch_load_b128 v[dst:dst+3], vaddr, soffset [offset:N]
     pub fn scratch_load_b128_gfx1200(vdst: u8, vaddr: u8, offset: i32) -> [u32; 3] {
-        gfx12_vglobal_load(0xED05C000, vdst, vaddr, offset)
+        // [2026-11-05 金标准修复] 同上：ADDR_EN（clang: 00020004）
+        let [w0, w1, w2] = gfx12_vglobal_load(0xED05C000, vdst, vaddr, offset);
+        [w0, w1 | 0x2_0000, w2]
     }
 
     /// GFX1200 scratch_store_b32 vaddr, vdata, soffset [offset:N]
     pub fn scratch_store_b32_gfx1200(vaddr: u8, vsrc: u8, offset: i32) -> [u32; 3] {
-        gfx12_vglobal_store(0xED068000, vaddr, vsrc, offset)
+        // [2026-11-05 金标准修复] ADDR_EN（clang: 00820000）
+        let [w0, w1, w2] = gfx12_vglobal_store(0xED068000, vaddr, vsrc, offset);
+        [w0, w1 | 0x2_0000, w2]
     }
 
     /// GFX1200 scratch_store_b64 vaddr, v[src:src+1], soffset [offset:N]
     pub fn scratch_store_b64_gfx1200(vaddr: u8, vsrc: u8, offset: i32) -> [u32; 3] {
-        gfx12_vglobal_store(0xED06C000, vaddr, vsrc, offset)
+        // [2026-11-05 金标准修复] ADDR_EN（clang: 00820000）
+        let [w0, w1, w2] = gfx12_vglobal_store(0xED06C000, vaddr, vsrc, offset);
+        [w0, w1 | 0x2_0000, w2]
     }
 
     /// GFX1200 scratch_store_b128 vaddr, v[src:src+3], soffset [offset:N]
     pub fn scratch_store_b128_gfx1200(vaddr: u8, vsrc: u8, offset: i32) -> [u32; 3] {
-        gfx12_vglobal_store(0xED074000, vaddr, vsrc, offset)
+        // [2026-11-05 金标准修复] ADDR_EN（clang: 02020000）
+        let [w0, w1, w2] = gfx12_vglobal_store(0xED074000, vaddr, vsrc, offset);
+        [w0, w1 | 0x2_0000, w2]
     }
 
     // =========================================================================
@@ -2184,7 +2193,9 @@ pub mod gfx11 {
     
     /// v_cmp_lt_f32 vcc, v_src0, v_src1
     pub fn v_cmp_lt_f32(vsrc0: u8, vsrc1: u8) -> u32 {
-        0x7C820000u32 | ((vsrc1 as u32) << 9) | ((vsrc0 as u32) + 256)
+        // [2026-11-05 金标准修复] 旧 opcode 0x82 实为 v_cmp_lt_I32（整数
+        // 比较冒充浮点！）——clang gfx1200 权威：v_cmp_lt_f32_e32 = 0x7C220000
+        0x7C220000u32 | ((vsrc1 as u32) << 9) | ((vsrc0 as u32) + 256)
     }
     
     /// v_cndmask_b32 v_dst, v_src0, v_src1, vcc - conditional select
@@ -4172,7 +4183,7 @@ mod tests {
         // llvm-mc: scratch_load_b32 v0, off, off → [0x7c,0x00,0x05,0xed,...]
         let [w0, w1, w2] = gfx11::scratch_load_b32_gfx1200(0, 0, 0);
         assert_eq!(w0, 0xED05007C, "scratch_load_b32 word0");
-        assert_eq!(w1, 0x00000000, "vdst=0");
+        assert_eq!(w1, 0x00020000, "vdst=0 + ADDR_EN(bit17) [金标准修复]");
         assert_eq!(w2, 0x00000000, "vaddr=0, offset=0");
     }
 
@@ -4217,34 +4228,39 @@ mod tests {
     fn test_gfx1200_global_atomic_add_u32_rtn() {
         // vdata=1: tests vdata<<1 = 0x02, NOT absorbed by 0x7C mask
         let [w0, w1, w2] = gfx11::global_atomic_add_u32_gfx1200(5, 0, 1, 0);
-        assert_eq!(w0, 0xEE0D407C | (1 << 1), "atomic_u32_rtn word0: vdata=1");
-        assert_eq!(w1, 0x00010005, "atomic_u32_rtn word1: vdst=5, GLC(bit16)");
+        assert_eq!(w0, 0xEE0D407C, "atomic_u32_rtn word0: vdata=1");
+        assert_eq!(w1, 0x0900005, "atomic_u32_rtn word1 (clang: vdst|TH(bit20)|vdata<<23, vdata=1)");
         assert_eq!(w2, 0x00000000, "no offset");
     }
 
     #[test]
     fn test_gfx1200_global_atomic_add_u32_no_rtn() {
-        // vdata=128: tests high vdata bit (128<<1=256=0x100)
+        // vdata=128: 高位 VGPR——分裂编码 [25:24]=64, bit23=0 → word1=0x40000000
         let [w0, w1, w2] = gfx11::global_atomic_add_u32_no_rtn_gfx1200(0, 128, 0);
-        assert_eq!(w0, 0xEE05407C | (128u32 << 1), "atomic_u32_nortn word0: vdata=128");
-        assert_eq!(w1, 0x00000000, "atomic_u32_nortn word1: no return = 0");
+        assert_eq!(w0, 0xEE0D407C, "atomic_u32_nortn word0 (clang: 与 rtn 同 base)");
+        assert_eq!(w1, 0x40000000, "atomic_u32_nortn word1 (clang: vdata 分裂编码)");
         assert_eq!(w2, 0x00000000, "no offset");
     }
 
     #[test]
     fn test_gfx1200_global_atomic_add_f32_rtn() {
         // llvm-mc: global_atomic_add_f32 v5, v[0:1], v10, off th:TH_ATOMIC_RETURN
+        // [2026-11-05 clang 权威] global_atomic_add_f32 v5, v[0:1], v10, off th:...
+        // word0 = 0xEE15807C（旧 0xEE154000|vdata<<1 为 RDNA3 遗留错布局）
+        // word1 = vdst | TH(bit20) | vdata<<23 = 5 | 0x100000 | 0x5000000
         let [w0, w1, _] = gfx11::global_atomic_add_f32_gfx1200(5, 0, 10, 0);
-        assert_eq!(w0, 0xEE15407C | (10 << 1), "atomic_f32_rtn word0");
-        assert_eq!(w1, 0x00010005, "atomic_f32_rtn word1");
+        assert_eq!(w0, 0xEE15807C, "atomic_f32_rtn word0");
+        assert_eq!(w1, 0x05100005, "atomic_f32_rtn word1");
     }
 
     #[test]
     fn test_gfx1200_global_atomic_add_f32_no_rtn() {
         // llvm-mc: global_atomic_add_f32 v[0:1], v10, off (no return)
+        // [2026-11-05 clang 权威] no_rtn：word0 与 rtn 同（0xEE15807C），
+        // word1 = vdata<<23（无 vdst 无 TH 位）
         let [w0, w1, _] = gfx11::global_atomic_add_f32_no_rtn_gfx1200(0, 10, 0);
-        assert_eq!(w0, 0xEE0D407C | (10 << 1), "atomic_f32_nortn word0");
-        assert_eq!(w1, 0x00000000, "atomic_f32_nortn word1: no return = 0");
+        assert_eq!(w0, 0xEE15807C, "atomic_f32_nortn word0");
+        assert_eq!(w1, 0x05000000, "atomic_f32_nortn word1: vdata<<23");
     }
 
     #[test]
@@ -4258,8 +4274,8 @@ mod tests {
     fn test_gfx1200_global_atomic_sub_u32() {
         // llvm-mc: global_atomic_sub_u32 v5, v[0:1], v10, off th:TH_ATOMIC_RETURN
         let [w0, w1, w2] = gfx11::global_atomic_sub_u32_gfx1200(5, 0, 10, 0);
-        assert_eq!(w0, 0xEE0D807C | (10 << 1), "atomic_sub_u32_rtn word0");
-        assert_eq!(w1, 0x00010005, "atomic_sub_u32_rtn word1");
+        assert_eq!(w0, 0xEE0D807C, "atomic_sub_u32_rtn word0");
+        assert_eq!(w1, 0x05100005, "atomic_sub_u32_rtn word1 (clang 布局)");
         assert_eq!(w2, 0x00000000, "no offset");
     }
 
@@ -4267,24 +4283,25 @@ mod tests {
     fn test_gfx1200_global_atomic_and_b32() {
         // llvm-mc: global_atomic_and_b32 v5, v[0:1], v10, off th:TH_ATOMIC_RETURN
         let [w0, w1, _] = gfx11::global_atomic_and_b32_gfx1200(5, 0, 10, 0);
-        assert_eq!(w0, 0xEE0F007C | (10 << 1), "atomic_and_b32_rtn word0");
-        assert_eq!(w1, 0x00010005, "atomic_and_b32_rtn word1");
+        assert_eq!(w0, 0xEE0F007C, "atomic_and_b32_rtn word0");
+        assert_eq!(w1, 0x05100005, "atomic_and_b32_rtn word1 (clang: vdst|TH(20)|vdata<<23)");
     }
 
     #[test]
     fn test_gfx1200_global_atomic_or_b32() {
         // llvm-mc: global_atomic_or_b32 v5, v[0:1], v10, off th:TH_ATOMIC_RETURN
+        // [2026-11-05 clang 权威布局] word1 = vdst | TH(bit20) | vdata<<23
         let [w0, w1, _] = gfx11::global_atomic_or_b32_gfx1200(5, 0, 10, 0);
-        assert_eq!(w0, 0xEE0F407C | (10 << 1), "atomic_or_b32_rtn word0");
-        assert_eq!(w1, 0x00010005, "atomic_or_b32_rtn word1");
+        assert_eq!(w0, 0xEE0F407C, "atomic_or_b32_rtn word0");
+        assert_eq!(w1, 0x05100005, "atomic_or_b32_rtn word1");
     }
 
     #[test]
     fn test_gfx1200_global_atomic_xor_b32() {
         // llvm-mc: global_atomic_xor_b32 v5, v[0:1], v10, off th:TH_ATOMIC_RETURN
         let [w0, w1, _] = gfx11::global_atomic_xor_b32_gfx1200(5, 0, 10, 0);
-        assert_eq!(w0, 0xEE0F807C | (10 << 1), "atomic_xor_b32_rtn word0");
-        assert_eq!(w1, 0x00010005, "atomic_xor_b32_rtn word1");
+        assert_eq!(w0, 0xEE0F807C, "atomic_xor_b32_rtn word0");
+        assert_eq!(w1, 0x05100005, "atomic_xor_b32_rtn word1 (clang 布局)");
     }
 
     // ── GFX1200 VOP3 — FMA, CNDMASK ──

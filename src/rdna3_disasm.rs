@@ -859,12 +859,13 @@ fn disasm_vglobal(word0: u32, word1: u32, word2: u32) -> String {
 
     let vdst_or_vsrc_lo = (word1 & 0x7FFFFF) as u32; // low 23 bits
     let odd_bit = (word1 >> 23) & 1;
-    let has_return = (word1 & 0x10000) != 0; // bit 16 = GLC (TH_ATOMIC_RETURN)
+    // [2026-11-05 金标准重写对齐] GFX12 VGLOBAL：TH_ATOMIC_RETURN @ word1[20]，
+    // atomic VDATA @ word1[25:23]（线性 VGPR 号，clang 差分实证）
+    let has_return = (word1 & 0x10_0000) != 0;
 
     // Match word0 base to known GFX12 VGLOBAL encodings.
     // Loads/stores/atomics all have 0x7C at bits[6:0] (saddr=off).
     // Distinguish by matching word0 base (bits[31:8]).
-    // For atomics with vdata in bits[8:1], use atomic_base (bits[31:9]).
     let w0_base = word0 & 0xFFFFFF00;
     let (mn, is_load, is_atomic) = match w0_base {
         // Unambiguous loads/stores
@@ -875,24 +876,19 @@ fn disasm_vglobal(word0: u32, word1: u32, word2: u32) -> String {
         0xEE06C000 => ("global_store_b64", false, false),
         0xEE074000 => ("global_store_b128", false, false),
         0xEE064000 => ("global_store_b16", false, false),
-        // Ambiguous: 0xEE054000 = load_b64 OR atomic_u32_nortn
-        // (encoder OR's 0x7C for both, so bits[6:0] can't disambiguate)
-        0xEE054000 => {
-            // Use has_return from word1 to disambiguate:
-            // loads always have has_return=false, atomics can have either
-            if has_return {
-                ("global_atomic_add_u32", false, true)
-            } else {
-                // Default: could be load_b64 or atomic_nortn. Prefer load.
-                ("global_load_b64", true, false)
-            }
-        }
-        // Ambiguous: 0xEE0D4000 = atomic_u32_rtn OR atomic_f32_nortn
-        0xEE0D4000 => {
-            if has_return { ("global_atomic_add_u32", false, true) }
-            else { ("global_atomic_add_f32", false, true) }
-        }
-        0xEE154000 => ("global_atomic_add_f32", false, true),  // f32 rtn
+        // GFX1100 路径（0xDC 段）——gfx1100 反汇编语义
+        0xDC560000 => ("global_load_b64", true, false),
+        0xDC6E0000 => ("global_store_b64", false, false),
+        0xDC5E0000 => ("global_load_b128", true, false),
+        0xDC760000 => ("global_store_b128", false, false),
+        // GFX12 atomics（clang 差分权威 base）
+        0xEE158000 => ("global_atomic_add_f32", false, true),
+        0xEE0D4000 => ("global_atomic_add_u32", false, true),
+        0xEE0F0000 => ("global_atomic_and_b32", false, true),
+        0xEE0F4000 => ("global_atomic_or_b32", false, true),
+        0xEE0D8000 => ("global_atomic_sub_u32", false, true),
+        0xEE0F8000 => ("global_atomic_xor_b32", false, true),
+        0xEE054000 => ("global_load_b64", true, false),
         _ => ("global_???", false, false),
     };
 
@@ -907,9 +903,11 @@ fn disasm_vglobal(word0: u32, word1: u32, word2: u32) -> String {
             format!("{} v{}, {}, off", mn, vdst, addr_str)
         }
     } else if is_atomic {
-        let vdata = (vdst_or_vsrc_lo as u8) / 2; // decoded from word1
+        // VDATA 与 store 同式分裂编码：[25:24]=vdata/2 + bit23=odd
+        //（clang 采样 vdata 0-8 与 128 实证；vdata=128 → word1=0x40000000 ✓）
+        let vdata = (((word1 >> 24) & 0x3F) * 2 + ((word1 >> 23) & 1)) as u8;
+        let vdst = (word1 & 0x1FF) as u8; // vdst @ word1[8:0]
         if has_return {
-            let vdst = vdst_or_vsrc_lo as u8;
             if offset != 0 {
                 format!("{} v{}, {}, v{}, off offset:{} th:TH_ATOMIC_RETURN",
                     mn, vdst, addr_str, vdata, offset)
@@ -918,14 +916,10 @@ fn disasm_vglobal(word0: u32, word1: u32, word2: u32) -> String {
                     mn, vdst, addr_str, vdata)
             }
         } else {
-            // Atomic no-return: vdata at bits[25:24] (same layout as store)
-            let vdata_lo = ((word1 >> 24) & 0x3F) as u8;
-            let store_odd = (word1 >> 23) & 1;
-            let vdata_enc = vdata_lo * 2 + store_odd as u8;
             if offset != 0 {
-                format!("{} {}, v{}, off offset:{}", mn, addr_str, vdata_enc, offset)
+                format!("{} {}, v{}, off offset:{}", mn, addr_str, vdata, offset)
             } else {
-                format!("{} {}, v{}, off", mn, addr_str, vdata_enc)
+                format!("{} {}, v{}, off", mn, addr_str, vdata)
             }
         }
     } else {
@@ -1448,11 +1442,9 @@ mod round_trip_tests {
 
     #[test]
     fn rt_atomic_u32_nortn() {
-        // NOTE: global_atomic_add_u32_no_rtn shares w0_base (0xEE054000) with
-        // global_load_b64 because the encoder OR's 0x7C into word0.
-        // The disassembler uses has_return to disambiguate when possible.
-        // With no return (has_return=false), it defaults to load_b64.
-        // This is an inherent encoder ambiguity, not a disassembler bug.
+        // [2026-11-05 金标准重写] no_rtn u32 的 base 已修正为 0xEE0D4000
+        //（与 rtn 同——clang 权威），旧 0xEE054000 与 load_b64 撞号的
+        // 固有歧义随 RDNA3 遗留布局一并消除。
         let words = gfx11::global_atomic_add_u32_no_rtn_gfx1200(0, 10, 0);
         let text = disasm(&words, true);
         // Should decode as either atomic or load (both are valid interpretations)
