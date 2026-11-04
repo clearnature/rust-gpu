@@ -102,7 +102,11 @@ static GFX1200_CAPS: TargetCaps = TargetCaps {
     vop3_inline_zero_bug: true,
     soffset_sgpr_only: true,
     delay_alu_ok: false,
-    vmem: VmemForm::Flat,
+    // 2026-11-03 对齐 LLVM：gfx1200 上 global_load/global_store（opcode 0xee，NULL 描述符）
+    // 与 flat_load 同为合法 FLAT 族编码，且 LLVM 后端对 global 地址空间一律发 global_load
+    //（本机 clang -mcpu=gfx1200 实测）。原 Flat 切换（8/30 提交）与 rows_per_wave 真根因
+    // 修复捆绑，"global_load 读到 L2 陈旧数据"无独立证据；flat_load 反而引入孔径翻译开销。
+    vmem: VmemForm::Global,
     exec_set: "s_mov_b32 exec_lo, -1",
     atomic_th: true,
     tgid_single_wg: true,
@@ -170,6 +174,7 @@ impl AsmEmitter {
         kernarg_size: u32,
         lds_size: u32,
         wgp_mode: bool,
+        wg_size: u32,
     ) {
         self.target = target;
         // Header
@@ -198,6 +203,34 @@ impl AsmEmitter {
         // Function end label
         writeln!(self.buf, ".Lfunc_end_{}:", name).unwrap();
         writeln!(self.buf, "  .size {}, .Lfunc_end_{}-{}", name, name, name).unwrap();
+
+        // .amdhsa_code_object_version + .amdgpu_metadata：与 clang 产物对齐。
+        // clang -x assembler 不会从 .amdgcn_target 自动生成 NT_AMD note——note 来自
+        // .amdgpu_metadata msgpack 块。没有它，链接出的 HSACO 缺 target 描述符
+        // （KFD 裸加载不读 note，但 ROCr/rocprof 等标准工具链需要）。.args 可省
+        //（COV6 schema 中可选，KFD kernarg 由 T0 自行打包）。
+        writeln!(self.buf).unwrap();
+        writeln!(self.buf, ".amdhsa_code_object_version 6").unwrap();
+        writeln!(self.buf, ".amdgpu_metadata").unwrap();
+        writeln!(self.buf, "---").unwrap();
+        writeln!(self.buf, "amdhsa.kernels:").unwrap();
+        writeln!(self.buf, "  - .name:           {}", name).unwrap();
+        writeln!(self.buf, "    .symbol:         {}.kd", name).unwrap();
+        writeln!(self.buf, "    .kernarg_segment_align: 8").unwrap();
+        writeln!(self.buf, "    .kernarg_segment_size: {}", kernarg_size).unwrap();
+        writeln!(self.buf, "    .group_segment_fixed_size: {}", lds_size).unwrap();
+        writeln!(self.buf, "    .private_segment_fixed_size: 0").unwrap();
+        writeln!(self.buf, "    .max_flat_workgroup_size: {}", wg_size).unwrap();
+        writeln!(self.buf, "    .sgpr_count:     {}", alloc.total_sgprs).unwrap();
+        writeln!(self.buf, "    .vgpr_count:     {}", alloc.total_vgprs).unwrap();
+        writeln!(self.buf, "    .wavefront_size: 32").unwrap();
+        writeln!(self.buf, "    .workgroup_processor_mode: {}", if wgp_mode { 1 } else { 0 }).unwrap();
+        writeln!(self.buf, "amdhsa.target:   amdgcn-amd-amdhsa--{}", target.mcpu_str()).unwrap();
+        writeln!(self.buf, "amdhsa.version:").unwrap();
+        writeln!(self.buf, "  - 1").unwrap();
+        writeln!(self.buf, "  - 2").unwrap();
+        writeln!(self.buf, "...").unwrap();
+        writeln!(self.buf, ".end_amdgpu_metadata").unwrap();
         writeln!(self.buf).unwrap();
 
         // Kernel descriptor in .rodata
@@ -844,8 +877,29 @@ impl AsmEmitter {
                     }
                 }
             }
+            Op::WaitInBranch { domain, n } => {
+                // 条件分支体内等待（运行时可能跳过）。发真实指令但 shadow 不动：
+                // 线性 shadow 无法表示"分支内清零"，保守假设分支未走（计数保留）。
+                // 分支走了时后续 mask 操作读写 VGPR，不碰计数器，shadow 仍成立。
+                match domain {
+                    WaitDomain::Vmcnt => writeln!(self.buf, "{}s_wait_loadcnt {}", self.indent, n).unwrap(),
+                    WaitDomain::Lgkmcnt => {
+                        writeln!(self.buf, "{}s_wait_kmcnt {}", self.indent, n).unwrap();
+                        writeln!(self.buf, "{}s_wait_dscnt {}", self.indent, n).unwrap();
+                    }
+                    WaitDomain::Vscnt => writeln!(self.buf, "{}s_wait_storecnt {:#x}", self.indent, n).unwrap(),
+                }
+                self.waits_emitted += 1;
+            }
             Op::WaitVmcnt(n) => {
-                if self.outstanding_vmcnt > 0 || *n > 0 {
+                // F1 修复（2026-11-08 审计定案）：n==0 **永不 elide**。
+                // 旧门 `shadow>0 || n>0` 在 shadow==0 且 n==0 时跳过发射——但 shadow
+                // 可能已因条件分支内的幻影 wait（如 emit_k_oob_mask_tail 在
+                // prefetch_skip 分支内的 wait_vmcnt(0)，运行时常规迭代跳过该分支）
+                // 被错误清零，而硬件计数仍在飞（实证：GEMM 合并等待路径 bad=60013，
+                // 全因 ds_store 前的等待被吞）。shadow 是软件近似，保守方向是发射。
+                // wait_loadcnt 0 = 全排空，冗余无害（性能损失 <1 条发射）。
+                if *n == 0 || self.outstanding_vmcnt > 0 {
                     let actual = (*n as u32).min(self.outstanding_vmcnt);
                     // RDNA4：VMEM 加载等待拆分为 s_wait_loadcnt；RDNA3 用统一 s_waitcnt vmcnt
                     match self.caps().waitcnt {
@@ -861,7 +915,8 @@ impl AsmEmitter {
                 }
             }
             Op::WaitLgkmcnt(n) => {
-                if self.outstanding_lgkmcnt > 0 || *n > 0 {
+                // F1 同款：n==0 永不 elide（理由同 WaitVmcnt，shadow 幻影清零防护）
+                if *n == 0 || self.outstanding_lgkmcnt > 0 {
                     let actual = (*n as u32).min(self.outstanding_lgkmcnt);
                     // RDNA4：S_WAITCNT 的 operand 被忽略（手册：等效 S_WAIT_IDLE，
                     // "should not be used in modern code"）——统一 s_waitcnt lgkmcnt
@@ -890,7 +945,8 @@ impl AsmEmitter {
                 }
             }
             Op::WaitVscnt(n) => {
-                if self.outstanding_vscnt > 0 || *n > 0 {
+                // F1 同款：n==0 永不 elide（shadow 幻影清零防护，理由同 WaitVmcnt）
+                if *n == 0 || self.outstanding_vscnt > 0 {
                     let actual = (*n as u32).min(self.outstanding_vscnt);
                     // GFX11 exposes VSCNT via the split s_waitcnt_vscnt (VINTRP space);
                     // GFX12 removed it — the unified s_waitcnt simm16 encodes
@@ -975,19 +1031,32 @@ impl AsmEmitter {
 
             Op::ComputeGlobalIdX { dst, wg_size } => {
                 let vd = a.phys_v(*dst);
-                // s2 = TGID.x (hardware), v0 = WORKITEM_ID_X (hardware)
-                // Compute: dst = TGID.x * wg_size + v0
-                if self.caps().tgid_single_wg {
-                    // GFX1200: TGID.x may be unreliable (bug P2).
-                    // CaptureTgid already hardcoded wg_id=0, so skip the multiplication.
-                    // Just use v0 directly as the global ID.
-                    writeln!(self.buf, "{}v_mov_b32 v{}, v0  ; global_id = tid (GFX1200: single-WG)",
-                        self.indent, vd).unwrap();
-                } else {
-                    writeln!(self.buf, "{}s_mul_i32 s2, s2, {}  ; TGID.x * WG_SIZE",
-                        self.indent, wg_size).unwrap();
-                    writeln!(self.buf, "{}v_add_nc_u32 v{}, s2, v0  ; global_id = wg_offset + tid",
-                        self.indent, vd).unwrap();
+                // dst = TGID.x * wg_size + v0(threads id)
+                match self.caps().tgid {
+                    TgidForm::Ttmp => {
+                        // GFX1200: TGID.x = ttmp9（RDNA4 ISA Table 12，硬件已验证——
+                        // gpu_zero 多 WG 正确清零）。clang gfx1200 同样模式：
+                        //   v_lshl_or_b32 v3, ttmp9, 8, v0   (wg=256)
+                        // OR==ADD 要求 v0 < 2^shift 且 ttmp9<<shift 低位为 0，wg_size
+                        // 为 2 的幂时成立。旧"单 WG 用 v0"workaround 基于 s2 误诊
+                        // （s2 在 RDNA4 是 user SGPR 非 TGID），已废弃。
+                        if *wg_size > 0 && (*wg_size & (*wg_size - 1)) == 0 {
+                            let shift = wg_size.trailing_zeros();
+                            writeln!(self.buf, "{}v_lshl_or_b32 v{}, ttmp9, {}, v0  ; global_id = wg_id*{} + tid",
+                                self.indent, vd, shift, wg_size).unwrap();
+                        } else {
+                            writeln!(self.buf, "{}v_mov_b32 v{}, ttmp9  ; global_id base = wg_id", self.indent, vd).unwrap();
+                            writeln!(self.buf, "{}v_mul_lo_u32 v{}, v{}, {}", self.indent, vd, vd, wg_size).unwrap();
+                            writeln!(self.buf, "{}v_add_nc_u32 v{}, v{}, v0  ; global_id = wg_offset + tid",
+                                self.indent, vd, vd).unwrap();
+                        }
+                    }
+                    TgidForm::SystemSgpr => {
+                        writeln!(self.buf, "{}s_mul_i32 s2, s2, {}  ; TGID.x * WG_SIZE",
+                            self.indent, wg_size).unwrap();
+                        writeln!(self.buf, "{}v_add_nc_u32 v{}, s2, v0  ; global_id = wg_offset + tid",
+                            self.indent, vd).unwrap();
+                    }
                 }
             }
 

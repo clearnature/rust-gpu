@@ -40,6 +40,14 @@
 
 
 /// RDNA3 GFX11 instruction encoding constants
+// ── 硬件事实常量（出处：RDNA4 ISA §3.5.3.4 Table 12 + §3.5.3；tests/isa_facts.rs 锁定）──
+/// GFX1200 (RDNA4)：TGID.x 在 **ttmp9**（SGPR 编码 117；TTMP0-15 占 108-123）。
+/// 用户态只读（PRIV=0 读合法，写被硬件忽略）。
+/// clang -mcpu=gfx1200 同样从 ttmp9 读（v_lshl_or_b32 v3, ttmp9, 8, v0 实测）。
+pub const GFX1200_TGID_X_ENC: u8 = 117;
+/// RDNA3 (GFX1100)：TGID.x 在 system SGPR s2（user_sgpr 布局）。
+pub const GFX1100_TGID_X_ENC: u8 = 2;
+
 pub mod gfx11 {
     // =========================================================================
     // SOPP (Scalar Operation, Immediate)

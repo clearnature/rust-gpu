@@ -338,7 +338,6 @@ fn unpad_f32(
         m as u32 => u32,
         n as u32 => u32,
         n_pad as u32 => u32,
-        0u32 => u32  // padding to 32 bytes
     ];
 
     let total = m * n;

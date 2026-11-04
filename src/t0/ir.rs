@@ -241,6 +241,17 @@ impl Target {
     }
 }
 
+/// Op::WaitInBranch 的等待域（决定发射哪条拆分等待指令）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitDomain {
+    /// VMEM load 计数（s_wait_loadcnt / vmcnt）
+    Vmcnt,
+    /// LDS+标量混合域（s_wait_dscnt + s_wait_kmcnt，GFX1200 拆分形式）
+    Lgkmcnt,
+    /// VMEM store 计数（s_wait_storecnt / vscnt）
+    Vscnt,
+}
+
 /// A single IR operation.
 #[derive(Clone, Debug)]
 pub enum Op {
@@ -359,6 +370,16 @@ pub enum Op {
 
     // ── Synchronization ──
     Barrier,
+    /// 条件分支体内的硬件等待（wait_vmcnt/lgkmcnt(0)），运行时可能不执行。
+    /// 2026-11-08 审计定案（emit_k_oob_mask_tail 幻影清零事故）：
+    /// - 发射真实等待指令（分支内语义正确）；
+    /// - 但 shadow 计数器**不在分支外清零**——线性 shadow 模型无法表示
+    ///   "分支内清零、分支外保留"。保守方向：shadow 保持不变（分支内
+    ///   掩码操作本身不被计数），后续分支外的 wait 以分支未走为假设。
+    ///   对渐进等待序列：分支未走时硬件计数仍在，remaining 语义成立；
+    ///   分支走了时 mask 读写 VGPR 与计数无关，仍成立。
+    /// 仅用于"分支内 mask 前置等待"场景；正常路径等待用 Wait* 系列。
+    WaitInBranch { domain: WaitDomain, n: u8 },
     WaitVmcnt(u8),
     WaitLgkmcnt(u8),
     WaitVscnt(u8),
@@ -701,7 +722,7 @@ impl Op {
             Op::Label(_) | Op::BranchScc1(_) | Op::Branch(_) => vec![],
 
             // Sync (no VGPRs)
-            Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)
+            Op::Barrier | Op::WaitInBranch { .. } | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)
             | Op::WaitKmcnt(_) | Op::ClearVcc
             | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } => vec![],
             Op::Endpgm => vec![],
@@ -961,7 +982,7 @@ impl Op {
             // ── Control flow, sync ──
             Op::Label(_) | Op::BranchScc1(_) | Op::Branch(_) |
             Op::BranchScc0(_) | Op::BranchVccz(_) |
-            Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)
+            Op::Barrier | Op::WaitInBranch { .. } | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)
             | Op::WaitKmcnt(_) |
             Op::ClearVcc | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } | Op::SMemLoadDwordx2 { .. } | Op::SMemLoadDwordx4 { .. } |
             Op::Endpgm | Op::SBarrier | Op::GlobalInv => vec![],

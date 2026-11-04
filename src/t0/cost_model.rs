@@ -5,8 +5,9 @@
 //!
 //! # Usage
 //! ```rust
+//! use t0_gpu::t0::cost_model::{auto_schedule_gemm, DataFormat};
 //! let best = auto_schedule_gemm(4096, 4096, 512, DataFormat::BF16);
-//! // Returns optimal tile_m, tile_n, tile_k, workgroup_size
+//! assert!(!best.is_empty());
 //! ```
 
 // ============================================================================
@@ -65,6 +66,21 @@ impl Default for GFX1100Limits {
             wgp_mode: true,       // enable WGP mode by default on GFX1100
             simds_per_cu: 2,
             l2_cache_bytes: 6 * 1024 * 1024, // 6 MB L2 on RX 7900 XTX
+        }
+    }
+}
+
+impl GFX1100Limits {
+    /// RX 9060 XT（GFX1200/Navi44）实测底数（2026-11-08 amd-smi + 规格表）：
+    /// 32 CU、GDDR6 322 GB/s、boost ~2.6 GHz。
+    /// max_vgprs/sgprs/LDS/WG 与 GFX1100 等价（64KB/WG、256 VGPR、wave32）。
+    /// wmma_cycles 未在 GFX1200 probe 校准（沿用 4）。
+    pub fn for_gfx1200() -> Self {
+        Self {
+            n_cus: 32,
+            vmem_bandwidth_gbps: 322.0,
+            clock_ghz: 2.6,
+            ..Self::default()
         }
     }
 }
@@ -229,9 +245,14 @@ pub fn estimate_tile_cost(
     };
 
     // ── Feasibility check ──
+    // 2026-11-08 勘探守卫：每线程 GMEM load 不足 1 条（x/wt loads < 1）的组合
+    // 会让 gemm_gen 生成"WT 从未加载"的坏内核（128x64×wg256 实证 n_bad=14174，
+    // N 维也坏）——编译期 assert 会 panic，必须在候选期过滤。
     let feasible = vgprs <= hw.max_vgprs
         && sgprs <= hw.max_sgprs
-        && lds_bytes <= hw.lds_per_wg;
+        && lds_bytes <= hw.lds_per_wg
+        && x_loads_per_thread >= 1
+        && wt_loads_per_thread >= 1;
 
     // ── Occupancy ──
     // RDNA3 Wave32: 256 VGPRs / SIMD, max 16 waves per SIMD
@@ -424,11 +445,22 @@ pub fn estimate_tile_cost(
 /// - swap_grid ∈ {false, true}
 ///
 /// Returns ordered list of feasible configs, best first.
+/// 按默认（GFX1100）硬件底数枚举。GFX1200 卡请用 `auto_schedule_gemm_hw`
+/// + `GFX1100Limits::for_gfx1200()`——n_cus=96/带宽 960 的 7900 XTX 底数
+/// 在 RX 9060 XT（32 CU / 322 GB/s）上会把评分并行度高估 3 倍。
 pub fn auto_schedule_gemm(
     m: u32, n: u32, k: u32,
     fmt: DataFormat,
 ) -> Vec<TileCost> {
-    let hw = GFX1100Limits::default();
+    auto_schedule_gemm_hw(GFX1100Limits::default(), m, n, k, fmt)
+}
+
+/// 指定硬件底数的候选枚举（auto_gemm tune 按 gfx_target_version 选用）。
+pub fn auto_schedule_gemm_hw(
+    hw: GFX1100Limits,
+    m: u32, n: u32, k: u32,
+    fmt: DataFormat,
+) -> Vec<TileCost> {
 
     let tile_m_candidates = [32u32, 64, 128];
     let tile_n_candidates = [64u32, 128]; // 128 enables larger output tiles (needs tile_ir path)
@@ -801,7 +833,7 @@ pub struct TileIrTuneResult {
 /// - LDS ≤ 65536 and VGPR ≤ 256 enforced
 ///
 /// # Example
-/// ```rust,no_run
+/// ```rust,ignore
 /// let result = tune_tile_ir(&rt, 4096, 4096, 4096)?;
 /// eprintln!("Best: {} ({:.1} TF)", result.best.name(), result.best_tflops);
 /// ```

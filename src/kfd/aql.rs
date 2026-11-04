@@ -3,7 +3,11 @@
 use std::sync::Arc;
 use std::os::unix::io::RawFd;
 use super::device::KfdDevice;
-use super::buffer::{GpuBuffer, validate_kernargs_bytes};
+use super::buffer::GpuBuffer;
+// validate_kernargs_bytes 仅在 debug 构建存在（buffer.rs #[cfg(debug_assertions)]），
+// import 也必须条件化，否则 release 构建 E0432。
+#[cfg(debug_assertions)]
+use super::buffer::validate_kernargs_bytes;
 use super::ioctl::*;
 use super::kernel::{GpuKernel, KernelLoadConfig};
 use super::pm4::Pm4CmdBuilder;
@@ -38,6 +42,11 @@ pub struct AqlQueue {
 
 unsafe impl Send for AqlQueue {}
 unsafe impl Sync for AqlQueue {}
+
+/// TGID.x 的 SGPR 编码（RDNA4=ttmp9/117，RDNA3=s2/2）——ISA Table 12，tests/isa_facts.rs 锁定
+fn tgid_x_enc(is_gfx1200: bool) -> u8 {
+    if is_gfx1200 { crate::rdna3_asm::GFX1200_TGID_X_ENC } else { crate::rdna3_asm::GFX1100_TGID_X_ENC }
+}
 
 impl AqlQueue {
     /// Dispatch a kernel. Returns after GPU completes execution.
@@ -690,7 +699,12 @@ impl AqlQueue {
             asm.wait_kmcnt(0);
 
             // global_id = workgroup_id_x * 256 + thread_id
-            asm.emit(gfx11::v_mov_b32_from_sgpr(1, 2));  // v1 = wg_id_x
+            // GFX1200 (RDNA4 ISA Table 12): TGID.x 在 ttmp9（编码 117），不在 s2；
+            // s2 是 user SGPR，读到垃圾 0xFFFFFFFF → bounds check 全灭 → store 不执行。
+            // clang gfx1200 生成代码同样从 ttmp9 读（v_lshl_or_b32 v3, ttmp9, 8, v0）。
+            // ttmp 用户态只读（ISA §3.5.3：PRIV=0 可读，写被忽略）。
+            let tgid_x = tgid_x_enc(is_gfx1200);
+            asm.emit(gfx11::v_mov_b32_from_sgpr(1, tgid_x));  // v1 = wg_id_x
             asm.emit(gfx11::v_lshlrev_b32(1, 8, 1));     // v1 *= 256
             let add = gfx11::v_add_co_u32_vcc(1, 1, 0);  // v1 += v0
             asm.emit(add[0]); asm.emit(add[1]);

@@ -28,7 +28,8 @@ pub enum BinaryOp {
 /// Copies valid [m, n] portion from a padded [m_pad, n_pad] buffer.
 /// Each thread handles one element (same pattern as transpose_f32).
 ///
-/// Kernargs (32 bytes): src_ptr(0), dst_ptr(8), m(16), n(20), n_pad(24), _pad(28)
+/// Kernargs (28 bytes): src_ptr(0), dst_ptr(8), m(16), n(20), n_pad(24)
+/// 段大小 = alignTo(显式参数, 4)（LLVM AMDGPUSubtarget::getKernArgSegmentSize 规则，无隐式参数）
 /// Grid: [ceil(m*n/32)*32, 1, 1], WG: 32
 pub fn t0_unpad_2d() -> T0Kernel {
     let mut k = T0Kernel::new("t0_unpad_2d");

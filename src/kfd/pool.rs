@@ -133,7 +133,11 @@ impl GpuMemset {
         asm.wait_kmcnt(0);
 
         // global_id = wg_id_x * 256 + thread_id
-        asm.emit(gfx11::v_mov_b32_from_sgpr(1, 2));
+        // 2026-11-08 修（TDD tests/isa_facts.rs::gpumemset_multi_wg 红灯）：GFX1200
+        // TGID.x 在 ttmp9（ISA Table 12），s2 是 user SGPR 读到垃圾 → 全部 gid
+        // 被 bounds 掩码吞 → 8KB 缓冲清零后 100% 仍是 0xAA（原样）。
+        let tgid_enc = if is_gfx1200 { crate::rdna3_asm::GFX1200_TGID_X_ENC } else { crate::rdna3_asm::GFX1100_TGID_X_ENC };
+        asm.emit(gfx11::v_mov_b32_from_sgpr(1, tgid_enc));
         asm.emit(gfx11::v_lshlrev_b32(1, 8, 1));
         asm.emit(gfx11::v_add_u32(1, 1, 0));
 

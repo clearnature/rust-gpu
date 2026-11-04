@@ -2036,10 +2036,21 @@ mod gpu_tests {
         let y_buf = rt.alloc_f32(y_elems as usize).unwrap();
         y_buf.zero();
 
-        // ── Build kernargs (gemm_gen layout: 40 bytes) ──
-        let ka = gemm_gen::build_kernargs(
+        // ── Build kernargs ──
+        // compile_via_ssa 的 GEMM 路径走 tile_ir::lower_gemm，其内核声明 8 参数
+        //（X,WT,Y,K,N,split_k_shift,y_split_stride,M → 44B）——必须用 tile_ir 布局，
+        // gemm_gen::build_kernargs（40B，无 M）只配 gemm_gen::generate 的内核。
+        let spec = crate::t0::tile_ir::TileGemm {
+            tile_m: config.tile_m, tile_n: config.tile_n, tile_k: config.tile_k,
+            wgp_mode: true, double_buffer: true, split_k: config.split_k,
+            swap_grid: true, transpose: crate::t0::tile_ir::TileTranspose::NT,
+            acc_swap: false, epilogue: vec![], persistent: false,
+            waves_per_wg: None,
+            wmma_format: crate::t0::ir::WmmaFormat::BF16_F32,
+        };
+        let ka = crate::t0::tile_ir::build_kernargs_m(
             x_buf.gpu_addr(), w_buf.gpu_addr(), y_buf.gpu_addr(),
-            k_val, n, m, &gemm_cfg,
+            k_val, n, m, &spec,
         );
 
         // ── Dispatch ──

@@ -203,7 +203,7 @@ pub fn op_latency(op: &Op) -> InsnLatency {
         Op::Barrier | Op::SBarrier | Op::GlobalInv => InsnLatency {
             class: InsnClass::CTRL, issue: 1, result: 0, recip_throughput: 1.0,
         },
-        Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
+        Op::WaitInBranch { .. } | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
         Op::WaitKmcnt(_) => InsnLatency {
             class: InsnClass::CTRL, issue: 1, result: 0, recip_throughput: 1.0,
         },

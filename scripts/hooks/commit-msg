@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# commit-msg — 提交信息规范（项目惯例：conventional 前缀 + 中文说明）
+HOOK_NAME=commit-msg
+f="$1"
+[ -f "$f" ] || exit 1
+
+# merge/fixup 自动信息放行
+head -1 "$f" | grep -qE '^(Merge |Revert |fixup!)' && exit 0
+
+msg_line=$(head -1 "$f" | sed 's/[[:space:]]*$//')
+
+[ -n "$msg_line" ] || { echo "✗ [commit-msg] 提交信息首行为空" >&2; exit 1; }
+
+if ! echo "$msg_line" | grep -qE '^(feat|fix|docs|chore|test|refactor|perf|style|ci|build|revert)(\([^)]+\))?: +[^[:space:]]'; then
+    echo "✗ [commit-msg] 首行需为「类型: 描述」格式" >&2
+    echo "   类型: feat|fix|docs|chore|test|refactor|perf|style|ci|build|revert (+可选 scope)" >&2
+    echo "   收到: \"$msg_line\"" >&2
+    echo "   例:   \"fix(gemm): wavepart rows_per_wave 遮蔽导致 Y 行 56-127 未写\"" >&2
+    exit 1
+fi
+
+if [ "${#msg_line}" -gt 100 ]; then
+    echo "✗ [commit-msg] 首行过长（${#msg_line} > 100 字符）—— 详情移到正文空行之后" >&2
+    exit 1
+fi
+
+exit 0

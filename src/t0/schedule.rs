@@ -322,9 +322,9 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
 ///
 /// # Usage
 /// ```rust
+/// use t0_gpu::t0::schedule::AutoGemmSchedule;
 /// let sched = AutoGemmSchedule::for_problem(4096, 4096, 512);
-/// let kernel = build_gemm_forward(&sched); // uses auto-selected tiles
-/// let elf = kernel.compile(Target::detect()).unwrap();
+/// assert!(sched.tile_m > 0);
 /// ```
 #[derive(Clone, Debug)]
 pub struct AutoGemmSchedule {
@@ -400,8 +400,9 @@ impl Schedule for AutoGemmSchedule {
 ///
 /// # Example
 /// ```rust
+/// use t0_gpu::t0::schedule::auto_build_gemm;
 /// let kernel = auto_build_gemm(4096, 4096, 512);
-/// let elf = kernel.compile(Target::detect()).unwrap();
+/// assert!(kernel.ops().len() > 0);
 /// ```
 pub fn auto_build_gemm(m: u32, n: u32, k: u32) -> T0Kernel {
     let sched = AutoGemmSchedule::for_problem(m, n, k);

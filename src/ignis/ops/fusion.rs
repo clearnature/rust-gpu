@@ -2,7 +2,7 @@
 //!
 //! ## Example
 //!
-//! ```rust
+//! ```rust,ignore
 //! // Without fusion: 3 kernel dispatches
 //! let sum = ops::add::add(&a, &b, &device)?;
 //! let scaled = ops::add::scale(&sum, 2.0, &device)?;

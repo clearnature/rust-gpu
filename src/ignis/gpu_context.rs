@@ -63,7 +63,11 @@ impl BufferPool {
             }
         }
         drop(cache);
-        self.device.alloc_uncached(n_bytes)
+        // 2026-11-07 定案（127× 性能）：alloc_uncached 使 GPU 端绕过 L2 缓存——
+        // GEMM 全尺寸恒 ~0.25TF 带宽墙（4096³ 555ms）；cached VRAM 同内核 31.5TF
+        //（4.36ms）。计算缓冲必须 cached。uncached 仅用于 kernarg 等需立即一致可见的
+        // 小缓冲（DispatchPool 仍用 alloc_uncached ✓）。
+        self.device.alloc_vram(n_bytes)
     }
 
     /// Return a buffer to the pool instead of freeing it.
@@ -607,12 +611,16 @@ pub struct CachedKernelInfo {
 ///
 /// Usage:
 /// ```rust
+/// use t0_gpu::kernargs;
+/// let (input_ptr, output_ptr): (u64, u64) = (0x1000, 0x2000);
+/// let (n_elems, scale): (u32, f32) = (64, 2.0);
 /// let ka = kernargs![
 ///     input_ptr => u64,
 ///     output_ptr => u64,
 ///     n_elems => u32,
 ///     scale => f32,
 /// ];
+/// assert_eq!(ka.len(), 24);
 /// ```
 ///
 /// Supports u32, u64, f32, i32 types.
@@ -631,12 +639,18 @@ macro_rules! kernargs {
 ///
 /// Usage:
 /// ```rust
+/// use t0_gpu::kernargs_fixed;
+/// let (input_addr, output_addr): (u64, u64) = (0x1000, 0x2000);
+/// let (n_elems, scale): (u32, f32) = (64, 2.0);
+/// // 语法：size=N; offset => value => Type（注意双 =>）
 /// let ka = kernargs_fixed!(size=32;
-///     0 => input_addr: u64,
-///     8 => output_addr: u64,
-///     16 => n_elems: u32,
-///     20 => scale: f32,
+///     0  => input_addr  => u64,
+///     8  => output_addr => u64,
+///     16 => n_elems     => u32,
+///     20 => scale       => f32,
 /// );
+/// assert_eq!(ka.len(), 32);
+/// assert_eq!(ka[24..], [0u8; 8]);
 /// ```
 #[macro_export]
 macro_rules! kernargs_fixed {

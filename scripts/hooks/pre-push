@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# pre-push — 重门（对应 deepseek 的 pre-push typecheck job）：
+#   clippy   → lint 层（存量 459 条 warning，只报数 + error 才拦截）
+#   全量 GPU 套件 → 841 测试（~13s GPU 时间）；本机 GPU 故障底数下，
+#              坏内核推上去影响所有下游，这是最后一道闸。
+# 逃生口：T0_SKIP_PUSHSUITE=1 跳过。
+
+set -u
+HOOK_NAME=pre-push
+cd "$(git rev-parse --show-toplevel)" || exit 1
+. scripts/hooks/common.sh
+
+if [ -n "${T0_SKIP_PUSHSUITE:-}" ]; then
+    info "[pre-push] T0_SKIP_PUSHSUITE=1 —— 跳过推送门"
+    exit 0
+fi
+
+# ── clippy（lint 层；error 拦截，warning 报数不拦——存量 459 条）──
+info "[pre-push] cargo clippy（lint 层）..."
+clippy_out=$(timeout 300 cargo clippy --release --features rocm --lib 2>&1)
+if echo "$clippy_out" | grep -aq "^error"; then
+    echo "$clippy_out" | grep -aE "^error" -A4 | head -30 >&2
+    fail "cargo clippy 报 error —— 先修复"
+fi
+warn_n=$(echo "$clippy_out" | grep -ac "^warning" || true)
+info "[pre-push] clippy warnings=${warn_n}（存量基线 ~459，趋势关注不拦截）"
+
+# ── 全量 GPU 套件 ──
+info "[pre-push] 全量 GPU 测试套件（~13s 运行 + 编译）..."
+out=$(timeout 550 cargo test --release --features rocm --lib -- --test-threads=1 2>&1)
+rc=$?
+summary=$(echo "$out" | grep -aE "test result" | tail -1)
+echo "$out" | grep -aE "test result" | head -1 >&2
+
+if [ $rc -ne 0 ] || echo "$out" | grep -aqE "test result: FAILED"; then
+    echo "$out" | grep -aE "panicked at|FAILED\." | head -6 >&2
+    fail "测试套件未全绿 —— 修复后再推送（GPU flaky 重跑确认；T0_SKIP_PUSHSUITE=1 可跳过）"
+fi
+
+passed=$(echo "$summary" | grep -aoE "[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+ok "[pre-push] 全套件通过 ✓（passed=${passed}）"
+exit 0

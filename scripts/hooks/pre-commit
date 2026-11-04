@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# pre-commit — staged-only 快检门（deepseek-harness 治理映射）：
+#   oxlint(staged)  → 危险模式扫描 + rustfmt advisory（staged .rs）
+#   whitespace      → git diff --cached --check
+#   typecheck(快)   → cargo check（Rust 的类型检查，秒~分钟级）
+#   pi-metadata     → GPU 内核生成器金丝雀（项目特有：tile_ir/gemm_gen/asm_emitter/
+#                     ssa_regalloc 改动强制跑 GEMM 正确性双配置——2026-11-08 事故链
+#                     wild-address 内核 → 整卡复位的用户态防线）
+# 重门（clippy + 全量 GPU 套件）在 pre-push；全库 fmt 迁移另立专项。
+# 逃生口：T0_SKIP_GPGUARD=1 跳过 GPU 金丝雀；git commit --no-verify 跳过全部。
+
+set -u
+HOOK_NAME=pre-commit
+cd "$(git rev-parse --show-toplevel)" || exit 1
+. scripts/hooks/common.sh
+
+is_merge_commit && exit 0
+
+# ── whitespace（与 deepseek whitespace job 对应）──
+if ! git diff --cached --check >/dev/null 2>&1; then
+    git diff --cached --check | head -10 >&2
+    fail "暂存区存在空白错误（trailing whitespace / space-before-tab）"
+fi
+
+# ── 危险模式（对应 oxlint job；项目事故沉淀）──
+added=$(staged_added_lines)
+if echo "$added" | grep -aqE 'todo!\(|unimplemented!\('; then
+    echo "$added" | grep -anE 'todo!\(|unimplemented!\(' | head -5 >&2
+    fail "暂存代码含 todo!()/unimplemented!() —— 完成实现或改用带说明的 return Err"
+fi
+if echo "$added" | grep -aE '^\+.*\bdbg!' >/dev/null; then
+    echo "$added" | grep -anE '\bdbg!' | head -5 >&2
+    fail "暂存代码含 dbg! 调试宏 —— 提交前移除"
+fi
+if echo "$added" | grep -aE '^\+.*\[dbg\]' >/dev/null; then
+    echo "$added" | grep -anE '\[dbg\]' | head -5 >&2
+    fail "暂存代码含 [dbg] 诊断打印残留 —— 提交前移除（2026-11-04 事故：诊断开关泄漏浪费 2 轮排查）"
+fi
+
+# ── rustfmt advisory（staged .rs；不 block——存量 64922 行未 fmt 化，
+#    硬门会产生全文件重排。全新文件若不 fmt-clean 会在报告中列出）──
+rs_files=$(staged_rs_files)
+if [ -n "$rs_files" ]; then
+    fmt_bad=()
+    for f in $rs_files; do
+        if ! rustfmt --check --edition 2021 "$f" >/dev/null 2>&1; then
+            fmt_bad+=("$f")
+        fi
+    done
+    if [ ${#fmt_bad[@]} -gt 0 ]; then
+        info "[fmt advisory] 以下暂存文件非 rustfmt-clean（不拦截；整体迁移另立专项）："
+        printf '  %s\n' "${fmt_bad[@]}" >&2
+    fi
+fi
+
+# ── cargo check（类型检查；check profile 比 test codegen 快一个量级）──
+info "[pre-commit] cargo check（类型/编译门）..."
+if ! cargo check --release --features rocm --lib --quiet >/dev/null 2>&1; then
+    cargo check --release --features rocm --lib 2>&1 | grep -aE "^error" -A4 | head -30 >&2
+    fail "cargo check 失败 —— 先修复类型/编译错误"
+fi
+
+# ── GPU 内核生成器金丝雀（项目特有重活；生成器文件改动才触发）──
+kernel_files=$(echo "$rs_files" | grep -aE 'src/t0/(tile_ir|gemm_gen|asm_emitter|ssa_regalloc)\.rs$' || true)
+if [ -n "$kernel_files" ] && [ -z "${T0_SKIP_GPGUARD:-}" ] && [ -e /dev/kfd ]; then
+    info "[pre-commit] GPU 金丝雀：内核生成器改动 → GEMM 正确性双配置（~60s；跳过 T0_SKIP_GPGUARD=1）"
+    info "              改动：$(echo "$kernel_files" | tr '\n' ' ')"
+    canary=$(timeout 300 cargo test --release --features rocm --lib -- \
+        t0::tile_ir::tests::test_lower_gemm_128x128_swap_correctness \
+        --test-threads=1 --nocapture 2>&1)
+    # 精确匹配 libtest 失败标记（不能匹配 .*failed——通过结果里
+    # "0 failed; 0 ignored" 也含 failed 字样，会误报，2026-11-08 实证）
+    if echo "$canary" | grep -aq "test result: FAILED"; then
+        echo "$canary" | grep -aE "bad=|panicked|TIMEOUT" | head -6 >&2
+        fail "GPU 金丝雀失败（128x64 bulk）—— 疑似破坏已验证内核路径；--no-verify 可强推（不推荐）"
+    fi
+    ok "[pre-commit] GPU 金丝雀通过 ✓"
+fi
+
+ok "[pre-commit] 全部检查通过 ✓"
+exit 0

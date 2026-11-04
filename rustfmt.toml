@@ -1,0 +1,6 @@
+# 风格固定（style pinning）—— 与 deepseek-harness 的治理对齐：
+# 工具默认值显式固化，防止工具链升级隐式改风格。
+# 注意：当前代码库尚未整体 rustfmt 化（存量 64922 行 diff），
+# fmt 在 hooks 中为 staged 文件的 advisory 检查，不做硬门。
+
+edition = "2021"

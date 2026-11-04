@@ -1311,6 +1311,7 @@ impl T0Kernel {
             self.kernarg_size,
             final_lds_size,
             self.wgp_mode,
+            self.wg_size,
         );
         Ok((emitter.finish(), final_lds_size))
     }

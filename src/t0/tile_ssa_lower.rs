@@ -581,7 +581,15 @@ fn lower_tile_op(
             let result_ty = func.value_type(*result);
             let is_scalar_result = result_ty.is_scalar();
 
-            if lhs_scalar && rhs_scalar && is_scalar_result {
+            // f32 标量禁走 SALU 快速路径：s_add_u32/s_mul_i32 是整数运算，
+            // 对 f32 位模式做整数乘会产出位垃圾（2026-11-04 adamw 6e24 根因：
+            // lr×wd 走 s_mul_i32 → 位模式整数积当 float → decay_factor=-6e24）。
+            // f32 降级到 VALU（v_mul_f32/v_add_f32），正确性优先。
+            let is_float_op = result_ty.dtype().map(|d| d.is_float()).unwrap_or(false)
+                || func.value_type(*lhs).dtype().map(|d| d.is_float()).unwrap_or(false)
+                || func.value_type(*rhs).dtype().map(|d| d.is_float()).unwrap_or(false);
+
+            if lhs_scalar && rhs_scalar && is_scalar_result && !is_float_op {
                 // 标量路径：s_add_u32, s_mul_i32 等
                 let ls = get_sreg_or_inline(val_map, *lhs)?;
                 let rs = get_sreg_or_inline(val_map, *rhs)?;

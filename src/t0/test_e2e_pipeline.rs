@@ -89,7 +89,9 @@ fn test_e2e_atomic_add_rtn() {
         k.endpgm();
     }, &[
         "global_atomic_add_u32",
-        "glc",  // GFX1200 uses glc for return
+        // GFX1200 (RDNA4)：原子返回值用 th 字段（TH_ATOMIC_RETURN），
+        // 与 clang -mcpu=gfx1200 生成代码一致；glc 是 RDNA3 形式。
+        "th:TH_ATOMIC_RETURN",
     ]);
 }
 

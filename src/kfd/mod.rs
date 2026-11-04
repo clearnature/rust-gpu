@@ -14,15 +14,21 @@ pub(crate) mod ioctl;
 mod buffer;
 mod kernel;
 mod aql;
-mod pm4;
 mod device;
 mod pool;
 
 // Re-export public types
 pub use ioctl::AqlDispatchPacket;
+// HSA/uapi 契约常量（tests/aql_contract.rs 锁定）
+pub use ioctl::{
+    AMDKFD_IOC_ACQUIRE_VM, AMDKFD_IOC_ALLOC_MEMORY, AMDKFD_IOC_CREATE_QUEUE,
+    AMDKFD_IOC_GET_VERSION, HSA_FENCE_SCOPE_SYSTEM, HSA_PACKET_TYPE_KERNEL_DISPATCH,
+    PM4_ACQUIRE_MEM, PM4_DISPATCH_DIRECT, PM4_EVENT_WRITE, PM4_SET_SH_REG,
+};
 pub use buffer::GpuBuffer;
 pub use kernel::{GpuKernel, KernelLoadConfig};
 pub use aql::AqlQueue;
+pub mod pm4;
 pub use pm4::{Pm4CmdBuilder, Pm4Queue};
 pub use device::KfdDevice;
 pub use pool::{DispatchPool, GpuMemset};

@@ -298,7 +298,7 @@ pub fn op_latency(op: &Op) -> LatencyInfo {
         // ── CTRL: control flow (0 cycle) ──
         Op::Branch(_) | Op::BranchScc0(_) | Op::BranchScc1(_) | Op::BranchVccz(_) |
         Op::Label(_) |
-        Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
+        Op::WaitInBranch { .. } | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
         Op::WaitKmcnt(_) |
         Op::Barrier | Op::SBarrier | Op::GlobalInv | Op::Endpgm |
         Op::CaptureTgid { .. } | Op::ComputeGlobalIdX { .. } => ctrl(),

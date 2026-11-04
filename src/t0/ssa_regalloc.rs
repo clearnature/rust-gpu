@@ -528,6 +528,17 @@ pub fn allocate_ssa(
     // All MVals in the same group share the same base register.
     let mut group_base: HashMap<u32, u8> = HashMap::new();
 
+    // 2026-11-08 H1 修正②：组级 max last_use（全组同步退役的依据）。
+    // 分片条目若用成员自身 last_use，跨 K 回边的迟使用（WMMA RMW dst=c）
+    // 未被完全计入时会提前过期（256x64w8 bad=1990 实证）——统一用组 max。
+    let mut group_last_use: HashMap<u32, u32> = HashMap::new();
+    for interval in intervals.iter() {
+        if let Some(gid) = interval.group_id {
+            let e = group_last_use.entry(gid).or_insert(0);
+            *e = (*e).max(interval.last_use);
+        }
+    }
+
     // Spill LDS offset counter
     let mut spill_lds_offset: u32 = 0;
 
@@ -557,7 +568,18 @@ pub fn allocate_ssa(
                 // Group already allocated — assign this MVal to base + group_index
                 let phys = base + interval.group_index as u8;
                 vgpr_map.insert(interval.mval, phys);
-                // Don't add a separate active entry — the group leader manages the range
+                // 2026-11-08 H1 修复（acc_swap NaN 根因，GPU 实测判别：opt=0 仍坏）：
+                // 组成员以**自身生命周期**进 Active 列表（单寄存器分片）。旧逻辑
+                // continue 不入列表 → 整组寄存器按 leader 的 last_use 过期回收 →
+                // 迟使用成员（acc[c] 的 store 期读取/跨迭代 RMW）的寄存器被中途
+                // 回池复用 → 值破坏（8/26 v8 覆盖旧案同机制）。分片 free 由
+                // pool.free 的 full-coalesce 合并回连续区间，无碎片化风险。
+                active.push(ActiveInterval {
+                    interval_idx: idx,
+                    phys_base: phys,
+                    count: 1,
+                    last_use: group_last_use.get(&gid).copied().unwrap_or(interval.last_use),
+                });
                 continue;
             }
         }
@@ -637,8 +659,16 @@ pub fn allocate_ssa(
                 active.push(ActiveInterval {
                     interval_idx: idx,
                     phys_base: base,
-                    count,
-                    last_use: interval.last_use,
+                    // 2026-11-08 H1：组 leader 只持**自己分片**（count=1）——
+                    // 整组 count 会在 leader 过期时整组回池。分片化后每片由
+                    // 自己的 Active 条目保护（last_use=组 max），全组同步退役、
+                    // 逐片 free + coalesce 恢复连续区间。
+                    count: if interval.group_id.is_some() { 1 } else { count },
+                    last_use: if let Some(g) = interval.group_id {
+                        group_last_use.get(&g).copied().unwrap_or(interval.last_use)
+                    } else {
+                        interval.last_use
+                    },
                 });
 
                 // Track peak active VGPRs

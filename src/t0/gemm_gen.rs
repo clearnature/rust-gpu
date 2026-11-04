@@ -201,7 +201,15 @@ impl GemmConfig {
     }
     /// Check if this config is feasible on GFX1100 (VGPR limit = 256).
     pub fn is_feasible(&self) -> bool {
-        self.estimated_vgprs() <= 256
+        if self.estimated_vgprs() > 256 {
+            return false;
+        }
+        // 2026-11-08（wg=256×128x64 勘探实证 n_bad=14174）：每线程 GMEM load
+        // 不足 1 条的组合会让 generate 产出"WT/X 从未加载"的坏内核——所有
+        // 调用方（cost_model::analyze_kloop / auto tune 等）经此统一过滤。
+        let x_loads = self.x_bytes_per_thread() / 16;
+        let wt_loads = self.wt_bytes_per_thread() / 16;
+        x_loads >= 1 && wt_loads >= 1
     }
     /// Descriptive name
     pub fn name(&self) -> String {
@@ -283,10 +291,15 @@ pub fn generate(cfg: &GemmConfig) -> T0Kernel {
 /// Returns (grid_x, grid_y) for a given (M, N) based on this config.
 /// Uses ceiling division — caller must ensure output buffer is large enough
 /// for the padded tile dimensions (m_padded * n_padded elements).
+///
+/// 2026-11-08 修 F1（GPU fullcheck 实证）：kernel 体从不读 n_col_passes——
+/// 每个 WG 无论 1p/2p 只算 tile_n 列。旧 grid 按 effective_n=tile_n*passes
+/// 分配 → 2p 配置 Y 列 tile_n..effective_n 永不写出（128x64_2p 上 50% 输出
+/// 是未写 sentinel）。grid 必须按 kernel 真实覆盖（tile_n）分配；
+/// 2p 的"双列 pass"从未实现，其 TF 优势是记账伪影（FLOPs 也按 2*M*N*K 多记）。
 pub fn compute_grid(cfg: &GemmConfig, m: u32, n: u32) -> (u32, u32) {
-    let effective_n = cfg.tile_n * cfg.n_col_passes;
     let tiles_m = (m + cfg.tile_m - 1) / cfg.tile_m;
-    let tiles_n = (n + effective_n - 1) / effective_n;
+    let tiles_n = (n + cfg.tile_n - 1) / cfg.tile_n;
     if cfg.swap_grid {
         (tiles_n * cfg.wg_size, tiles_m)
     } else {
@@ -296,11 +309,10 @@ pub fn compute_grid(cfg: &GemmConfig, m: u32, n: u32) -> (u32, u32) {
 
 /// Grid with split-K. Uses ceiling division for M/N.
 pub fn compute_grid_split_k(cfg: &GemmConfig, m: u32, n: u32, split_k: u32) -> (u32, u32) {
-    let effective_n = cfg.tile_n * cfg.n_col_passes;
     assert!(split_k > 0 && split_k.is_power_of_two(),
         "split_k={} must be power of 2", split_k);
     let tiles_m = (m + cfg.tile_m - 1) / cfg.tile_m;
-    let tiles_n = (n + effective_n - 1) / effective_n;
+    let tiles_n = (n + cfg.tile_n - 1) / cfg.tile_n;
     if cfg.swap_grid {
         (tiles_n * cfg.wg_size, tiles_m * split_k)
     } else {
@@ -565,7 +577,10 @@ mod auto_select_tests {
         // Medium square: should use >=64 tile_m
         let c = auto_select(1024, 1024, 1024);
         assert!(c.tile_m >= 64, "1024² tile_m should be >= 64: {}", c.tile_m);
-        assert_eq!(c.tile_k, 16);
+        // 2026-11-08：cost_model 过滤非法 wg 组合（wt_loads<1）后排序变化，
+        // 1024³ 最优从 k16 → k32（k32 wg128 合法且 GPU fullcheck 已验证 bad=0）。
+        assert!(c.tile_k == 16 || c.tile_k == 32,
+            "1024² tile_k should be 16 or 32: {}", c.tile_k);
         eprintln!("1024×1024: {}", c.name());
 
         // Very large: should use large tiles
@@ -661,6 +676,15 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     // How many b128 loads per thread for X and WT
     let x_loads_per_thread = cfg.x_bytes_per_thread() / 16;  // 16 bytes per b128
     let wt_loads_per_thread = cfg.wt_bytes_per_thread() / 16;
+    // 2026-11-08 守卫（wg=256×128x64 勘探实证）：wg=256 时 WT 每线程仅 4B →
+    // wt_loads_per_thread=0 → **WT 从未加载**，LDS WT 区是未初始化垃圾
+    //（fullcheck n_bad=14174/16384，N 维也坏）。这类"每线程不足 1 load"的
+    // cfg 是非法组合，编译期 fail-fast（此前静默生成坏内核）。
+    assert!(x_loads_per_thread >= 1 && wt_loads_per_thread >= 1,
+        "gemm_gen: {} 每线程 GMEM load 不足 1 条（x={} wt={}）——wg_size={} 对 \
+         tile_m×tile_k/tile_n×tile_k 过大，WT/X 不会加载，内核必产出垃圾。\
+         请缩小 wg_size 或加大 tile。cost_model 需过滤此组合（2026-11-08）",
+        cfg.name(), x_loads_per_thread, wt_loads_per_thread, cfg.wg_size);
 
     // ── Args ──
     let x_ptr = k.arg_ptr("X");
@@ -769,6 +793,12 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
     let lane_row = k.alloc_vreg();
     k.v_and_b32_imm(lane_row, lane_id, 15);
+    // P2 FIX (2026-11-08，F2)：GFX1200 WMMA fragment（4 VGPR = 单 b128）B 操作数
+    // lane l 装 B[l%16][(l/16)*8..+8]——lanes 16-31 需 +16B 第二块分量
+    //（tile_ir.rs:1507 已验证实现；缺失时 K 列 8-15/24-31 读 block 0 → uniform 值
+    // 48 = 6×8 恒等 X 值——twop_fullcheck 实证）。
+    let lane_hi = k.alloc_vreg();
+    k.v_and_b32_imm(lane_hi, lane_id, 16); // 0 for lanes 0-15, 16 for lanes 16-31
 
     // ── Accumulators: n_row_blocks × n_col_tiles × 8 VGPRs ──
     let mut acc = Vec::new();
@@ -942,6 +972,7 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
         let xr = k.alloc_vreg();
         k.v_mov_from_sgpr(xr, s_wave_x_off);
         k.v_add_u32(xr, xr, lane_row_stride);
+        k.v_add_u32(xr, xr, lane_hi); // F2: lane 16-31 → second 16B block
         if r > 0 {
             k.push(Op::VAddU32 {
                 dst: xr, src0: Operand::VReg(xr),
@@ -962,6 +993,7 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
         k.v_mov_from_sgpr(v_wrs2, s_wrs2);
         k.v_mul_lo_u32(wt_lds_read_base, lane_row, v_wrs2);
     }
+    k.v_add_u32(wt_lds_read_base, wt_lds_read_base, lane_hi); // F2: same B-fragment layout
 
     // ── Temp VGPRs (pre-allocated, reused) ──
     let n_x_gmem_regs = x_loads_per_thread as usize;
@@ -1262,8 +1294,14 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     k.v_lshrrev_b32(lane_half, 4, lane_id);
     let n_vreg = k.alloc_vreg();
     k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
+    // 2026-11-08 修 D 布局（线 A 勘探定案，照抄 tile_ir.rs:3523-3558 已验证实现）：
+    // RDNA4 wave32 WMMA D 布局 = D[(lane>>4)*8 + v][lane&15]——VGPR 索引 v 步进 1 行
+    // （row_stride=N*4），lane_half 贡献 (lane>>4)*8 行。旧代码 v 步进 2 行（N*8）
+    // 且 lane_half 只加 0/1 行——双重错位（D[1] 写到行 2、D[2] 写到行 4…）。
+    // 全矩阵仿真 n_bad=11924/16384 与 GPU 逐位一致；行 0,1 "对"是 %7 测试数据的
+    // 巧合（行数据只依赖行号 mod 7，8≡1）。
     let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);  // N * 8 (2 rows × 4 bytes)
+    k.v_lshlrev_b32(row_stride, 2, n_vreg);  // N * 4 (1 row × 4 bytes)
 
     let col_base_v = k.alloc_vreg();
     k.v_mov_from_sgpr(col_base_v, base_n_s);
@@ -1272,9 +1310,12 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     k.v_lshlrev_b32(col_bytes, 2, col_base_v);  // col * 4 bytes
 
     for r in 0..n_row_blocks {
+        // base_row = s_row_bases[r] + (lane_half * 8)
         let base_row_v = k.alloc_vreg();
         k.v_mov_from_sgpr(base_row_v, s_row_bases[r]);
-        k.v_add_u32(base_row_v, base_row_v, lane_half);
+        let lane_half8 = k.alloc_vreg();
+        k.v_lshlrev_b32(lane_half8, 3, lane_half);
+        k.v_add_u32(base_row_v, base_row_v, lane_half8);
 
         let row_bytes = k.alloc_vreg();
         k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);

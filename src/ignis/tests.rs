@@ -6,6 +6,47 @@
 #[cfg(all(test, feature = "rocm"))]
 mod ignis_tests {
     use std::sync::{Arc, OnceLock};
+
+    /// 测试内编译简单内核（2026-11-05：替代 /tmp 历史 .hsaco fixture——那批文件是
+    /// 过去调试会话的产物，仓库无源，依赖它们等于环境性失败）。走 TileFunc →
+    /// lower_elementwise_1d 已验证管线。返回 (ELF, kernarg 字节数)。
+    /// 保留原测试意图：手工 kernarg 布局 + GpuKernel::load + AQL dispatch。
+    #[cfg(feature = "rocm")]
+    fn compile_test_kernel(kind: &str) -> (Vec<u8>, usize) {
+        use crate::t0::tile_ssa::{TileFunc, ScalarDType};
+        use crate::t0::tile_ssa_lower::lower_elementwise_1d;
+        use crate::t0::ir::Target;
+
+        let n = 32u32;
+        if kind == "add3" {
+            let mut f = TileFunc::new("test_add3");
+            let x_ptr = f.arg_ptr("x");
+            let y_ptr = f.arg_ptr("y");
+            let out_ptr = f.arg_ptr("out");
+            let offs = f.arange(0, n);
+            let x = f.load(x_ptr, offs, ScalarDType::F32);
+            let y = f.load(y_ptr, offs, ScalarDType::F32);
+            let z = f.add(x, y);
+            f.store(out_ptr, offs, z);
+            f.return_();
+            let lowered = lower_elementwise_1d(&f, n, 1).unwrap();
+            let elf = lowered.kernel.compile(Target::detect()).unwrap();
+            (elf, 24) // [x, y, out] ptrs
+        } else {
+            let mut f = TileFunc::new("test_relu");
+            let x_ptr = f.arg_ptr("x");
+            let out_ptr = f.arg_ptr("out");
+            let offs = f.arange(0, n);
+            let x = f.load(x_ptr, offs, ScalarDType::F32);
+            let z = f.relu(x);
+            f.store(out_ptr, offs, z);
+            f.return_();
+            let lowered = lower_elementwise_1d(&f, n, 1).unwrap();
+            let elf = lowered.kernel.compile(Target::detect()).unwrap();
+            (elf, 16) // [x, out] ptrs
+        }
+    }
+
     use crate::ignis::gpu_context::GpuRuntime;
     use crate::ignis::tensor::{Tensor, DType};
     use crate::ignis::tape::Tape;
@@ -667,15 +708,15 @@ mod ignis_tests {
         let out_buf = device.alloc_uncached(4096).unwrap();
         out_buf.zero();
 
-        let mut ka = [0u8; 28];
+        // TileFunc kernel kernarg = [x, y, out]（24B；n 由 arange 覆盖，无标量参数）
+        let mut ka = [0u8; 24];
         ka[0..8].copy_from_slice(&a_buf.gpu_addr().to_le_bytes());
         ka[8..16].copy_from_slice(&b_buf.gpu_addr().to_le_bytes());
         ka[16..24].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
-        ka[24..28].copy_from_slice(&n.to_le_bytes());
 
-        // Simple bounds check kernel (v_cmp_lt_u32 directly, no v_cndmask)
-        let hsaco = std::fs::read("/tmp/test_simple_bounds.hsaco")
-            .expect("test_simple_bounds.hsaco not found");
+        // 2026-11-05：/tmp fixture（历史调试产物）→ 测试内编译等价内核
+        let (hsaco, ka_size) = compile_test_kernel("add3");
+        assert_eq!(ka_size, 24, "add3 kernarg = [x, y, out]");
         let config = crate::kfd::KernelLoadConfig { workgroup_size: [32, 1, 1], lds_size: 0 };
         let kernel = crate::kfd::GpuKernel::load(device, &hsaco, &config).unwrap();
         rt.dispatch(&kernel, [32, 1, 1], &ka).unwrap();
@@ -701,13 +742,14 @@ mod ignis_tests {
         let out_buf = device.alloc_uncached(4096).unwrap();
         out_buf.zero();
 
-        let mut ka = [0u8; 20];
+        // TileFunc kernel kernarg = [x, out]（16B）
+        let mut ka = [0u8; 16];
         ka[0..8].copy_from_slice(&a_buf.gpu_addr().to_le_bytes());
         ka[8..16].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
-        ka[16..20].copy_from_slice(&n.to_le_bytes());
 
-        let hsaco = std::fs::read("/tmp/test_relu_direct.hsaco")
-            .expect("test_relu_direct.hsaco not found");
+        // 2026-11-05：/tmp fixture → 测试内编译 relu 内核（保留手工 kernarg 意图）
+        let (hsaco, ka_size) = compile_test_kernel("relu");
+        assert_eq!(ka_size, 16, "relu kernarg = [x, out]");
         let config = crate::kfd::KernelLoadConfig { workgroup_size: [32, 1, 1], lds_size: 0 };
         let kernel = crate::kfd::GpuKernel::load(device, &hsaco, &config).unwrap();
         rt.dispatch(&kernel, [32, 1, 1], &ka).unwrap();
@@ -737,17 +779,17 @@ mod ignis_tests {
         let out_buf = device.alloc_uncached(4096).unwrap();
         out_buf.zero();
 
-        // Load the T0-compiled HSACO (same as relu kernel)
-        let hsaco = std::fs::read("/tmp/t0_relu6.hsaco")
-            .expect("T0 relu HSACO not found. Run test_relu_backward with T0_DUMP_HSACO first.");
+        // 2026-11-05：原读 /tmp/t0_relu6.hsaco（依赖另一测试 dump）——改为测试内
+        // T0 编译 relu（原意图即"T0-编译的 relu HSACO + 手工 kernarg dispatch"）
+        let (hsaco, _ka_size) = compile_test_kernel("relu");
         let config = crate::kfd::KernelLoadConfig { workgroup_size: [32, 1, 1], lds_size: 0 };
         let kernel = crate::kfd::GpuKernel::load(device, &hsaco, &config).unwrap();
 
         // Same kernarg layout as mimic test
-        let mut ka = [0u8; 20];
+        // TileFunc kernel kernarg = [x, out]（16B）
+        let mut ka = [0u8; 16];
         ka[0..8].copy_from_slice(&a_buf.gpu_addr().to_le_bytes());
         ka[8..16].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
-        ka[16..20].copy_from_slice(&n.to_le_bytes());
 
         rt.dispatch(&kernel, [32, 1, 1], &ka).unwrap();
 

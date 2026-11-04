@@ -8,11 +8,11 @@ use std::os::unix::io::RawFd;
 // KFD IOCTL numbers (Linux _IOC encoding, type='K'=0x4B)
 // =============================================================================
 
-pub(crate) const AMDKFD_IOC_GET_VERSION: u64       = 0x80084B01;
-pub(crate) const AMDKFD_IOC_CREATE_QUEUE: u64      = 0xC0604B02; // sizeof=96 (matches tinygrad)
+pub const AMDKFD_IOC_GET_VERSION: u64       = 0x80084B01; // 内核 uapi kfd_ioctl.h（tests/aql_contract.rs 锁定）
+pub const AMDKFD_IOC_CREATE_QUEUE: u64      = 0xC0604B02; // sizeof=96 (matches tinygrad)；uapi 契约
 pub(crate) const AMDKFD_IOC_DESTROY_QUEUE: u64     = 0xC0084B03;
-pub(crate) const AMDKFD_IOC_ACQUIRE_VM: u64        = 0x40084B15;
-pub(crate) const AMDKFD_IOC_ALLOC_MEMORY: u64      = 0xC0284B16;
+pub const AMDKFD_IOC_ACQUIRE_VM: u64        = 0x40084B15; // uapi 契约
+pub const AMDKFD_IOC_ALLOC_MEMORY: u64      = 0xC0284B16; // uapi 契约
 pub(crate) const AMDKFD_IOC_FREE_MEMORY: u64       = 0x40084B17;
 pub(crate) const AMDKFD_IOC_MAP_MEMORY: u64        = 0xC0184B18;
 pub(crate) const AMDKFD_IOC_UNMAP_MEMORY: u64      = 0xC0184B19;
@@ -37,12 +37,12 @@ pub(crate) const KFD_IOC_QUEUE_TYPE_COMPUTE_AQL: u32 = 0x2;  // AQL compute queu
 
 // AQL packet types
 pub(crate) const HSA_PACKET_TYPE_VENDOR_SPECIFIC: u16 = 0x0;
-pub(crate) const HSA_PACKET_TYPE_KERNEL_DISPATCH: u16 = 0x2;
+pub const HSA_PACKET_TYPE_KERNEL_DISPATCH: u16 = 0x2; // HSA 规格：kernel dispatch type=2（tests/aql_contract.rs 锁定）
 
 // Fence scopes
 #[allow(dead_code)]
 pub(crate) const HSA_FENCE_SCOPE_AGENT: u16 = 1;   // GPU-internal only (no PCIe sync)
-pub(crate) const HSA_FENCE_SCOPE_SYSTEM: u16 = 2;  // Full system coherency (PCIe writeback)
+pub const HSA_FENCE_SCOPE_SYSTEM: u16 = 2;  // Full system coherency (PCIe writeback)；HSA fence scope=2
 
 // PM4-in-AQL constants
 pub(crate) const PACKET3_INDIRECT_BUFFER: u32 = 0x3F;
@@ -50,11 +50,11 @@ pub(crate) const INDIRECT_BUFFER_VALID: u32 = 1 << 23;
 pub(crate) const PM4_IB_SIZE: usize = 256 * 1024; // 256KB for PM4 indirect buffers
 
 // PM4 opcodes for compute dispatch
-pub(crate) const PM4_SET_SH_REG: u32         = 0x76;
-pub(crate) const PM4_DISPATCH_DIRECT: u32    = 0x15;
+pub const PM4_SET_SH_REG: u32         = 0x76; // PM4 PACKET3 opcode（tests/pm4_contract.rs 锁定）
+pub const PM4_DISPATCH_DIRECT: u32    = 0x15;
 pub(crate) const PM4_RELEASE_MEM: u32        = 0x49;
-pub(crate) const PM4_ACQUIRE_MEM: u32        = 0x58;
-pub(crate) const PM4_EVENT_WRITE: u32        = 0x46;
+pub const PM4_ACQUIRE_MEM: u32        = 0x58;
+pub const PM4_EVENT_WRITE: u32        = 0x46;
 
 // GFX11 Compute SH register offsets
 pub(crate) const SH_REG_BASE: u32              = 0x2C00;
@@ -204,8 +204,9 @@ const _: () = assert!(std::mem::size_of::<AqlDispatchPacket>() == 64);
 // libc FFI
 // =============================================================================
 
-extern "C" {
-    pub(crate) fn open(pathname: *const u8, flags: i32) -> i32;
+unsafe extern "C" {
+    // rustc ≥1.89 对运行时符号 `open` 强制可变参数签名（open(2) 是 variadic）
+    pub(crate) fn open(pathname: *const i8, flags: i32, ...) -> i32;
     pub(crate) fn close(fd: i32) -> i32;
     pub(crate) fn mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     pub(crate) fn munmap(addr: *mut u8, length: usize) -> i32;

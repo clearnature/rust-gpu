@@ -92,7 +92,7 @@ impl KfdDevice {
         // Open /dev/dri/renderDXXX — detect correct minor from KFD topology
         let render_minor = Self::detect_drm_render_minor(gpu_id).unwrap_or(128);
         let drm_path = format!("/dev/dri/renderD{}\0", render_minor);
-        let drm_fd = unsafe { open(drm_path.as_ptr(), 2) };
+        let drm_fd = unsafe { open(drm_path.as_ptr() as *const i8, 2) };
         if drm_fd < 0 {
             unsafe { close(kfd_fd); }
             return Err(format!("Failed to open /dev/dri/renderD{}: {}", render_minor, std::io::Error::last_os_error()));
@@ -248,7 +248,7 @@ impl KfdDevice {
     /// KFD driver may temporarily refuse open() while GPU is resetting.
     fn open_kfd_with_retry() -> Result<RawFd, String> {
         for attempt in 0..5 {
-            let fd = unsafe { open(b"/dev/kfd\0".as_ptr(), 2 /* O_RDWR */) };
+            let fd = unsafe { open(b"/dev/kfd\0".as_ptr() as *const i8, 2 /* O_RDWR */) };
             if fd >= 0 {
                 return Ok(fd);
             }

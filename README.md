@@ -23,6 +23,14 @@ T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3/RDNA4 (GFX11
 
 ## 🏆 性能亮点 / Performance Highlights
 
+> ⚠️ **当前状态（2026-11-07 更新）**：历史 96TF 数字来自现已不可运行的配置家族
+>（LDS>64KB / streaming / acc_swap，见 PROJECT_MEMORY）。**2026-11-07 修复
+> GpuRuntime::alloc 的 uncached 分配（GPU 端绕过 L2 → 0.25TF 带宽墙）后：
+> 4096³ 实测 gemm_gen 41.1 TF / tile_ir 256×64 34.4 TF**（cached VRAM 一行修正，
+> 127×）。历史 rocBLAS 对比数字（91TF@4096³）尚未复现；软件流水（GMEM 延迟
+> 隐藏，消融显示 WMMA 仅占 5% 时间）是通往 50TF+ 的 roadmap。
+> **正确性测试套件 711 通过 / 0 失败。**
+
 > 🏆 **超越 rocBLAS / Surpasses rocBLAS** — T0 在大矩阵上**全面超越** AMD 官方 rocBLAS 库：
 > - **4096³: 96.4 TF vs rocBLAS 91.1 TF** (+6%)
 > - **2048³: 83.2 TF vs rocBLAS 71.2 TF** (+17%)
