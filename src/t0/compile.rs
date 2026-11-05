@@ -1674,10 +1674,13 @@ mod tests {
 
         let asm = k.to_assembly(Target::GFX1100).unwrap();
         // The EXEC guard must appear in the assembly
-        assert!(asm.contains("s_setexeclo_b32 -1"),
-            "WMMA must be preceded by s_setexeclo_b32 -1 silent-drop guard");
+        // [2026-11-05 clang gfx1100 实测] s_setexeclo_b32 在 GFX1100 = invalid
+        //（正确形式与 GFX1200 同：s_mov_b32 exec_lo, -1）——历史断言锁的是
+        // 错误指令形式，按 clang 实测修正
+        assert!(asm.contains("s_mov_b32 exec_lo, -1"),
+            "WMMA must be preceded by exec_set guard");
         // And it must appear before the v_wmma instruction
-        let guard_pos = asm.find("s_setexeclo_b32 -1").unwrap();
+        let guard_pos = asm.find("s_mov_b32 exec_lo, -1").unwrap();
         let wmma_pos = asm.find("v_wmma_f32_16x16x16_bf16").unwrap();
         assert!(guard_pos < wmma_pos,
             "EXEC guard (pos={}) must appear before WMMA (pos={})", guard_pos, wmma_pos);

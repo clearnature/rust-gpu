@@ -122,7 +122,9 @@ static GFX1100_CAPS: TargetCaps = TargetCaps {
     soffset_sgpr_only: false,
     delay_alu_ok: true,
     vmem: VmemForm::Global,
-    exec_set: "s_setexeclo_b32 -1",
+    // [2026-11-05 clang gfx1100 实测] s_setexeclo_b32 在 GFX1100 = invalid——
+    // 正确形式与 GFX1200 同：s_mov_b32 exec_lo, -1（exec_lo=SGPR126 可直接写）
+    exec_set: "s_mov_b32 exec_lo, -1",
     atomic_th: false,
     tgid_single_wg: false,
 };

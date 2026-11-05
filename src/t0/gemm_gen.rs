@@ -259,6 +259,13 @@ pub fn sweep_configs() -> Vec<GemmConfig> {
 /// Returns (kernel, lds_size, workgroup_size, grid_fn) where grid_fn
 /// computes grid dimensions for a given (M, N).
 pub fn generate(cfg: &GemmConfig) -> T0Kernel {
+    generate_for_target(cfg, crate::t0::ir::Target::detect())
+}
+
+/// [多硬件后端] 指定 target 的生成入口——GFX1100/GFX1200 字级形状
+///（A/B frag VGPR 数、hi load 门控）由 target 决定。调用方 compile()
+/// 必须使用同一 target（否则寄存器形状与指令集错位）。
+pub fn generate_for_target(cfg: &GemmConfig, target: crate::t0::ir::Target) -> T0Kernel {
     // Safety check: reject configs that exceed GFX1100 VGPR limit
     let est_vgprs = cfg.estimated_vgprs();
     if est_vgprs > 256 {
@@ -273,10 +280,11 @@ pub fn generate(cfg: &GemmConfig) -> T0Kernel {
         );
     }
     let mut k = if cfg.use_lds && cfg.double_buffer {
-        generate_lds_db(cfg)
+        generate_lds_db(cfg, target)
     } else {
-        generate_direct(cfg)
+        generate_direct(cfg, target)
     };
+    // [多硬件后端] target 已在子函数 T0Kernel::new 后立刻 set（alloc 之前） // [多硬件后端] alloc/hi-load 门控依据（须在首次 wmma_ab_frag_size() 前）
     // GEMM kernels use carefully hand-crafted instruction sequences
     // (cooperative loads, barriers, LDS double-buffering, WMMA scheduling).
     // The optimization passes (DCE, CSE, instruction scheduling, etc.) are
@@ -657,8 +665,9 @@ mod epilogue_tests {
 // LDS Double-Buffered Generator (handles any tile_m × tile_n × tile_k)
 // ============================================================================
 
-fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
+fn generate_lds_db(cfg: &GemmConfig, target: crate::t0::ir::Target) -> T0Kernel {
     let mut k = T0Kernel::new(&cfg.name());
+    k.set_target(target); // [多硬件后端] alloc/hi-load 门控依据（alloc 前）
     let n_col_tiles = cfg.n_col_tiles();
     let n_row_blocks = cfg.n_row_blocks();
     let _n_waves = cfg.n_waves();
@@ -1006,12 +1015,18 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
         .collect();
 
     // WMMA fragment registers
+    // [2026-11-05 frag 8→4] GFX1200 A/B frag = 4 VGPR（1×b128），8 是 GFX1100
+    // 遗留——本机 9060 XT 上释放 n_row_blocks×4 + n_col_tiles×4 死 VGPR。
+    // hi load（+4 第二 b128）同步门控（见下方 load 宏）——此前单独改分配
+    // 未门控导致 hi load 越界写（bad=1990 教训），本次三件同步。
+    let wmma_ab = k.wmma_ab_frag_size(); // GFX1200: 4, GFX1100: 8
     let x_frags: Vec<VReg> = (0..n_row_blocks)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
+        .map(|_| k.alloc_vreg_array(wmma_ab, Alignment::Align8))
         .collect();
     let wt_frags: Vec<VReg> = (0..n_col_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
+        .map(|_| k.alloc_vreg_array(wmma_ab, Alignment::Align8))
         .collect();
+    let load_ab_hi = wmma_ab > 4;
 
     // Pre-allocated temp addresses (reuse across all macro invocations!)
     let tmp_xa = k.alloc_vreg_array(2, Alignment::Align2);
@@ -1138,12 +1153,16 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
                     // ── Issue ALL Phase-1 ds_loads ──
                     $k.v_add_u32(tmp_frag_addr, x_lds_reads[0], $buf_off);
                     $k.ds_load_b128(x_frags[0], tmp_frag_addr, k_byte_within);
-                    $k.ds_load_b128(VReg(x_frags[0].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                    if load_ab_hi {
+                        $k.ds_load_b128(VReg(x_frags[0].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                    }
                     for c in 0..n_col_tiles {
                         $k.v_add_u32(tmp_frag_addr, wt_lds_read_base, $buf_off);
                         let base_off: u16 = (lds_x + (c as u32) * 16 * wt_row_stride) as u16;
                         $k.ds_load_b128(wt_frags[c], tmp_frag_addr, base_off + k_byte_within);
-                        $k.ds_load_b128(VReg(wt_frags[c].0 + 4), tmp_frag_addr, base_off + k_byte_within + 16);
+                        if load_ab_hi {
+                            $k.ds_load_b128(VReg(wt_frags[c].0 + 4), tmp_frag_addr, base_off + k_byte_within + 16);
+                        }
                     }
                     // Total in-flight: C = 2 + n_col_tiles * 2
 
@@ -1163,7 +1182,9 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
                     // X[1] loads overlap with last WMMA(s) above (WMMA ~32 cyc each)
                     $k.v_add_u32(tmp_frag_addr, x_lds_reads[1], $buf_off);
                     $k.ds_load_b128(x_frags[1], tmp_frag_addr, k_byte_within);
-                    $k.ds_load_b128(VReg(x_frags[1].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                    if load_ab_hi {
+                        $k.ds_load_b128(VReg(x_frags[1].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                    }
                     // Wait for X[1] — only 2 loads in flight
                     $k.wait_lgkmcnt(0);
                     // WMMA X[1]×WT — wt_frags still valid from Phase 1
@@ -1177,7 +1198,9 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
                         // Prefetch X[r] while computing WMMA X[r-1] (already done above for r=1)
                         $k.v_add_u32(tmp_frag_addr, x_lds_reads[r], $buf_off);
                         $k.ds_load_b128(x_frags[r], tmp_frag_addr, k_byte_within);
-                        $k.ds_load_b128(VReg(x_frags[r].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                        if load_ab_hi {
+                            $k.ds_load_b128(VReg(x_frags[r].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                        }
                         $k.wait_lgkmcnt(0);
                         for c in 0..n_col_tiles {
                             let a_idx = r * n_col_tiles + c;
@@ -1189,13 +1212,17 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
                     // Refined: issue x_frag[0] first, then wt_frags with graduated wait
                     $k.v_add_u32(tmp_frag_addr, x_lds_reads[0], $buf_off);
                     $k.ds_load_b128(x_frags[0], tmp_frag_addr, k_byte_within);
-                    $k.ds_load_b128(VReg(x_frags[0].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                    if load_ab_hi {
+                        $k.ds_load_b128(VReg(x_frags[0].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                    }
                     // Issue all wt_frag loads
                     for c in 0..n_col_tiles {
                         $k.v_add_u32(tmp_frag_addr, wt_lds_read_base, $buf_off);
                         let base_off: u16 = (lds_x + (c as u32) * 16 * wt_row_stride) as u16;
                         $k.ds_load_b128(wt_frags[c], tmp_frag_addr, base_off + k_byte_within);
-                        $k.ds_load_b128(VReg(wt_frags[c].0 + 4), tmp_frag_addr, base_off + k_byte_within + 16);
+                        if load_ab_hi {
+                            $k.ds_load_b128(VReg(wt_frags[c].0 + 4), tmp_frag_addr, base_off + k_byte_within + 16);
+                        }
                     }
                     // Graduated waitcnt: dispatch WMMA as each wt_frag pair completes
                     let total_loads = (2 + n_col_tiles * 2) as u8;
@@ -1414,11 +1441,11 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
 // Direct (no-LDS) Generator — for reference/small matrices
 // ============================================================================
 
-fn generate_direct(cfg: &GemmConfig) -> T0Kernel {
+fn generate_direct(cfg: &GemmConfig, target: crate::t0::ir::Target) -> T0Kernel {
     // Delegate to the LDS version with single-buffer for now
     // TODO: implement zero-LDS variant
     let mut lds_cfg = cfg.clone();
     lds_cfg.use_lds = true;
     lds_cfg.double_buffer = true;
-    generate_lds_db(&lds_cfg)
+    generate_lds_db(&lds_cfg, target)
 }
