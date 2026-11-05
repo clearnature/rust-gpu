@@ -40,6 +40,12 @@ fn main() {
             _ => TileGemm::tile_128x64_k16(),
         };
         eprintln!("[spec] wg={} lds={}", spec.wg_size(), spec.lds_total());
+        // [LDS sizing 扫描] T0_NODB=1：单缓冲对照（LDS 减半，流水串行化）
+        let mut spec = spec;
+        if std::env::var("T0_NODB").is_ok() {
+            spec.double_buffer = false;
+            eprintln!("[lds-scan] double_buffer=off, lds_total={}", spec.lds_total());
+        }
         let kernel = tile_ir::lower_gemm(&spec);
         let (elf, final_lds) = kernel.compile_with_info(t0_gpu::t0::ir::Target::detect()).expect("compile");
         let dev = &rt.device;
