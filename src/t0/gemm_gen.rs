@@ -262,7 +262,7 @@ pub fn generate(cfg: &GemmConfig) -> T0Kernel {
     generate_for_target(cfg, crate::t0::ir::Target::detect())
 }
 
-/// [多硬件后端] 指定 target 的生成入口——GFX1100/GFX1200 字级形状
+/// [多硬件后端] 指定 target 的生成入口——RDNA3/RDNA4 字级形状
 ///（A/B frag VGPR 数、hi load 门控）由 target 决定。调用方 compile()
 /// 必须使用同一 target（否则寄存器形状与指令集错位）。
 pub fn generate_for_target(cfg: &GemmConfig, target: crate::t0::ir::Target) -> T0Kernel {
@@ -1015,11 +1015,11 @@ fn generate_lds_db(cfg: &GemmConfig, target: crate::t0::ir::Target) -> T0Kernel 
         .collect();
 
     // WMMA fragment registers
-    // [2026-11-05 frag 8→4] GFX1200 A/B frag = 4 VGPR（1×b128），8 是 GFX1100
-    // 遗留——本机 9060 XT 上释放 n_row_blocks×4 + n_col_tiles×4 死 VGPR。
+    // [2026-11-05 frag 8→4] RDNA4 (gfx1200) A/B frag = 4 VGPR（1×b128），
+    // 8 是 RDNA3 (gfx1100) 遗留——RDNA4 上释放 n_row_blocks×4 + n_col_tiles×4 死 VGPR。
     // hi load（+4 第二 b128）同步门控（见下方 load 宏）——此前单独改分配
     // 未门控导致 hi load 越界写（bad=1990 教训），本次三件同步。
-    let wmma_ab = k.wmma_ab_frag_size(); // GFX1200: 4, GFX1100: 8
+    let wmma_ab = k.wmma_ab_frag_size(); // RDNA4 (gfx1200): 4, RDNA3 (gfx1100): 8
     let x_frags: Vec<VReg> = (0..n_row_blocks)
         .map(|_| k.alloc_vreg_array(wmma_ab, Alignment::Align8))
         .collect();

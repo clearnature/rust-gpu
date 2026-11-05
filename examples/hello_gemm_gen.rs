@@ -49,13 +49,13 @@ fn main() -> Result<(), String> {
 
             // 2. Compile kernel if not cached
             if !kernel_cache.contains_key(&cfg_name) {
-                // [多硬件后端] example hardcode GFX1100 = RDNA3 后端验证
-                //（alloc/hi-load 形状必须与 compile target 一致——
-                // generate_for_target 保证；此例同时验证 GFX1100 后端未坏）
-                // [T0_TARGET] GFX1100=RDNA3 后端验证；默认 detect()=GFX1200 主后端正确性
+                // [多硬件后端] RDNA3 后端验证（compile target = RDNA3 ISA；
+                // alloc/hi-load 形状与 compile target 由 generate_for_target
+                // 保证一致）
+                // [T0_TARGET] gfx1100=RDNA3 后端验证；默认 detect()=RDNA4（本机 9060 XT）
                 let tgt = std::env::var("T0_TARGET").ok()
-                    // ⚠ gfx1100 = GFX1100 ISA 编码，**只能在 GFX1100 硬件上
-                    // dispatch**——本机 GFX1200 跑 GFX1100 编码内核会挂（跨代
+                    // ⚠ RDNA3 ISA 编码**只能在 RDNA3 硬件上 dispatch**——
+                    // RDNA4 硬件跑 RDNA3 编码内核会挂（跨代
                     // 指令集，RDNA3→RDNA4 编码漂移）。本机验证用默认 detect()。
                     .and_then(|v| match v.as_str() {
                         "gfx1100" if cfg!(target_os = "linux") && std::env::var("T0_GFX1100_HW").is_ok()

@@ -496,7 +496,8 @@ fn gen_pipeline_coverage_floor() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// [GFX1100 硬件后端 · 官方背书] 多硬件后端定位：rdna3_asm 的 0xDC/0xDD
+// [RDNA3 后端 · 官方背书] 多硬件后端定位：rdna3_asm 的 0xDC/0xDD
+//（Target::GFX1100 = RDNA3 架构代 API 名，覆盖 gfx1100/gfx1101/gfx1102）
 // 字级编码器是 **GFX1100 (RDNA3) 后端的活资产**（Target::detect() 支持此
 // 卡，非死代码）——本机 9060 XT 走 GFX1200 路径，换 GFX1100 卡即激活。
 // 0xDC/0xDD = 官方 rdna3 GLOBAL 类，op 值断言（op@[24:18]）：
