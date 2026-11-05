@@ -480,3 +480,40 @@ fn vglobal_base_ops_match_official_isa_xml_opcodes() {
     let ds_bp: u32 = gfx11::ds_bpermute_b32(1, 2, 3)[0];
     assert_eq!((ds_bp >> 18) & 0xFF, 179, "DS_BPERMUTE_B32 = 179（官方）");
 }
+
+// ═══════════════════════════════════════════════════════════════
+// [gen 管线覆盖率门禁] 金标准 push 行数下限锁——防止 gen 管线
+// 覆盖被静默削减（每条 push = 一个编码器的官方背书锚点）。
+// 基线：2026-11-05 五批审计后 192 条。新增编码器必须走 gen 管线。
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn gen_pipeline_coverage_floor() {
+    let gen_src = include_str!("encoding_golden_gen.rs");
+    let pushes = gen_src.matches("push(\"").count();
+    assert!(pushes >= 190,
+        "gen 管线 push 行数 {pushes} < 基线 190——编码器金标准覆盖被削减，禁止回退");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// [GFX1100 FLAT 路径官方背书] 0xDC/0xDD 前缀（gfx1100 global 语义
+// = 官方 rdna3 GLOBAL 类）op 值断言——我们字 op@[24:18] 与官方
+// GLOBALOp 逐一相等（GLOBAL_LOAD_B64=21/STORE_B32=26/STORE_B16=25/
+// ATOMIC_ADD_U32=53/ATOMIC_ADD_F32=86）。
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn gfx1100_flat_path_official_opcodes() {
+    // (名, word0, 官方 GLOBALOp op 值, op 位域 [24:18])
+    let cases: &[(&str, u32, u32)] = &[
+        ("global_load_dword (2字)",   0xDC520000, 20),
+        ("global_store_dword (2字)",  0xDC6A0000, 26),
+        ("global_atomic_add_u32",     0xDCD64000, 53),
+        ("global_atomic_add_f32 rtn", 0xDD5A4000, 86),
+        ("global_atomic_add_f32 nortn", 0xDD5A0000, 86),
+    ];
+    for (name, w0, official) in cases {
+        let op = (w0 >> 18) & 0x7F;
+        assert_eq!(op, *official, "{name}: GFX1100 FLAT/GLOBAL op 官方值 = {official}");
+    }
+}
