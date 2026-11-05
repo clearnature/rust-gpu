@@ -496,10 +496,12 @@ fn gen_pipeline_coverage_floor() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// [GFX1100 FLAT 路径官方背书] 0xDC/0xDD 前缀（gfx1100 global 语义
-// = 官方 rdna3 GLOBAL 类）op 值断言——我们字 op@[24:18] 与官方
-// GLOBALOp 逐一相等（GLOBAL_LOAD_B64=21/STORE_B32=26/STORE_B16=25/
-// ATOMIC_ADD_U32=53/ATOMIC_ADD_F32=86）。
+// [GFX1100 硬件后端 · 官方背书] 多硬件后端定位：rdna3_asm 的 0xDC/0xDD
+// 字级编码器是 **GFX1100 (RDNA3) 后端的活资产**（Target::detect() 支持此
+// 卡，非死代码）——本机 9060 XT 走 GFX1200 路径，换 GFX1100 卡即激活。
+// 0xDC/0xDD = 官方 rdna3 GLOBAL 类，op 值断言（op@[24:18]）：
+// GLOBAL_LOAD_B64=21 / STORE_B32=26 / STORE_B16=25 / ATOMIC_ADD_U32=53 /
+// ATOMIC_ADD_F32=86。2026-11-05 已修 vdst 错塞 word0 + saddr 域重叠两 bug。
 // ═══════════════════════════════════════════════════════════════
 
 #[test]

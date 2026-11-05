@@ -2151,6 +2151,8 @@ pub mod gfx11 {
     /// global_atomic_add_u32 without return (no vdst)
     /// For fire-and-forget counter increment
     pub fn global_atomic_add_u32_no_rtn(vaddr: u8, vdata: u8) -> [u32; 2] {
+        // 【GFX1100 硬件后端】0xDC/0xDD 字级族 = RDNA3 后端路径（Target::GFX1100，
+        // 多硬件后端支持；本机 9060 XT 走 0xEE GFX1200 路径）。
         // Without glc, no return - just increment
         // [2026-11-05 金标准修复] 旧码 saddr 标记写 0x7C00（bit14-10）——
         // 与 vdata 字段 [15:8] 域重叠（vdata≥1 即互踩）。clang gfx1100 权威：
