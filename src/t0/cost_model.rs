@@ -614,6 +614,7 @@ impl TileConfig {
             tile_k: self.tile_k,
             wgp_mode: self.wgp_mode,
             double_buffer: self.use_lds,
+            triple_buffer: false,
             split_k: self.split_k,
             swap_grid: true,  // tile_ir presets always use swap_grid=true (L2 friendly + proven safe)
             transpose: super::tile_ir::TileTranspose::NT,
@@ -1107,6 +1108,7 @@ fn load_tile_ir_cache(path: &std::path::Path) -> Option<TileIrTuneResult> {
         tile_m, tile_n, tile_k,
         wgp_mode: wgp,
         double_buffer: true,
+            triple_buffer: false,
         split_k,
         swap_grid: true,
         transpose: super::tile_ir::TileTranspose::NT,

@@ -1685,6 +1685,7 @@ pub fn lower_tiled_gemm(func: &TileFunc) -> Result<LoweredTiledGemm, String> {
         tile_n: analysis.tile_n,
         tile_k: analysis.tile_k,
         double_buffer: true,
+            triple_buffer: false,
         wgp_mode: true,
         split_k: 1,
         swap_grid: true,

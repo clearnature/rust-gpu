@@ -117,6 +117,10 @@ pub struct TileGemm {
     pub wgp_mode: bool,
     /// LDS double-buffering (prefetch next tile while computing current)
     pub double_buffer: bool,
+    /// [M2 P1 三窗流水] 三缓冲：load i+2 / compute i+1 / store i 全重叠。
+    /// LDS 代价 = lds_per_buffer × 3（256x64: 60KB ≤ 64KB 单 WG 上限）。
+    /// 优先级高于 double_buffer（triple=true 时忽略 double_buffer）。
+    pub triple_buffer: bool,
     /// Split-K factor (1 = no split, 2/4/8/16 = split K dimension)
     pub split_k: u32,
     /// Grid axis swap: true=TGID.x→N (L2 friendly), false=TGID.x→M
@@ -152,7 +156,7 @@ impl TileGemm {
     pub fn tile_128x64_k16() -> Self {
         Self {
             tile_m: 128, tile_n: 64, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -167,7 +171,7 @@ impl TileGemm {
     pub fn tile_64x64_k16() -> Self {
         Self {
             tile_m: 64, tile_n: 64, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -182,7 +186,7 @@ impl TileGemm {
     pub fn tile_64x64_k32() -> Self {
         Self {
             tile_m: 64, tile_n: 64, tile_k: 32,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -197,7 +201,7 @@ impl TileGemm {
     pub fn tile_64x64_k64() -> Self {
         Self {
             tile_m: 64, tile_n: 64, tile_k: 64,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -212,7 +216,7 @@ impl TileGemm {
     pub fn tile_32x64_k16() -> Self {
         Self {
             tile_m: 32, tile_n: 64, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -227,7 +231,7 @@ impl TileGemm {
     pub fn tile_128x64_k32() -> Self {
         Self {
             tile_m: 128, tile_n: 64, tile_k: 32,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -244,7 +248,7 @@ impl TileGemm {
     pub fn tile_64x128_k32() -> Self {
         Self {
             tile_m: 64, tile_n: 128, tile_k: 32,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: true, // 2026-08-30: acc_swap=false 时普通池 high-water=247 + Address 池叠加 → 255+1 溢出（rocm 边界测试/bench 编译即崩）。acc_swap=true 降 acc 驻留 → 编译通过（ELF 17440B, LDS 57344B < 64KB）
@@ -259,7 +263,7 @@ impl TileGemm {
     pub fn tile_64x128_k16() -> Self {
         Self {
             tile_m: 64, tile_n: 128, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -276,7 +280,7 @@ impl TileGemm {
     pub fn tile_128x128_k16() -> Self {
         Self {
             tile_m: 128, tile_n: 128, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -295,7 +299,7 @@ impl TileGemm {
     pub fn tile_128x128_k32() -> Self {
         Self {
             tile_m: 128, tile_n: 128, tile_k: 32,
-            wgp_mode: true, double_buffer: false, // P2 EXP: 4-wave 省1 基线
+            wgp_mode: true, double_buffer: false, triple_buffer: false, // P2 EXP: 4-wave 省1 基线
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: true, // P2 EXP: 4-wave 省1 基线
@@ -312,7 +316,7 @@ impl TileGemm {
     pub fn tile_128x128_k48() -> Self {
         Self {
             tile_m: 128, tile_n: 128, tile_k: 48,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -329,7 +333,7 @@ impl TileGemm {
     pub fn tile_128x128_k16_swap() -> Self {
         Self {
             tile_m: 128, tile_n: 128, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: true,
@@ -347,7 +351,7 @@ impl TileGemm {
     pub fn tile_128x128_k32_swap() -> Self {
         Self {
             tile_m: 128, tile_n: 128, tile_k: 32,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: true,
@@ -366,7 +370,7 @@ impl TileGemm {
     pub fn tile_256x64_k32_wgp() -> Self {
         Self {
             tile_m: 256, tile_n: 64, tile_k: 32,
-            wgp_mode: true, double_buffer: true,
+            wgp_mode: true, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -385,7 +389,7 @@ impl TileGemm {
     pub fn tile_256x64_k64_wgp() -> Self {
         Self {
             tile_m: 256, tile_n: 64, tile_k: 64,
-            wgp_mode: true, double_buffer: true,
+            wgp_mode: true, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -405,7 +409,7 @@ impl TileGemm {
     pub fn tile_128x128_k64() -> Self {
         Self {
             tile_m: 128, tile_n: 128, tile_k: 64,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: true, // 2026-08-30: acc_swap=false 时普通池 VGPR high-water=255 → regalloc panic（k64 任何路径编译即崩）。acc_swap=true 降 acc 驻留（frag_a_count=1）→ 编译通过（ELF 22328B）
@@ -423,7 +427,7 @@ impl TileGemm {
     pub fn tile_128x64_k64() -> Self {
         Self {
             tile_m: 128, tile_n: 64, tile_k: 64,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -447,7 +451,7 @@ impl TileGemm {
     pub fn tile_32x32_k16() -> Self {
         Self {
             tile_m: 32, tile_n: 32, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -462,7 +466,7 @@ impl TileGemm {
     pub fn tile_32x128_k16() -> Self {
         Self {
             tile_m: 32, tile_n: 128, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -477,7 +481,7 @@ impl TileGemm {
     pub fn tile_128x32_k16() -> Self {
         Self {
             tile_m: 128, tile_n: 32, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -492,7 +496,7 @@ impl TileGemm {
     pub fn tile_64x256_k32() -> Self {
         Self {
             tile_m: 64, tile_n: 256, tile_k: 32,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -507,7 +511,7 @@ impl TileGemm {
     pub fn tile_128x256_k32() -> Self {
         Self {
             tile_m: 128, tile_n: 256, tile_k: 32,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -522,7 +526,7 @@ impl TileGemm {
     pub fn tile_256x128_k32() -> Self {
         Self {
             tile_m: 256, tile_n: 128, tile_k: 32,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -545,7 +549,7 @@ impl TileGemm {
     pub fn tile_persistent_decode() -> Self {
         Self {
             tile_m: 32, tile_n: 64, tile_k: 16,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: false,
             transpose: TileTranspose::NT,
             acc_swap: false,
@@ -569,7 +573,7 @@ impl TileGemm {
     pub fn tile_persistent_128x64_k32() -> Self {
         Self {
             tile_m: 128, tile_n: 64, tile_k: 32,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,  // GPU hung even with wait_kmcnt(0) — deeper LDS addr debug needed instead of wait_lgkmcnt(0) in emit_acc_swap
@@ -588,7 +592,7 @@ impl TileGemm {
     pub fn tile_persistent_256x128_k32() -> Self {
         Self {
             tile_m: 256, tile_n: 128, tile_k: 32,
-            wgp_mode: false, double_buffer: true,
+            wgp_mode: false, double_buffer: true, triple_buffer: false,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: true,
@@ -632,7 +636,13 @@ impl TileGemm {
     /// WG-scoped claim broadcast slot (tile_idx published by wave 0, read by
     /// the other waves after s_barrier).
     pub fn lds_total(&self) -> u32 {
-        let gemm_lds = if self.double_buffer { self.lds_per_buffer() * 2 } else { self.lds_per_buffer() };
+        let gemm_lds = if self.triple_buffer {
+            self.lds_per_buffer() * 3
+        } else if self.double_buffer {
+            self.lds_per_buffer() * 2
+        } else {
+            self.lds_per_buffer()
+        };
         let base = if self.acc_swap {
             gemm_lds + self.acc_swap_region_size()
         } else {

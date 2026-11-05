@@ -178,3 +178,65 @@ fn auto_select_domain_sample_feasible() {
     eprintln!("[auto_select_domain] checked {n_checked} combos");
     assert!(n_checked >= 100, "抽样覆盖不足：{n_checked}");
 }
+
+// ═══════════════════════════════════════════════════════════════
+// [三窗流水契约] triple_buffer（M2 P1-3）：load i+2 / compute i+1 /
+// store i 全重叠。LDS 代价 = lds_per_buffer × 3。
+// 硬约束：GFX1200 单 WG LDS ≤ 64KB（isa_facts 锁）——256x64 spec
+// 20KB×3 = 60KB ≤ 64KB ✓，更大 tile 禁止 triple。
+// ═══════════════════════════════════════════════════════════════
+
+/// [公式] triple_buffer 时 lds_total = lds_per_buffer × 3（+swap+persistent 同前）
+#[test]
+fn triple_buffer_lds_formula() {
+    let mut spec = TileGemm::tile_256x64_k32_wgp();
+    spec.double_buffer = true;
+    spec.triple_buffer = false;
+    let db_total = spec.lds_total();
+    spec.triple_buffer = true;
+    let tb_total = spec.lds_total();
+    // 256x64: X=16KB + WT=4KB = 20KB/缓冲 → db 40KB, tb 60KB
+    assert_eq!(db_total, 40960, "256x64 双缓冲 = 40KB");
+    assert_eq!(tb_total, 61440, "256x64 三缓冲 = 60KB（≤64KB 单 WG 上限）");
+    // 三缓冲优先于双缓冲
+    assert_ne!(db_total, tb_total, "triple 必须覆盖 double");
+}
+
+/// [硬约束] triple_buffer 允许集/禁止集：lds_per_buffer×3 ≤ 64KB 的 spec
+/// 才可开三缓冲。允许集逐个验证公式；禁止集（128x64_k64 等大缓冲）
+/// 登记——lower_gemm 落地时必须 fail-fast 拒绝。
+#[test]
+fn triple_buffer_within_64kb_hard_limit() {
+    let mut allowed = Vec::new();
+    let mut forbidden = Vec::new();
+    for spec in all_presets() {
+        let mut s = spec;
+        s.triple_buffer = true;
+        let total = s.lds_total();
+        if total <= 65536 {
+            allowed.push((s.name().to_string(), total));
+        } else {
+            forbidden.push((s.name().to_string(), total));
+        }
+    }
+    // 禁止集打印登记（将来 lower_gemm fail-fast 的拒绝清单）
+    eprintln!("[triple-contract] 允许 {} 条: {:?}", allowed.len(),
+        allowed.iter().map(|(n, t)| format!("{n}={t}B")).collect::<Vec<_>>());
+    eprintln!("[triple-contract] 禁止 {} 条: {:?}", forbidden.len(),
+        forbidden.iter().map(|(n, t)| format!("{n}={t}B")).collect::<Vec<_>>());
+    // 主力 spec 必须在允许集（三窗主选）
+    assert!(allowed.iter().any(|(n, _)| n.contains("256x64")),
+        "主力 256x64 spec 必须在 triple 允许集");
+    assert!(forbidden.iter().any(|(n, _)| n.contains("128x64_k64")),
+        "128x64_k64 必须在禁止集（24KB×3=72KB）");
+}
+
+/// [优先级] triple_buffer = true 时忽略 double_buffer
+#[test]
+fn triple_overrides_double() {
+    let mut spec = TileGemm::tile_256x64_k32_wgp();
+    spec.double_buffer = false;
+    spec.triple_buffer = true;
+    assert_eq!(spec.lds_total(), 61440,
+        "triple=true 时无论 double 与否都按 ×3 计算");
+}
