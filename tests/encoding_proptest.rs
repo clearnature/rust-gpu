@@ -1451,11 +1451,12 @@ fn proptest_v_mul_f32() {
 fn proptest_v_max_f32() {
     with_rng(0x564D5846, |rng| {
         for _ in 0..PROPERTY_ITERATIONS {
-            let vdst = rng.range_u8(255);
+            let vdst = rng.range_u8(128); // VOP2 VDST 8 位 [24:17]，高位段属格式前缀
             let vsrc0 = rng.range_u8(255);
             let vsrc1 = rng.range_u8(255);
             let word = gfx11::v_max_f32(vdst, vsrc0, vsrc1);
-            assert_eq!(extract_vop2_vdst(word), vdst, "v_max_f32 vdst");
+            assert_eq!(extract_vop2_vdst(word), vdst,
+                "v_max_f32 vdst (word={word:#010X} vsrc0={vsrc0} vsrc1={vsrc1})");
             assert_eq!(extract_vop2_src0(word), vsrc0 as u32 + 256, "v_max_f32 src0");
         }
     });
@@ -1465,7 +1466,7 @@ fn proptest_v_max_f32() {
 fn proptest_v_min_f32() {
     with_rng(0x564D4E46, |rng| {
         for _ in 0..PROPERTY_ITERATIONS {
-            let vdst = rng.range_u8(255);
+            let vdst = rng.range_u8(128); // 同上
             let vsrc0 = rng.range_u8(255);
             let vsrc1 = rng.range_u8(255);
             let word = gfx11::v_min_f32(vdst, vsrc0, vsrc1);

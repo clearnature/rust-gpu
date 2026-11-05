@@ -1,16 +1,23 @@
 //! 编码器金标准锁（llvm-mc 反汇编对拍，三件套方法论）
 //!
-//! 出处：2026-11-05 全量覆盖审计——285 个真编码器中 144 个无 llvm-mc 金
-//! 标准锁，本文件锁定命脉级子集。每条 = 编码函数 + 代表性参数 → 字序列
-//! （llvm-mc 23.1.4 /opt/rocm 字节流反汇编实证语义）→ 测试断言逐字匹配。
-//! 编码器改动任何 bit 即红灯；金标准注释即该编码的 LLVM 权威语义。
-//! 本表已实锤并修复 4 个 RDNA3→RDNA4 遗留编码 bug：
-//!   ds_bpermute_b32（旧 opcode 52）、v_max_f32_imm0（旧 VOP3 形式）、
-//!   ds_add_f32（op 22 + GDS=1——会打穿全局内存！）、ds_max_f32（同病，
-//!   GFX12 改名 ds_max_num_f32）——均为死路径编码器，金标准锁是唯一防线。
-//! 注：global_load_async_to_lds_* 为 GFX1250 专属，金标准以 gfx1250 反汇编。
-//! 教训：llvm-mc --disassemble 输入=字节流小端；系统 llvm-mc 不支持
-//! gfx1200，用 /opt/rocm/llvm/bin 版。
+//! 出处：2026-11-05 全量覆盖审计 + RDNA3→RDNA4 系统追查三批。
+//! 本表已实锤并修复 **12 个真编码 bug**：
+//!   · DS 族：ds_bpermute_b32（旧 opcode 52）、ds_add_f32（op 22+GDS=1
+//!     ——会打穿全局内存！）、ds_max_f32（同病，GFX12 改名 ds_max_num_f32）
+//!   · VOP：v_max_f32（解码无效，VOP1 前缀装双操作数；GFX12 =
+//!     v_max_num_f32 VOP2 opcode 64）、v_min_f32（同族）、v_sin_f32
+//!     （解码 = v_floor_f32，floor 冒充 sin！）、v_max_f32_imm0（旧形式）
+//!   · VGLOBAL：global_atomic_add_f32/u32 rtn+no_rtn（全布局重写：
+//!     VDATA@word1[25:23] 分裂编码、TH@bit20、vdst@[8:0]）
+//!   · scratch 六件套（word1 缺 ADDR_EN bit17——spill 寻址在硬件全坏，
+//!     0-spill 现状掩盖）
+//!   · s_waitcnt_vmcnt（n 落错位段恒 vmcnt(0)）
+//!   · v_cmp_lt_f32（opcode 错成 v_cmp_lt_I32 整数比较）
+//! 多数是死路径或未触发路径——金标准锁是唯一防线。
+//! clang 装饰位差异（VOP3e64 bit25、WMMA bit27/28）已裁决：解码语义
+//! 等价，锁我们（GPU 实证）的形式。
+//! 注：global_load_async_to_lds_* 为 GFX1250 专属；GFX1100 路径
+//!（0xDC MUBUF 旧前缀）按 gfx1100 反汇编锁。
 //!
 //! 生成方式：tests/encoding_golden_gen.rs 产出字 → llvm-mc 反汇编 → bake。
 //! 用法：cargo test --release --features rocm --test encoding_golden
@@ -78,6 +85,75 @@ const GOLDENS: &[(&str, &[u32], &str)] = &[
     ("global_atomic_or_b32_gfx1200(1,2,3,0)", &[0xEE0F407C, 0x01900001, 0x00000002], "global_atomic_or_b32 v1, v[2:3], v3, off th:TH_ATOMIC_RETURN"),
     ("global_atomic_sub_u32_gfx1200(1,2,3,0)", &[0xEE0D807C, 0x01900001, 0x00000002], "global_atomic_sub_u32 v1, v[2:3], v3, off th:TH_ATOMIC_RETURN"),
     ("global_atomic_xor_b32_gfx1200(1,2,3,0)", &[0xEE0F807C, 0x01900001, 0x00000002], "global_atomic_xor_b32 v1, v[2:3], v3, off th:TH_ATOMIC_RETURN"),
+    ("s_nop(0)", &[0xBF800000], "s_nop 0"),
+    ("s_clause(4)", &[0xBF850004], "s_clause 0x4"),
+    ("s_setprio(1)", &[0xBFB50001], "s_setprio 1"),
+    ("s_branch(2)", &[0xBFA00002], "s_branch 2"),
+    ("s_cbranch_scc0(2)", &[0xBFA10002], "s_cbranch_scc0 2"),
+    ("s_cbranch_scc1(2)", &[0xBFA20002], "s_cbranch_scc1 2"),
+    ("s_cbranch_vccz(2)", &[0xBFA30002], "s_cbranch_vccz 2"),
+    ("s_cbranch_vccnz(2)", &[0xBFA40002], "s_cbranch_vccnz 2"),
+    ("s_add_u32(1, 2, 3)", &[0x80010302], "s_add_co_u32 s1, s2, s3"),
+    ("s_sub_u32(1, 2, 3)", &[0x80810302], "s_sub_co_u32 s1, s2, s3"),
+    ("s_add_i32(1, 2, 3)", &[0x81010302], "s_add_co_i32 s1, s2, s3"),
+    ("s_addc_u32(1, 2, 3)", &[0x82010302], "s_add_co_ci_u32 s1, s2, s3"),
+    ("s_subb_u32(1, 2, 3)", &[0x82810302], "s_sub_co_ci_u32 s1, s2, s3"),
+    ("s_and_b32(1, 2, 3)", &[0x8B010302], "s_and_b32 s1, s2, s3"),
+    ("s_xor_b32(1, 2, 3)", &[0x8D010302], "s_xor_b32 s1, s2, s3"),
+    ("s_mul_i32(1, 2, 3)", &[0x96010302], "s_mul_i32 s1, s2, s3"),
+    ("s_cselect_b32(1, 2, 3)", &[0x98010302], "s_cselect_b32 s1, s2, s3"),
+    ("s_cmp_eq_u32(1, 2)", &[0xBF060201], "s_cmp_eq_u32 s1, s2"),
+    ("s_cmp_lt_u32(1, 2)", &[0xBF0A0201], "s_cmp_lt_u32 s1, s2"),
+    ("s_cmp_gt_i32(1, 2)", &[0xBF020201], "s_cmp_gt_i32 s1, s2"),
+    ("s_cmp_ge_u32(1, 2)", &[0xBF090201], "s_cmp_ge_u32 s1, s2"),
+    ("s_lshr_b32(1, 2, 4)", &[0x85018402], "s_lshr_b32 s1, s2, 4"),
+    ("s_lshl_b32(1, 2, 4)", &[0x84018402], "s_lshl_b32 s1, s2, 4"),
+    ("s_mov_b32(1, 2)", &[0xBE810002], "s_mov_b32 s1, s2"),
+    ("s_and_saveexec_b32_vcc(1)", &[0xBE81206A], "s_and_saveexec_b32 s1, vcc_lo"),
+    ("s_load_dword_gfx1200(8, 2, 0)", &[0xF4000201, 0xF8000000], "s_load_b32 s8, s[2:3], 0x0"),
+    ("s_load_dwordx2_gfx1200(8, 2, 0)", &[0xF4002201, 0xF8000000], "s_load_b64 s[8:9], s[2:3], 0x0"),
+    ("s_load_dwordx4_gfx1200(8, 2, 0)", &[0xF4004201, 0xF8000000], "s_load_b128 s[8:11], s[2:3], 0x0"),
+    ("global_load_dword_gfx1200(4, 2, 0)", &[0xEE05007C, 0x00000004, 0x00000002], "global_load_b32 v4, v[2:3], off"),
+    ("global_store_dword_gfx1200(2, 1, 0)", &[0xEE06807C, 0x00800000, 0x00000002], "global_store_b32 v[2:3], v1, off"),
+    ("global_load_dwordx2_gfx1200(4, 2, 0)", &[0xEE05407C, 0x00000004, 0x00000002], "global_load_b64 v[4:5], v[2:3], off"),
+    ("global_store_dwordx2_gfx1200(2, 4, 0)", &[0xEE06C07C, 0x02000000, 0x00000002], "global_store_b64 v[2:3], v[4:5], off"),
+    ("global_load_dwordx4_gfx1200(4, 2, 0)", &[0xEE05C07C, 0x00000004, 0x00000002], "global_load_b128 v[4:7], v[2:3], off"),
+    ("global_store_dwordx4_gfx1200(2, 4, 0)", &[0xEE07407C, 0x02000000, 0x00000002], "global_store_b128 v[2:3], v[4:7], off"),
+    ("global_load_ushort_gfx1200(4, 2, 0)", &[0xEE04807C, 0x00000004, 0x00000002], "global_load_u16 v4, v[2:3], off"),
+    ("global_store_short_gfx1200(2, 1, 0)", &[0xEE06407C, 0x00800000, 0x00000002], "global_store_b16 v[2:3], v1, off"),
+    ("ds_store_b128(2, 4, 8)", &[0xDB7C0008, 0x00000402], "ds_store_b128 v2, v[4:7] offset:8"),
+    ("ds_store_b16(2, 1, 0)", &[0xD87C0000, 0x00000102], "ds_store_b16 v2, v1"),
+    ("ds_load_b64(4, 2, 0)", &[0xD9D80000, 0x04000002], "ds_load_b64 v[4:5], v2"),
+    ("v_readfirstlane_b32(1, 1)", &[0x7E020501], "v_readfirstlane_b32 s1, v1"),
+    ("v_readlane_b32(1, 1, 16)", &[0xD7600001, 0x00012101], "v_readlane_b32 s1, v1, 16"),
+    ("v_permlane64_b32(4, 1)", &[0x7E08CF01], "v_permlane64_b32 v4, v1"),
+    ("v_fma_f32(4, 1, 2, 3)", &[0xD6130004, 0x040E0501], "v_fma_f32 v4, v1, v2, v3"),
+    ("v_mul_lo_u32(4, 1, 2)", &[0xD72C0004, 0x00020501], "v_mul_lo_u32 v4, v1, v2"),
+    ("v_mul_f32_e64_literal(4, 1, 305419896)", &[0xD5080004, 0x0001FF01, 0x12345678], "v_mul_f32_e64 v4, v1, 0x12345678"),
+    ("v_add_f32_e64_inline(4, 1, 2)", &[0xD5030004, 0x00000501], "v_add_f32_e64 v4, v1, s2"),
+    ("v_add_nc_u32_e64(4, 1, 3)", &[0xD5250004, 0x00000701], "v_add_nc_u32_e64 v4, v1, s3"),
+    ("v_sub_co_u32_vcc(3, 1, 2)", &[0xD7016A03, 0x00020501], "v_sub_co_u32 v3, vcc_lo, v1, v2"),
+    ("v_sub_co_ci_u32_zero_vcc(3, 1)", &[0xD5216A03, 0x01A90101], "v_sub_co_ci_u32_e64 v3, vcc_lo, v1, 0, vcc_lo"),
+    ("v_alignbit_b32(4, 1, 2, 4)", &[0xD6160004, 0x02120501], "v_alignbit_b32 v4, v1, v2, 4"),
+    ("v_add_f32(4, 1, 2)", &[0x06080501], "v_add_f32_e32 v4, v1, v2"),
+    ("v_mul_f32(4, 1, 2)", &[0x10080501], "v_mul_f32_e32 v4, v1, v2"),
+    ("v_max_f32(4, 1, 2)", &[0x2C080501], "v_max_num_f32_e32 v4, v1, v2"),
+    ("v_min_f32(4, 1, 2)", &[0x2A080501], "v_min_num_f32_e32 v4, v1, v2"),
+    ("v_sub_f32(4, 1, 2)", &[0x08080501], "v_sub_f32_e32 v4, v1, v2"),
+    ("v_and_b32(4, 1, 2)", &[0x36080501], "v_and_b32_e32 v4, v1, v2"),
+    ("v_xor_b32(4, 1, 2)", &[0x3A080501], "v_xor_b32_e32 v4, v1, v2"),
+    ("v_add_u32(4, 1, 2)", &[0x4A080501], "v_add_nc_u32_e32 v4, v1, v2"),
+    ("v_sub_u32(4, 1, 2)", &[0x4C080501], "v_sub_nc_u32_e32 v4, v1, v2"),
+    ("v_mul_u32_u24(4, 1, 2)", &[0x16080501], "v_mul_u32_u24_e32 v4, v1, v2"),
+    ("v_exp_f32(4, 1)", &[0x7E084B01], "v_exp_f32_e32 v4, v1"),
+    ("v_log_f32(4, 1)", &[0x7E084F01], "v_log_f32_e32 v4, v1"),
+    ("v_sin_f32(4, 1)", &[0x7E086B01], "v_sin_f32_e32 v4, v1"),
+    ("v_rcp_f32(4, 1)", &[0x7E085501], "v_rcp_f32_e32 v4, v1"),
+    ("v_sqrt_f32(4, 1)", &[0x7E086701], "v_sqrt_f32_e32 v4, v1"),
+    ("v_cvt_f32_u32(4, 1)", &[0x7E080D01], "v_cvt_f32_u32_e32 v4, v1"),
+    ("v_cvt_u32_f32(4, 1)", &[0x7E080F01], "v_cvt_u32_f32_e32 v4, v1"),
+    ("v_mov_b32(4, 1)", &[0x7E080301], "v_mov_b32_e32 v4, v1"),
+    ("v_lshlrev_b32(4, 4, 1)", &[0x30080284], "v_lshlrev_b32_e32 v4, 4, v1"),
     ("s_waitcnt_vmcnt(3)", &[0xBF890FF7], "s_waitcnt vmcnt(3)"),
     ("s_waitcnt_lgkmcnt(5)", &[0xBF89FC17], "s_waitcnt lgkmcnt(1)"),
     ("s_waitcnt_vscnt(2)", &[0xBC7C0002], "s_waitcnt_vscnt null, 0x2"),
@@ -147,6 +223,75 @@ fn encoders_match_llvm_mc_goldens() {
         ("global_atomic_or_b32_gfx1200(1,2,3,0)", gfx11::global_atomic_or_b32_gfx1200(1, 2, 3, 0).to_vec()),
         ("global_atomic_sub_u32_gfx1200(1,2,3,0)", gfx11::global_atomic_sub_u32_gfx1200(1, 2, 3, 0).to_vec()),
         ("global_atomic_xor_b32_gfx1200(1,2,3,0)", gfx11::global_atomic_xor_b32_gfx1200(1, 2, 3, 0).to_vec()),
+        ("s_nop(0)", vec![gfx11::s_nop(0)]),
+        ("s_clause(4)", vec![gfx11::s_clause(4)]),
+        ("s_setprio(1)", vec![gfx11::s_setprio(1)]),
+        ("s_branch(2)", vec![gfx11::s_branch(2)]),
+        ("s_cbranch_scc0(2)", vec![gfx11::s_cbranch_scc0(2)]),
+        ("s_cbranch_scc1(2)", vec![gfx11::s_cbranch_scc1(2)]),
+        ("s_cbranch_vccz(2)", vec![gfx11::s_cbranch_vccz(2)]),
+        ("s_cbranch_vccnz(2)", vec![gfx11::s_cbranch_vccnz(2)]),
+        ("s_add_u32(1, 2, 3)", vec![gfx11::s_add_u32(1, 2, 3)]),
+        ("s_sub_u32(1, 2, 3)", vec![gfx11::s_sub_u32(1, 2, 3)]),
+        ("s_add_i32(1, 2, 3)", vec![gfx11::s_add_i32(1, 2, 3)]),
+        ("s_addc_u32(1, 2, 3)", vec![gfx11::s_addc_u32(1, 2, 3)]),
+        ("s_subb_u32(1, 2, 3)", vec![gfx11::s_subb_u32(1, 2, 3)]),
+        ("s_and_b32(1, 2, 3)", vec![gfx11::s_and_b32(1, 2, 3)]),
+        ("s_xor_b32(1, 2, 3)", vec![gfx11::s_xor_b32(1, 2, 3)]),
+        ("s_mul_i32(1, 2, 3)", vec![gfx11::s_mul_i32(1, 2, 3)]),
+        ("s_cselect_b32(1, 2, 3)", vec![gfx11::s_cselect_b32(1, 2, 3)]),
+        ("s_cmp_eq_u32(1, 2)", vec![gfx11::s_cmp_eq_u32(1, 2)]),
+        ("s_cmp_lt_u32(1, 2)", vec![gfx11::s_cmp_lt_u32(1, 2)]),
+        ("s_cmp_gt_i32(1, 2)", vec![gfx11::s_cmp_gt_i32(1, 2)]),
+        ("s_cmp_ge_u32(1, 2)", vec![gfx11::s_cmp_ge_u32(1, 2)]),
+        ("s_lshr_b32(1, 2, 4)", vec![gfx11::s_lshr_b32(1, 2, 4)]),
+        ("s_lshl_b32(1, 2, 4)", vec![gfx11::s_lshl_b32(1, 2, 4)]),
+        ("s_mov_b32(1, 2)", vec![gfx11::s_mov_b32(1, 2)]),
+        ("s_and_saveexec_b32_vcc(1)", vec![gfx11::s_and_saveexec_b32_vcc(1)]),
+        ("s_load_dword_gfx1200(8, 2, 0)", gfx11::s_load_dword_gfx1200(8, 2, 0).to_vec()),
+        ("s_load_dwordx2_gfx1200(8, 2, 0)", gfx11::s_load_dwordx2_gfx1200(8, 2, 0).to_vec()),
+        ("s_load_dwordx4_gfx1200(8, 2, 0)", gfx11::s_load_dwordx4_gfx1200(8, 2, 0).to_vec()),
+        ("global_load_dword_gfx1200(4, 2, 0)", gfx11::global_load_dword_gfx1200(4, 2, 0).to_vec()),
+        ("global_store_dword_gfx1200(2, 1, 0)", gfx11::global_store_dword_gfx1200(2, 1, 0).to_vec()),
+        ("global_load_dwordx2_gfx1200(4, 2, 0)", gfx11::global_load_dwordx2_gfx1200(4, 2, 0).to_vec()),
+        ("global_store_dwordx2_gfx1200(2, 4, 0)", gfx11::global_store_dwordx2_gfx1200(2, 4, 0).to_vec()),
+        ("global_load_dwordx4_gfx1200(4, 2, 0)", gfx11::global_load_dwordx4_gfx1200(4, 2, 0).to_vec()),
+        ("global_store_dwordx4_gfx1200(2, 4, 0)", gfx11::global_store_dwordx4_gfx1200(2, 4, 0).to_vec()),
+        ("global_load_ushort_gfx1200(4, 2, 0)", gfx11::global_load_ushort_gfx1200(4, 2, 0).to_vec()),
+        ("global_store_short_gfx1200(2, 1, 0)", gfx11::global_store_short_gfx1200(2, 1, 0).to_vec()),
+        ("ds_store_b128(2, 4, 8)", gfx11::ds_store_b128(2, 4, 8).to_vec()),
+        ("ds_store_b16(2, 1, 0)", gfx11::ds_store_b16(2, 1, 0).to_vec()),
+        ("ds_load_b64(4, 2, 0)", gfx11::ds_load_b64(4, 2, 0).to_vec()),
+        ("v_readfirstlane_b32(1, 1)", vec![gfx11::v_readfirstlane_b32(1, 1)]),
+        ("v_readlane_b32(1, 1, 16)", gfx11::v_readlane_b32(1, 1, 16).to_vec()),
+        ("v_permlane64_b32(4, 1)", vec![gfx11::v_permlane64_b32(4, 1)]),
+        ("v_fma_f32(4, 1, 2, 3)", gfx11::v_fma_f32(4, 1, 2, 3).to_vec()),
+        ("v_mul_lo_u32(4, 1, 2)", gfx11::v_mul_lo_u32(4, 1, 2).to_vec()),
+        ("v_mul_f32_e64_literal(4, 1, 305419896)", gfx11::v_mul_f32_e64_literal(4, 1, 305419896).to_vec()),
+        ("v_add_f32_e64_inline(4, 1, 2)", gfx11::v_add_f32_e64_inline(4, 1, 2).to_vec()),
+        ("v_add_nc_u32_e64(4, 1, 3)", gfx11::v_add_nc_u32_e64(4, 1, 3).to_vec()),
+        ("v_sub_co_u32_vcc(3, 1, 2)", gfx11::v_sub_co_u32_vcc(3, 1, 2).to_vec()),
+        ("v_sub_co_ci_u32_zero_vcc(3, 1)", gfx11::v_sub_co_ci_u32_zero_vcc(3, 1).to_vec()),
+        ("v_alignbit_b32(4, 1, 2, 4)", gfx11::v_alignbit_b32(4, 1, 2, 4).to_vec()),
+        ("v_add_f32(4, 1, 2)", vec![gfx11::v_add_f32(4, 1, 2)]),
+        ("v_mul_f32(4, 1, 2)", vec![gfx11::v_mul_f32(4, 1, 2)]),
+        ("v_max_f32(4, 1, 2)", vec![gfx11::v_max_f32(4, 1, 2)]),
+        ("v_min_f32(4, 1, 2)", vec![gfx11::v_min_f32(4, 1, 2)]),
+        ("v_sub_f32(4, 1, 2)", vec![gfx11::v_sub_f32(4, 1, 2)]),
+        ("v_and_b32(4, 1, 2)", vec![gfx11::v_and_b32(4, 1, 2)]),
+        ("v_xor_b32(4, 1, 2)", vec![gfx11::v_xor_b32(4, 1, 2)]),
+        ("v_add_u32(4, 1, 2)", vec![gfx11::v_add_u32(4, 1, 2)]),
+        ("v_sub_u32(4, 1, 2)", vec![gfx11::v_sub_u32(4, 1, 2)]),
+        ("v_mul_u32_u24(4, 1, 2)", vec![gfx11::v_mul_u32_u24(4, 1, 2)]),
+        ("v_exp_f32(4, 1)", vec![gfx11::v_exp_f32(4, 1)]),
+        ("v_log_f32(4, 1)", vec![gfx11::v_log_f32(4, 1)]),
+        ("v_sin_f32(4, 1)", vec![gfx11::v_sin_f32(4, 1)]),
+        ("v_rcp_f32(4, 1)", vec![gfx11::v_rcp_f32(4, 1)]),
+        ("v_sqrt_f32(4, 1)", vec![gfx11::v_sqrt_f32(4, 1)]),
+        ("v_cvt_f32_u32(4, 1)", vec![gfx11::v_cvt_f32_u32(4, 1)]),
+        ("v_cvt_u32_f32(4, 1)", vec![gfx11::v_cvt_u32_f32(4, 1)]),
+        ("v_mov_b32(4, 1)", vec![gfx11::v_mov_b32(4, 1)]),
+        ("v_lshlrev_b32(4, 4, 1)", vec![gfx11::v_lshlrev_b32(4, 4, 1)]),
         ("s_waitcnt_vmcnt(3)", vec![gfx11::s_waitcnt_vmcnt(3)]),
         ("s_waitcnt_lgkmcnt(5)", vec![gfx11::s_waitcnt_lgkmcnt(5)]),
         ("s_waitcnt_vscnt(2)", vec![gfx11::s_waitcnt_vscnt(2)]),

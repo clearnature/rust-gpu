@@ -1649,8 +1649,9 @@ pub mod gfx11 {
     /// v_sin_f32 v_dst, v_src - sine: dst = sin(2π·src)
     /// NOTE: RDNA3 v_sin_f32 computes sin(2π·x), NOT sin(x).
     pub fn v_sin_f32(vdst: u8, vsrc: u8) -> u32 {
-        // VOP1 opcode = 0x24 (GFX11)
-        0x7E000000u32 | (0x24 << 9) | ((vdst as u32) << 17) | (256 + vsrc as u32)
+        // [2026-11-05 金标准修复] 旧 opcode 解码 = v_floor_f32（floor 冒充
+        // sin！）——clang 权威：v_sin_f32_e32 v4, v1 → 0x7E086B01（opcode 53）
+        0x7E000000u32 | (0x35 << 9) | ((vdst as u32) << 17) | (256 + vsrc as u32)
     }
     
     /// v_rcp_f32 v_dst, v_src - reciprocal: dst = 1/src
@@ -1674,16 +1675,19 @@ pub mod gfx11 {
     
     /// v_max_f32 v_dst, v_src0, v_src1 - needed for softmax max reduction
     pub fn v_max_f32(vdst: u8, vsrc0: u8, vsrc1: u8) -> u32 {
-        // LLVM: v_max_f32 -> opcode 0x20
-        // VOP2: vsrc0 must be encoded as 256 + vgpr_num for VGPRs
-        0x20000000u32 | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (256 + vsrc0 as u32)
+        // [2026-11-05 金标准修复] 旧字解码 ENCODE-ERROR（VOP1 前缀装双操作数）。
+        // GFX12 改名 v_max_num_f32，clang 权威：v_max_num_f32_e32 v4, v1, v2
+        // → 0x2C080501（vdst=4 时）。VDST @ [24:17]，base = 0x2C000000
+        //（旧 base 0x2C080000 的 0x08 是 vdst=4 自身位被误固化——vdst bit2=0
+        // 时泄漏 bit19 污染字）。生产调用者：tile_ir GEMM clamp、Max 算子。
+        0x2C000000u32 | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (256 + vsrc0 as u32)
     }
     
     /// v_min_f32 v_dst, v_src0, v_src1
     pub fn v_min_f32(vdst: u8, vsrc0: u8, vsrc1: u8) -> u32 {
-        // LLVM: v_min_f32 -> opcode 0x1E
-        // VOP2: vsrc0 must be encoded as 256 + vgpr_num for VGPRs
-        0x1E000000u32 | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (256 + vsrc0 as u32)
+        // [2026-11-05 金标准修复] GFX12 v_min_num_f32，clang 权威 0x2A080501
+        // （vdst=4 时；base = 0x2A000000 同 v_max 族裁决）。生产调用者同上。
+        0x2A000000u32 | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (256 + vsrc0 as u32)
     }
     
     /// v_sub_f32 v_dst, v_src0, v_src1
