@@ -111,3 +111,50 @@ fn code_object_elf_e_flags_per_arch() {
         assert_eq!(e_flags, expect, "{target} e_flags（offset 48）");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// [RSRC3 INST_PREF_SIZE 契约] (2026-11-05 M2 性能 P1 扫描前置锁)
+// inst_pref_lines @ RSRC3[9:4]：指令预取行数（128B cache line 为单位）。
+// 默认公式 = ceil(code_size/128) 钳 63；T0_RSRC3_PREF=N 环境变量可覆盖
+//（扫描开关——默认行为在 env 未设时不变）。
+// ═══════════════════════════════════════════════════════════════
+
+fn rsrc3_of(code_size: usize) -> u32 {
+    let kd = KernelDescriptor::for_gfx11(&test_config("gfx1200"), code_size);
+    kd.as_bytes();
+    kd.compute_pgm_rsrc3
+}
+
+/// [默认公式] ceil(code_size/128) 钳 63，落 RSRC3[9:4]。
+/// 位域完整性（与 env 开关测试分离但同文件——本测试不碰 env，竞态面=0；
+/// env 测试的 set/remove 影响本测试的默认断言——进程级全局态，故本测试
+/// 只锁"位域布局"（0xF / >>12 干净性），数值断言全部在 combined 测试内。
+#[test]
+fn rsrc3_inst_pref_default_formula() {
+    let r3 = rsrc3_of(4096);
+    assert_eq!(r3 & 0xF, 0, "SHARED_VGPR_COUNT = 0");
+    assert_eq!(r3 >> 12, 0, "RSRC3[31:12] reserved = 0");
+    assert_eq!((r3 >> 4) & 0x3F, r3 >> 4 & 0x3F, "PREF 字段可提取");
+}
+
+/// [扫描开关] T0_RSRC3_PREF=N 覆盖默认公式（env 未设时默认不变）。
+/// 与默认公式测试合并为单测试——cargo 并行下 set_var 是进程级竞态
+///（手打必错定律的流程版：env 全局态测试禁拆分）。
+#[test]
+fn rsrc3_pref_default_and_env_override() {
+    // 1) 默认公式全谱
+    assert_eq!((rsrc3_of(4096) >> 4) & 0x3F, 32, "4096B → 32 行预取");
+    assert_eq!((rsrc3_of(8192) >> 4) & 0x3F, 63, "8192B → 钳 63");
+    assert_eq!((rsrc3_of(128) >> 4) & 0x3F, 1, "128B → 1 行");
+    assert_eq!((rsrc3_of(1000) >> 4) & 0x3F, 8, "ceil(1000/128)=8");
+    assert_eq!(rsrc3_of(4096) >> 12, 0, "RSRC3[31:12] reserved = 0");
+    // 2) env 覆盖
+    std::env::set_var("T0_RSRC3_PREF", "7");
+    assert_eq!((rsrc3_of(4096) >> 4) & 0x3F, 7, "T0_RSRC3_PREF=7 覆盖默认 32");
+    // 3) 越界钳 63
+    std::env::set_var("T0_RSRC3_PREF", "100");
+    assert_eq!((rsrc3_of(4096) >> 4) & 0x3F, 63, "PREF=100 钳 63");
+    // 4) env 清除 → 恢复默认
+    std::env::remove_var("T0_RSRC3_PREF");
+    assert_eq!((rsrc3_of(4096) >> 4) & 0x3F, 32, "env 未设恢复默认公式");
+}

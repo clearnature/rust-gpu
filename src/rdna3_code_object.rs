@@ -167,7 +167,16 @@ impl KernelDescriptor {
         // [10]    = TRAP_ON_START
         // [11]    = TRAP_ON_END
         // [31:12] = Reserved (must be 0)
-        let inst_pref_lines = ((code_size as u32 + 127) / 128).min(63);
+        // [M2 性能 P1] T0_RSRC3_PREF=N 扫描开关：INST_PREF_SIZE 从未实测调优过，
+        // 默认公式 ceil(code_size/128) 只是"算出来"的。env 设定 N（钳 0..63）
+        // 覆盖默认——GPU 基准扫描最优值后将固化。env 未设 = 默认行为不变。
+        let inst_pref_lines = match std::env::var("T0_RSRC3_PREF")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            Some(n) => n.min(63),
+            None => ((code_size as u32 + 127) / 128).min(63),
+        };
         let rsrc3 = (inst_pref_lines & 0x3F) << 4;
         
         // KERNEL_CODE_PROPERTIES:
