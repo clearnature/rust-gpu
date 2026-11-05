@@ -2037,6 +2037,13 @@ k_vreg,
                 }
             }
             // Store GMEM→LDS after WMMA (sequential is faster than interleaved for k64)
+            // [2026-11-05 T2b 分解矩阵·中位（同批交错 3 遍）] 4096³ 256x64：
+            //   E1 完整 41.49 TF / E2 跳过本段（纯compute）59.20 / E3 仅去
+            //   LDS store 42.23 / E4 仅去 GMEM load 35.21。
+            //   → 时间成本分解：load+store 总 42.7%；其中 GMEM load 停等
+            //   40.2%（主杠杆）、LDS store 净负担 -1.8%（三缓冲对它无收益）。
+            //   → 结构解方向：load 更早发射（prefetch 深化）或分批与 WMMA
+            //   真交错。同批对比纪律：跨批次波动 ±3%以上，禁止跨批比数。
             let total_loads = x_batch_loads + wt_batch_loads;
             if std::env::var("T0_PHASEA_SKIP_LOAD").is_err() {
             // P1 (2026-08-27): K-OOB mask before Phase A store to buf1.
