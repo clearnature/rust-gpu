@@ -2139,9 +2139,12 @@ pub mod gfx11 {
     pub fn global_atomic_add_u32(vdst: u8, vaddr: u8, vdata: u8) -> [u32; 2] {
         // FLAT_GLOBAL atomic add u32 with glc flag
         // Opcode: 0xDCD64000 (incl. glc bit at 0x4000)
+        // [2026-11-05 金标准修复] 旧码把 vdst 塞 word0[4:0]——clang gfx1100
+        // 权威：word0 = 0xDCD64000（无 vdst），vdst @ word1[31:24]（与 f32
+        // 版本布局一致）。clang: v1,v[2:3],v3 → [DCD64000, 017C0302]。
         [
-            0xDCD64000 | (vdst as u32),
-            ((vdata as u32) << 8) | (vaddr as u32) | 0x7C00
+            0xDCD64000,
+            ((vdst as u32) << 24) | (0x7C << 16) | ((vdata as u32) << 8) | (vaddr as u32)
         ]
     }
     
@@ -2149,9 +2152,12 @@ pub mod gfx11 {
     /// For fire-and-forget counter increment
     pub fn global_atomic_add_u32_no_rtn(vaddr: u8, vdata: u8) -> [u32; 2] {
         // Without glc, no return - just increment
+        // [2026-11-05 金标准修复] 旧码 saddr 标记写 0x7C00（bit14-10）——
+        // 与 vdata 字段 [15:8] 域重叠（vdata≥1 即互踩）。clang gfx1100 权威：
+        // vaddr=2,vdata=3 → [DCD60000, 007C0302]，saddr=off 应在 [23:16]。
         [
             0xDCD60000,  // no glc
-            ((vdata as u32) << 8) | (vaddr as u32) | 0x7C00
+            (0x7C << 16) | ((vdata as u32) << 8) | (vaddr as u32)
         ]
     }
     
@@ -2223,10 +2229,16 @@ pub mod gfx11 {
     /// Format: opcode | (vgpr << 9) | imm_encoded
     /// Note: This tests if lane_id (vsrc) > imm, useful for masking lanes 0-15
     pub fn v_cmp_lt_u32_imm(vsrc: u8, imm: u8) -> u32 {
-        // LLVM encoding verified: v_cmp_lt_u32 vcc_lo, 16, v80 = 0x7C92A090
-        // Format: [31:17]=op [16:9]=VSRC1 [8:0]=SRC0 (can be inline const)
+        // [2026-11-05 金标准修复·两轮] VOP2 硬件约束：内联常量只能放 SRC0
+        //（llvm-mc 实证：SRC1 放 133 解码为 SGPR 133，非 inline）。要表达
+        // 「vsrc < imm」只有两条硬件合法路：e64 双字（src1 任意）或
+        // **GT + 操作数互换**（imm > vsrc ⟺ vsrc < imm，编译器标准技巧）。
+        // 本函数取后者（单字）：v_cmp_gt_u32 opcode 76（0x7C98 space），
+        // SRC0 = imm（inline 128+imm），SRC1 = vsrc（256+vsrc）→ vcc = imm>vsrc。
+        // 旧实现是 LT opcode + imm@SRC0/vsrc@SRC1——硬件合法但语义 = imm<vsrc，
+        // 与函数名契约颠倒（死路径，零调用者）。
         let imm_encoded = if imm <= 64 { 128 + imm as u32 } else { imm as u32 };
-        0x7C920000u32 | ((vsrc as u32) << 9) | imm_encoded
+        0x7C980000u32 | ((vsrc as u32) << 9) | imm_encoded
     }
     
     /// v_cmp_gt_u32 vcc_lo, imm, vsrc - compare greater than (unsigned): imm > vsrc
@@ -3435,11 +3447,15 @@ impl Rdna3Assembler {
     /// vaddr_lo/hi = 64-bit address in VGPR pair
     /// Use offset to add immediate offset to address
     pub fn global_atomic_add_f32(&mut self, vdst: u8, vaddr_lo: u8, vdata: u8, offset: i16) {
-        // Use the existing gfx11 function but with proper address handling
         // vaddr is a pair [vaddr_lo, vaddr_lo+1]
+        // [2026-11-05 金标准修复] 旧码三重错：vdst 塞 word0[4:0]（应在
+        // word1[31:24]）、saddr 标记 0x7C00 域重叠（应在 [23:16]=0x7C<<16）、
+        // offset 掩码 &0xFFF 吞掉 glc 位。clang gfx1100 权威（offset=16）：
+        // [DD5A4010, 017C0302]——word0 = base|glc|offset[11:0]，word1 =
+        // vdst<<24|0x7C<<16|vdata<<8|vaddr。
         let instr = [
-            0xDD5A4000u32 | ((offset as u16 as u32) & 0xFFF) | (vdst as u32),
-            ((vdata as u32) << 8) | (vaddr_lo as u32) | 0x7C00
+            0xDD5A4000u32 | ((offset as u16 as u32) & 0xFFF),
+            ((vdst as u32) << 24) | (0x7C << 16) | ((vdata as u32) << 8) | (vaddr_lo as u32)
         ];
         self.emit2(instr);
         self.vmcnt = self.vmcnt.saturating_add(1);

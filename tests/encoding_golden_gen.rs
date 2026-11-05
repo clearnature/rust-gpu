@@ -164,6 +164,50 @@ fn gen_golden_words() {
     push("v_mov_b32(4, 1)", &[gfx11::v_mov_b32(4, 1)]);
     push("v_lshlrev_b32(4, 4, 1)", &[gfx11::v_lshlrev_b32(4, 4, 1)]);
 
+    // ── 第四批（RDNA3→RDNA4 高危族追查）──
+    push("s_wait_loadcnt(3)", &[gfx11::s_wait_loadcnt(3)]);
+    push("s_wait_storecnt(3)", &[gfx11::s_wait_storecnt(3)]);
+    push("s_wait_dscnt(3)", &[gfx11::s_wait_dscnt(3)]);
+    push("s_wait_kmcnt(3)", &[gfx11::s_wait_kmcnt(3)]);
+    push("v_cmp_gt_i32(1,2)", &[gfx11::v_cmp_gt_i32(1, 2)]);
+    push("v_cmp_ge_i32(1,2)", &[gfx11::v_cmp_ge_i32(1, 2)]);
+    push("v_cmp_ge_u32(1,2)", &[gfx11::v_cmp_ge_u32(1, 2)]);
+    push("v_cmp_lt_u32_imm(1,5)", &[gfx11::v_cmp_lt_u32_imm(1, 5)]);
+    push("v_mov_b32_from_sgpr(4,3)", &[gfx11::v_mov_b32_from_sgpr(4, 3)]);
+    push("v_readfirstlane_b32(1,1)", &[gfx11::v_readfirstlane_b32(1, 1)]);
+    push("s_mov_b32_imm(1,42)", &[gfx11::s_mov_b32_imm(1, 42)]);
+    push("s_mov_b32_exec_lo(42)", &[gfx11::s_mov_b32_exec_lo(42)]);
+    push("s_mov_b32_exec_lo_from_sgpr(3)", &[gfx11::s_mov_b32_exec_lo_from_sgpr(3)]);
+    push("s_add_u32_imm(1,2,5)", &[gfx11::s_add_u32_imm(1, 2, 5)]);
+    push("s_sub_u32_imm(1,2,5)", &[gfx11::s_sub_u32_imm(1, 2, 5)]);
+    push("s_and_b32_imm(1,2,5)", &[gfx11::s_and_b32_imm(1, 2, 5)]);
+    push("s_cmp_lt_u32_imm(1,5)", &[gfx11::s_cmp_lt_u32_imm(1, 5)]);
+    push("s_cmp_ge_u32_imm(1,5)", &[gfx11::s_cmp_ge_u32_imm(1, 5)]);
+    push("s_cmp_lg_u32_imm(1,5)", &[gfx11::s_cmp_lg_u32_imm(1, 5)]);
+    push("global_load_dword(4,2,0)", &gfx11::global_load_dword(4, 2, 0));
+    push("global_store_dword(2,1,0)", &gfx11::global_store_dword(2, 1, 0));
+    push("global_load_ushort(4,2,0)", &gfx11::global_load_ushort(4, 2, 0));
+    push("global_store_short(2,1,0)", &gfx11::global_store_short(2, 1, 0));
+    push("s_load_dword(8,2,0)", &gfx11::s_load_dword(8, 2, 0));
+    push("s_load_dwordx2(8,2,0)", &gfx11::s_load_dwordx2(8, 2, 0));
+    push("s_load_dwordx4(8,2,0)", &gfx11::s_load_dwordx4(8, 2, 0));
+    push("global_atomic_add_u32(1,2,3)", &gfx11::global_atomic_add_u32(1, 2, 3));
+    push("global_atomic_add_f32(1,2,3)", &gfx11::global_atomic_add_f32(1, 2, 3));
+    push("global_atomic_add_u32_no_rtn(2,3)", &gfx11::global_atomic_add_u32_no_rtn(2, 3));
+    push("v_mov_b32(4,1)", &[gfx11::v_mov_b32(4, 1)]);
+    push("v_mov_b32_from_sgpr(4,3)_b", &[gfx11::v_mov_b32_from_sgpr(4, 3)]);
+    push("v_and_b32_imm(4,1,5)", &[gfx11::v_and_b32_imm(4, 1, 5)]);
+    push("v_add_u32_imm(4,1,5)", &[gfx11::v_add_u32_imm(4, 1, 5)]);
+    push("v_mul_u32_u24_imm(4,1,5)", &[gfx11::v_mul_u32_u24_imm(4, 1, 5)]);
+    push("v_and_b32_zero_imm(4,1)", &[gfx11::v_and_b32_zero_imm(4, 1)]);
+    push("v_readfirstlane(1,1)", &[gfx11::v_readfirstlane(1, 1)]);
+    push("v_pk_add_f16(4,1,2)", &gfx11::v_pk_add_f16(4, 1, 2));
+    push("v_pk_mul_f16(4,1,2)", &gfx11::v_pk_mul_f16(4, 1, 2));
+    push("v_pk_fma_f16(4,1,2,3)", &gfx11::v_pk_fma_f16(4, 1, 2, 3));
+    push("v_dot2_f32_bf16(4,1,2,3)", &gfx11::v_dot2_f32_bf16(4, 1, 2, 3));
+    push("v_dual_max_f32_max_f32(0,1,2,3,4,5)", &gfx11::v_dual_max_f32_max_f32(0, 1, 2, 3, 4, 5));
+    push("v_dual_fmac_f32_fmac_f32(0,1,2,3,4,5)", &gfx11::v_dual_fmac_f32_fmac_f32(0, 1, 2, 3, 4, 5));
+
     // ── 等待族 ──
     push("s_waitcnt_vmcnt(3)", &[gfx11::s_waitcnt_vmcnt(3)]);
     push("s_waitcnt_lgkmcnt(5)", &[gfx11::s_waitcnt_lgkmcnt(5)]);
