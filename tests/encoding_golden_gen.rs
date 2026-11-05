@@ -208,6 +208,25 @@ fn gen_golden_words() {
     push("v_dual_max_f32_max_f32(0,1,2,3,4,5)", &gfx11::v_dual_max_f32_max_f32(0, 1, 2, 3, 4, 5));
     push("v_dual_fmac_f32_fmac_f32(0,1,2,3,4,5)", &gfx11::v_dual_fmac_f32_fmac_f32(0, 1, 2, 3, 4, 5));
 
+    // ── WMMA clang 可对拍族（8 条，形状实证：f32 出 8 VGPR/f16·bf16 出 4/fp8 A·B 各 2）──
+    push("v_wmma_f32_16x16x16_bf16(4,1,2,4)", &gfx11::v_wmma_f32_16x16x16_bf16(4, 1, 2, 4));
+    push("v_wmma_f32_16x16x16_f16(4,1,2,4)", &gfx11::v_wmma_f32_16x16x16_f16(4, 1, 2, 4));
+    push("v_wmma_bf16_16x16x16_bf16(4,1,2,4)", &gfx11::v_wmma_bf16_16x16x16_bf16(4, 1, 2, 4));
+    push("v_wmma_f16_16x16x16_f16(4,1,2,4)", &gfx11::v_wmma_f16_16x16x16_f16(4, 1, 2, 4));
+    push("v_wmma_f32_16x16x16_fp8_fp8(4,1,2,4)", &gfx11::v_wmma_f32_16x16x16_fp8_fp8(4, 1, 2, 4));
+    push("v_wmma_f32_16x16x16_fp8_bf8(4,1,2,4)", &gfx11::v_wmma_f32_16x16x16_fp8_bf8(4, 1, 2, 4));
+    push("v_wmma_f32_16x16x16_bf8_fp8(4,1,2,4)", &gfx11::v_wmma_f32_16x16x16_bf8_fp8(4, 1, 2, 4));
+    push("v_wmma_f32_16x16x16_bf8_bf8(4,1,2,4)", &gfx11::v_wmma_f32_16x16x16_bf8_bf8(4, 1, 2, 4));
+    // ── TH 提示变体（GFX1200 cache policy 族）──
+    push("global_load_dword_gfx1200_nt(4,2,0)", &gfx11::global_load_dword_gfx1200_nt(4, 2, 0));
+    push("global_load_dwordx2_gfx1200_nt(4,2,0)", &gfx11::global_load_dwordx2_gfx1200_nt(4, 2, 0));
+    push("global_load_ushort_gfx1200_nt(4,2,0)", &gfx11::global_load_ushort_gfx1200_nt(4, 2, 0));
+    push("global_load_dwordx4_gfx1200_ht(4,2,0)", &gfx11::global_load_dwordx4_gfx1200_ht(4, 2, 0));
+    push("global_load_dwordx4_gfx1200_lu(4,2,0)", &gfx11::global_load_dwordx4_gfx1200_lu(4, 2, 0));
+    push("global_store_dword_gfx1200(2,1,0)", &gfx11::global_store_dword_gfx1200(2, 1, 0));
+    push("global_store_dwordx2_gfx1200(2,4,0)", &gfx11::global_store_dwordx2_gfx1200(2, 4, 0));
+    push("global_store_dwordx4_gfx1200(2,4,0)", &gfx11::global_store_dwordx4_gfx1200(2, 4, 0));
+
     // ── 等待族 ──
     push("s_waitcnt_vmcnt(3)", &[gfx11::s_waitcnt_vmcnt(3)]);
     push("s_waitcnt_lgkmcnt(5)", &[gfx11::s_waitcnt_lgkmcnt(5)]);

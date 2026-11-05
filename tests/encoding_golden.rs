@@ -1,7 +1,7 @@
 //! 编码器金标准锁（llvm-mc 反汇编对拍，三件套方法论）
 //!
 //! 出处：2026-11-05 全量覆盖审计 + RDNA3→RDNA4 系统追查三批。
-//! 本表已实锤并修复 **15 个真编码 bug**：
+//! 本表已实锤并修复 **15 个真编码 bug**（WMMA 8 条 clang 对拍全等 ✓；iu8/iu4/x32/x64 族 14 条 GFX1200 硬件不存在=死路径已标注）：
 //!   · DS 族：ds_bpermute_b32（旧 opcode 52）、ds_add_f32（op 22+GDS=1
 //!     ——会打穿全局内存！）、ds_max_f32（同病，GFX12 改名 ds_max_num_f32）
 //!   · VOP：v_max_f32（解码无效，VOP1 前缀装双操作数；GFX12 =
@@ -201,6 +201,22 @@ const GOLDENS: &[(&str, &[u32], &str)] = &[
     ("v_dot2_f32_bf16(4,1,2,3)", &[0xCC1A4004, 0x1C0E0501], "v_dot2_f32_bf16 v4, v1, v2, v3"),
     ("v_dual_max_f32_max_f32(0,1,2,3,4,5)", &[0xCA940501, 0x00020B04], "v_dual_max_num_f32 v0, v1, v2 :: v_dual_max_num_f32 v3, v4, v5"),
     ("v_dual_fmac_f32_fmac_f32(0,1,2,3,4,5)", &[0xC8000501, 0x00020B04], "v_dual_fmac_f32 v0, v1, v2 :: v_dual_fmac_f32 v3, v4, v5"),
+    ("v_wmma_f32_16x16x16_bf16(4,1,2,4)", &[0xCC414004, 0x1C120501], "v_wmma_f32_16x16x16_bf16 v[4:11], v[1:4], v[2:5], v[4:11]"),
+    ("v_wmma_f32_16x16x16_f16(4,1,2,4)", &[0xCC404004, 0x1C120501], "v_wmma_f32_16x16x16_f16 v[4:11], v[1:4], v[2:5], v[4:11]"),
+    ("v_wmma_bf16_16x16x16_bf16(4,1,2,4)", &[0xCC434004, 0x1C120501], "v_wmma_bf16_16x16x16_bf16 v[4:7], v[1:4], v[2:5], v[4:7]"),
+    ("v_wmma_f16_16x16x16_f16(4,1,2,4)", &[0xCC424004, 0x1C120501], "v_wmma_f16_16x16x16_f16 v[4:7], v[1:4], v[2:5], v[4:7]"),
+    ("v_wmma_f32_16x16x16_fp8_fp8(4,1,2,4)", &[0xCC464004, 0x1C120501], "v_wmma_f32_16x16x16_fp8_fp8 v[4:11], v[1:2], v[2:3], v[4:11]"),
+    ("v_wmma_f32_16x16x16_fp8_bf8(4,1,2,4)", &[0xCC474004, 0x1C120501], "v_wmma_f32_16x16x16_fp8_bf8 v[4:11], v[1:2], v[2:3], v[4:11]"),
+    ("v_wmma_f32_16x16x16_bf8_fp8(4,1,2,4)", &[0xCC484004, 0x1C120501], "v_wmma_f32_16x16x16_bf8_fp8 v[4:11], v[1:2], v[2:3], v[4:11]"),
+    ("v_wmma_f32_16x16x16_bf8_bf8(4,1,2,4)", &[0xCC494004, 0x1C120501], "v_wmma_f32_16x16x16_bf8_bf8 v[4:11], v[1:2], v[2:3], v[4:11]"),
+    ("global_load_dword_gfx1200_nt(4,2,0)", &[0xEE05007C, 0x00001004, 0x00000002], "global_load_b32 v4, v[2:3], off"),
+    ("global_load_dwordx2_gfx1200_nt(4,2,0)", &[0xEE05407C, 0x00001004, 0x00000002], "global_load_b64 v[4:5], v[2:3], off"),
+    ("global_load_ushort_gfx1200_nt(4,2,0)", &[0xEE04807C, 0x00001004, 0x00000002], "global_load_u16 v4, v[2:3], off"),
+    ("global_load_dwordx4_gfx1200_ht(4,2,0)", &[0xEE05C07C, 0x00002004, 0x00000002], "global_load_b128 v[4:7], v[2:3], off"),
+    ("global_load_dwordx4_gfx1200_lu(4,2,0)", &[0xEE05C07C, 0x00003004, 0x00000002], "global_load_b128 v[4:7], v[2:3], off"),
+    ("global_store_dword_gfx1200(2,1,0)", &[0xEE06807C, 0x00800000, 0x00000002], "global_store_b32 v[2:3], v1, off"),
+    ("global_store_dwordx2_gfx1200(2,4,0)", &[0xEE06C07C, 0x02000000, 0x00000002], "global_store_b64 v[2:3], v[4:5], off"),
+    ("global_store_dwordx4_gfx1200(2,4,0)", &[0xEE07407C, 0x02000000, 0x00000002], "global_store_b128 v[2:3], v[4:7], off"),
     ("s_waitcnt_vmcnt(3)", &[0xBF890FF7], "s_waitcnt vmcnt(3)"),
     ("s_waitcnt_lgkmcnt(5)", &[0xBF89FC17], "s_waitcnt lgkmcnt(1)"),
     ("s_waitcnt_vscnt(2)", &[0xBC7C0002], "s_waitcnt_vscnt null, 0x2"),
@@ -381,6 +397,22 @@ fn encoders_match_llvm_mc_goldens() {
         ("v_dot2_f32_bf16(4,1,2,3)", gfx11::v_dot2_f32_bf16(4, 1, 2, 3).to_vec()),
         ("v_dual_max_f32_max_f32(0,1,2,3,4,5)", gfx11::v_dual_max_f32_max_f32(0, 1, 2, 3, 4, 5).to_vec()),
         ("v_dual_fmac_f32_fmac_f32(0,1,2,3,4,5)", gfx11::v_dual_fmac_f32_fmac_f32(0, 1, 2, 3, 4, 5).to_vec()),
+        ("v_wmma_f32_16x16x16_bf16(4,1,2,4)", gfx11::v_wmma_f32_16x16x16_bf16(4, 1, 2, 4).to_vec()),
+        ("v_wmma_f32_16x16x16_f16(4,1,2,4)", gfx11::v_wmma_f32_16x16x16_f16(4, 1, 2, 4).to_vec()),
+        ("v_wmma_bf16_16x16x16_bf16(4,1,2,4)", gfx11::v_wmma_bf16_16x16x16_bf16(4, 1, 2, 4).to_vec()),
+        ("v_wmma_f16_16x16x16_f16(4,1,2,4)", gfx11::v_wmma_f16_16x16x16_f16(4, 1, 2, 4).to_vec()),
+        ("v_wmma_f32_16x16x16_fp8_fp8(4,1,2,4)", gfx11::v_wmma_f32_16x16x16_fp8_fp8(4, 1, 2, 4).to_vec()),
+        ("v_wmma_f32_16x16x16_fp8_bf8(4,1,2,4)", gfx11::v_wmma_f32_16x16x16_fp8_bf8(4, 1, 2, 4).to_vec()),
+        ("v_wmma_f32_16x16x16_bf8_fp8(4,1,2,4)", gfx11::v_wmma_f32_16x16x16_bf8_fp8(4, 1, 2, 4).to_vec()),
+        ("v_wmma_f32_16x16x16_bf8_bf8(4,1,2,4)", gfx11::v_wmma_f32_16x16x16_bf8_bf8(4, 1, 2, 4).to_vec()),
+        ("global_load_dword_gfx1200_nt(4,2,0)", gfx11::global_load_dword_gfx1200_nt(4, 2, 0).to_vec()),
+        ("global_load_dwordx2_gfx1200_nt(4,2,0)", gfx11::global_load_dwordx2_gfx1200_nt(4, 2, 0).to_vec()),
+        ("global_load_ushort_gfx1200_nt(4,2,0)", gfx11::global_load_ushort_gfx1200_nt(4, 2, 0).to_vec()),
+        ("global_load_dwordx4_gfx1200_ht(4,2,0)", gfx11::global_load_dwordx4_gfx1200_ht(4, 2, 0).to_vec()),
+        ("global_load_dwordx4_gfx1200_lu(4,2,0)", gfx11::global_load_dwordx4_gfx1200_lu(4, 2, 0).to_vec()),
+        ("global_store_dword_gfx1200(2,1,0)", gfx11::global_store_dword_gfx1200(2, 1, 0).to_vec()),
+        ("global_store_dwordx2_gfx1200(2,4,0)", gfx11::global_store_dwordx2_gfx1200(2, 4, 0).to_vec()),
+        ("global_store_dwordx4_gfx1200(2,4,0)", gfx11::global_store_dwordx4_gfx1200(2, 4, 0).to_vec()),
         ("s_waitcnt_vmcnt(3)", vec![gfx11::s_waitcnt_vmcnt(3)]),
         ("s_waitcnt_lgkmcnt(5)", vec![gfx11::s_waitcnt_lgkmcnt(5)]),
         ("s_waitcnt_vscnt(2)", vec![gfx11::s_waitcnt_vscnt(2)]),
